@@ -126,12 +126,18 @@ For end-to-end A100 tuning on seed-42 SVP-challenge ladders, use:
 
 ```bash
 $ bench/bgj_cuda_seed42.py --preset ladder --stop-on-timeout --stop-on-failure \
-    --timeout-sec 900 --time-budget-sec 10800
+    --timeout-sec 3600 --time-budget-sec 28800
 ```
 
-The harness preprocesses available SVP-challenge instances with
-`app/lattice_preprocess`, writes live logs, and records CSV/JSONL summaries
-under `bench/results/`.
+The harness uses the official SVP-challenge seed-0 generator when an instance
+is missing from `../G6K-GPU-Tensor/svpchallenge`, preprocesses challenge
+instances with `app/lattice_preprocess`, writes live logs, and records CSV/JSONL
+summaries under `bench/results/`. It no longer falls back to `tmp/L_<dim>` or
+synthetic lattices by default; use `--allow-tmp-lattice` or
+`--synthetic-fallback` only when deliberately benchmarking non-challenge inputs.
+Use `--validate-svpchallenge-generator` to compare the online generator against
+the downloadable seed-0 dim-140 example, and `--prepare-only` to fetch and
+preprocess lattices without launching sieving jobs.
 
 For large instances, it's recommended to use [sparsepp](https://github.com/greg7mdp/sparsepp) to replace the default `std::unordered_set` used in the implementation of UidHashTable. This can be done by changing `USE_SPARSEPP` in `include/config.h` to 1 and manually placing the sparsepp headers into `dep/sparsepp/` before running make.
 

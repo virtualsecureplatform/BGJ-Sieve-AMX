@@ -11,10 +11,14 @@ import shlex
 import subprocess
 import sys
 import time
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_SVPCHALLENGE_DIR = ROOT.parent / "G6K-GPU-Tensor" / "svpchallenge"
+SVPCHALLENGE_URL = "https://www.latticechallenge.org/svp-challenge/generator.php"
 
 BEGIN_RE = re.compile(r"begin bgj1 sieve, sieving dimension = (\d+), pool size = (\d+)")
 SOL_RE = re.compile(r"solution collect done, found (\d+) solutions in (\d+) buckets")
@@ -88,7 +92,7 @@ PRESET_TIMEOUTS = {
     "standard": (600, 1800),
     "extended": (1800, 7200),
     "tune": (3600, 14400),
-    "ladder": (1800, 14400),
+    "ladder": (3600, 28800),
 }
 
 
@@ -142,12 +146,119 @@ def template_lattice_path(template, dim, seed):
     return path.resolve()
 
 
-def default_existing_lattice(dim):
-    candidates = [
-        ROOT.parent / "G6K-GPU-Tensor" / "svpchallenge" / f"svpchallenge-dim-{dim:03d}-seed-00.txt",
-        ROOT / "tmp" / f"L_{dim}",
-    ]
-    for path in candidates:
+def svpchallenge_lattice_path(args, dim):
+    return (
+        args.svpchallenge_dir
+        / f"svpchallenge-dim-{dim:03d}-seed-{args.svpchallenge_seed:02d}.txt"
+    ).resolve()
+
+
+def validate_svpchallenge_text(text, dim):
+    rows = 0
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line == "]":
+            continue
+        if not line.startswith("[") or not line.endswith("]"):
+            raise ValueError("unexpected SVP challenge matrix row format")
+        values = line.replace("[", " ").replace("]", " ").split()
+        if len(values) != dim:
+            raise ValueError(f"expected {dim} columns, found {len(values)}")
+        for value in values:
+            int(value)
+        rows += 1
+    if rows != dim:
+        raise ValueError(f"expected {dim} rows, found {rows}")
+
+
+def matrix_integer_tokens(text):
+    return [int(value) for value in re.findall(r"-?\d+", text)]
+
+
+def fetch_svpchallenge_lattice(args, dim):
+    path = svpchallenge_lattice_path(args, dim)
+    if path.exists():
+        return path
+    if args.dry_run:
+        return path
+    if not args.fetch_svpchallenge:
+        return None
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = urllib.parse.urlencode(
+        {
+            "dimension": str(dim),
+            "seed": str(args.svpchallenge_seed),
+            "sent": "True",
+        }
+    ).encode("ascii")
+    request = urllib.request.Request(
+        SVPCHALLENGE_URL,
+        data=payload,
+        headers={"User-Agent": "BGJ-Sieve-AMX benchmark harness"},
+    )
+    print(
+        f"downloading SVP challenge dim={dim} seed={args.svpchallenge_seed}: {SVPCHALLENGE_URL}",
+        file=sys.stderr,
+        flush=True,
+    )
+    with urllib.request.urlopen(request, timeout=args.fetch_timeout_sec) as response:
+        text = response.read().decode("ascii")
+    validate_svpchallenge_text(text, dim)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(text.rstrip() + "\n", encoding="ascii")
+    tmp_path.replace(path)
+    return path.resolve()
+
+
+def validate_svpchallenge_generator(args, dim):
+    if args.svpchallenge_seed != 0:
+        raise ValueError("downloadable SVP challenge examples are seed-0 only")
+    download_url = (
+        "https://www.latticechallenge.org/svp-challenge/download/challenges/"
+        f"svpchallengedim{dim}seed0.txt"
+    )
+    payload = urllib.parse.urlencode(
+        {
+            "dimension": str(dim),
+            "seed": "0",
+            "sent": "True",
+        }
+    ).encode("ascii")
+    request_headers = {"User-Agent": "BGJ-Sieve-AMX benchmark harness"}
+    with urllib.request.urlopen(
+        urllib.request.Request(download_url, headers=request_headers),
+        timeout=args.fetch_timeout_sec,
+    ) as response:
+        downloaded = response.read().decode("ascii")
+    with urllib.request.urlopen(
+        urllib.request.Request(SVPCHALLENGE_URL, data=payload, headers=request_headers),
+        timeout=args.fetch_timeout_sec,
+    ) as response:
+        generated = response.read().decode("ascii")
+    downloaded_values = matrix_integer_tokens(downloaded)
+    generated_values = matrix_integer_tokens(generated)
+    expected_values = dim * dim
+    if len(downloaded_values) != expected_values:
+        raise ValueError(f"downloaded dim={dim} example has {len(downloaded_values)} integers")
+    if generated_values != downloaded_values:
+        raise ValueError(f"SVP challenge generator did not match downloadable dim={dim} seed-0 example")
+    print(
+        f"validated SVP challenge generator against downloadable dim={dim} seed-0 example",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def default_existing_lattice(args, dim):
+    lattice = fetch_svpchallenge_lattice(args, dim)
+    if lattice is not None and (lattice.exists() or args.dry_run):
+        return lattice
+
+    if args.allow_tmp_lattice:
+        path = ROOT / "tmp" / f"L_{dim}"
         if path.exists():
             return path.resolve()
     return None
@@ -163,7 +274,7 @@ def should_preprocess_lattice(path):
 def preprocess_lattice(args, source, outdir, dim):
     if not args.preprocess_svp or not should_preprocess_lattice(source):
         return source
-    target = outdir / "lattices" / f"svpchallenge-dim-{dim:03d}-seed{args.seed}-lll.txt"
+    target = outdir / "lattices" / f"{source.stem}-lll.txt"
     if target.exists() or args.dry_run:
         return target
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -188,9 +299,15 @@ def resolve_lattice(args, outdir, dim):
             raise FileNotFoundError(f"lattice template resolved to missing file: {lattice}")
         return preprocess_lattice(args, lattice, outdir, dim)
 
-    lattice = default_existing_lattice(dim)
+    lattice = default_existing_lattice(args, dim)
     if lattice is not None:
         return preprocess_lattice(args, lattice, outdir, dim)
+
+    if not args.synthetic_fallback:
+        raise FileNotFoundError(
+            f"missing SVP challenge dim={dim} seed={args.svpchallenge_seed}; "
+            "enable --synthetic-fallback or --allow-tmp-lattice to use non-challenge inputs"
+        )
 
     lattice = outdir / "lattices" / f"R_{dim}_seed{args.seed}.txt"
     if not lattice.exists() or not args.reuse_lattices:
@@ -402,10 +519,18 @@ def run_suite(args):
     commit = repo_commit()
 
     dims = parse_csv_ints(args.dims) if args.dims else PRESET_DIMS[args.preset]
-    modes = parse_csv_strings(args.modes) if args.modes else PRESET_MODES[args.preset]
+    modes = parse_csv_strings(args.modes) if args.modes is not None else PRESET_MODES[args.preset]
 
     for dim in dims:
         resolve_lattice(args, outdir, dim)
+
+    if args.prepare_only:
+        csv_path = outdir / "results.csv"
+        jsonl_path = outdir / "results.jsonl"
+        with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
+            csv.DictWriter(csv_file, fieldnames=CSV_FIELDS, extrasaction="ignore").writeheader()
+        jsonl_path.write_text("", encoding="utf-8")
+        return [], csv_path, jsonl_path
 
     csv_path = outdir / "results.csv"
     jsonl_path = outdir / "results.jsonl"
@@ -473,10 +598,25 @@ def parse_args(argv):
     parser.add_argument("--app", type=Path, default=ROOT / "app" / "bgj_epi8")
     parser.add_argument("--preprocess-app", type=Path, default=ROOT / "app" / "lattice_preprocess")
     parser.add_argument("--lattice-template", help="existing lattice path template, e.g. tmp/L_{dim}")
+    parser.add_argument("--svpchallenge-dir", type=Path, default=DEFAULT_SVPCHALLENGE_DIR)
+    parser.add_argument("--svpchallenge-seed", type=int, default=0)
+    parser.add_argument("--fetch-svpchallenge", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--fetch-timeout-sec", type=int, default=120)
+    parser.add_argument(
+        "--validate-svpchallenge-generator",
+        nargs="?",
+        const=140,
+        type=int,
+        metavar="DIM",
+        help="compare generator.php seed-0 output with a downloadable challenge example",
+    )
+    parser.add_argument("--allow-tmp-lattice", action="store_true")
+    parser.add_argument("--synthetic-fallback", action="store_true")
     parser.add_argument("--preprocess-svp", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--preprocess-timeout-sec", type=int, default=900)
     parser.add_argument("--output-dir", type=Path, default=default_out)
     parser.add_argument("--reuse-lattices", action="store_true")
+    parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--stop-on-timeout", action="store_true")
     parser.add_argument("--stop-on-failure", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -486,6 +626,7 @@ def parse_args(argv):
         args.timeout_sec = default_timeout
     if args.time_budget_sec is None:
         args.time_budget_sec = default_budget
+    args.svpchallenge_dir = args.svpchallenge_dir.resolve()
     return args
 
 
@@ -493,6 +634,8 @@ def main(argv):
     args = parse_args(argv)
     args.output_dir = args.output_dir.resolve()
     args.app = args.app.resolve()
+    if args.validate_svpchallenge_generator is not None:
+        validate_svpchallenge_generator(args, args.validate_svpchallenge_generator)
     if not args.app.exists() and not args.dry_run:
         print(f"missing benchmark binary: {args.app}", file=sys.stderr)
         return 2
