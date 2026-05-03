@@ -62,11 +62,11 @@ repeated tile loads use the A100 read-only cache. Set
 `BGJ_CUDA_TENSOR_NP_MIN_TILES=<n>` to tune the positive/negative Tensor
 threshold, `BGJ_CUDA_TENSOR_SAME=0` to disable only same-side Tensor tiles, or
 `BGJ_CUDA_TENSOR_SAME_MIN_TILES=<n>` to tune the same-side threshold. A
-shared-A positive/negative Tensor kernel and a wider 64x64 positive/negative
-Tensor kernel are available for profiling with
-`BGJ_CUDA_TENSOR_NP_SHARED_A=1` and `BGJ_CUDA_TENSOR_NP_WIDE=1`; both are off
-by default on A100 because the lighter four-warp 16x16-tile path benchmarks
-faster.
+shared-A positive/negative Tensor kernel, a wider 64x64 positive/negative
+Tensor kernel, and a 32x256 positive/negative multi-fragment Tensor kernel are
+available for profiling with `BGJ_CUDA_TENSOR_NP_SHARED_A=1`,
+`BGJ_CUDA_TENSOR_NP_WIDE=1`, and `BGJ_CUDA_TENSOR_NP_MULTI=1`; these are off
+by default on A100 because their wins depend on dimension and bucket shape.
 CUDA bucket search uses a nonblocking per-thread CUDA stream. By default, CUDA
 search keeps the current pool vectors in a shared on-device cache and packs
 bucket rows on-device; set `BGJ_CUDA_POOL_CACHE=0` to disable this and copy

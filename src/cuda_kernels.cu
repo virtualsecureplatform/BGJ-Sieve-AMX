@@ -16,6 +16,9 @@ static char bgj_cuda_error[512] = "no CUDA error";
 #define BGJ_CUDA_TENSOR_WARPS_PER_BLOCK 4u
 #define BGJ_CUDA_TENSOR_THREADS_PER_BLOCK (BGJ_CUDA_WARP_SIZE * BGJ_CUDA_TENSOR_WARPS_PER_BLOCK)
 #define BGJ_CUDA_TENSOR_NP_WIDE_TILES 4u
+#define BGJ_CUDA_TENSOR_NP_MULTI_P_TILES 2u
+#define BGJ_CUDA_TENSOR_NP_MULTI_N_TILES_PER_WARP 4u
+#define BGJ_CUDA_TENSOR_NP_MULTI_N_TILES (BGJ_CUDA_TENSOR_WARPS_PER_BLOCK * BGJ_CUDA_TENSOR_NP_MULTI_N_TILES_PER_WARP)
 
 typedef wmma::fragment<wmma::matrix_a, 16, 16, 16, signed char, wmma::row_major> bgj_cuda_i8_a_frag_t;
 typedef wmma::fragment<wmma::matrix_b, 16, 16, 16, signed char, wmma::col_major> bgj_cuda_i8_b_frag_t;
@@ -418,6 +421,194 @@ void bgj_cuda_search_np_tensor_reordered_kernel(const uint64_t *p_a_frags,
         if (record_dp && p_dot[p] + n_dot[n] - dp < center_goal_norm) {
             bgj_cuda_push_result(results, result_count, overflow, result_capacity,
                                  BGJ_CUDA_SOL_SA, p_ids[p], n_ids[n]);
+        }
+    }
+}
+
+__global__ __launch_bounds__(BGJ_CUDA_TENSOR_THREADS_PER_BLOCK, 1)
+void bgj_cuda_search_np_tensor_multi_kernel(const uint64_t *p_a_frags,
+                                            const uint64_t *n_b_frags,
+                                            const uint32_t *p_ids,
+                                            const uint32_t *n_ids,
+                                            const int32_t *p_norm,
+                                            const int32_t *n_norm,
+                                            const int32_t *p_dot,
+                                            const int32_t *n_dot,
+                                            uint32_t group_blocks_n,
+                                            uint32_t k_blocks,
+                                            int32_t goal_norm,
+                                            int32_t center_goal_norm,
+                                            int record_dp,
+                                            bgj_cuda_result_t *results,
+                                            uint32_t result_capacity,
+                                            uint32_t *result_count,
+                                            int *overflow)
+{
+    const uint32_t warp_id = threadIdx.x / BGJ_CUDA_WARP_SIZE;
+    const uint32_t lane_id = threadIdx.x % BGJ_CUDA_WARP_SIZE;
+    const uint32_t group_p = blockIdx.x / group_blocks_n;
+    const uint32_t group_n = blockIdx.x - group_p * group_blocks_n;
+    const uint32_t base_p_block = group_p * BGJ_CUDA_TENSOR_NP_MULTI_P_TILES;
+    const uint32_t base_n_block =
+        group_n * BGJ_CUDA_TENSOR_NP_MULTI_N_TILES +
+        warp_id * BGJ_CUDA_TENSOR_NP_MULTI_N_TILES_PER_WARP;
+
+    bgj_cuda_i8_a_frag_u a_frag[BGJ_CUDA_TENSOR_NP_MULTI_P_TILES];
+    bgj_cuda_i8_b_frag_u b_frag[BGJ_CUDA_TENSOR_NP_MULTI_N_TILES_PER_WARP];
+    wmma::fragment<wmma::accumulator, 16, 16, 16, int>
+        c_frag[BGJ_CUDA_TENSOR_NP_MULTI_P_TILES][BGJ_CUDA_TENSOR_NP_MULTI_N_TILES_PER_WARP];
+
+    #pragma unroll
+    for (uint32_t row_tile = 0; row_tile < BGJ_CUDA_TENSOR_NP_MULTI_P_TILES; row_tile++) {
+        #pragma unroll
+        for (uint32_t col_tile = 0; col_tile < BGJ_CUDA_TENSOR_NP_MULTI_N_TILES_PER_WARP; col_tile++) {
+            wmma::fill_fragment(c_frag[row_tile][col_tile], 0);
+        }
+    }
+
+    for (uint32_t k_block = 0; k_block < k_blocks; k_block++) {
+        #pragma unroll
+        for (uint32_t row_tile = 0; row_tile < BGJ_CUDA_TENSOR_NP_MULTI_P_TILES; row_tile++) {
+            const uint64_t *a_src = p_a_frags +
+                                    (((uint64_t)(base_p_block + row_tile) * k_blocks + k_block) *
+                                     BGJ_CUDA_WARP_SIZE + lane_id) *
+                                    BGJ_CUDA_I8_A_FRAG_WORDS;
+            #pragma unroll
+            for (uint32_t word = 0; word < BGJ_CUDA_I8_A_FRAG_WORDS; word++) {
+                a_frag[row_tile].word[word] = __ldg(a_src + word);
+            }
+        }
+        #pragma unroll
+        for (uint32_t col_tile = 0; col_tile < BGJ_CUDA_TENSOR_NP_MULTI_N_TILES_PER_WARP; col_tile++) {
+            const uint64_t *b_src = n_b_frags +
+                                    (((uint64_t)(base_n_block + col_tile) * k_blocks + k_block) *
+                                     BGJ_CUDA_WARP_SIZE + lane_id) *
+                                    BGJ_CUDA_I8_B_FRAG_WORDS;
+            #pragma unroll
+            for (uint32_t word = 0; word < BGJ_CUDA_I8_B_FRAG_WORDS; word++) {
+                b_frag[col_tile].word[word] = __ldg(b_src + word);
+            }
+        }
+
+        #pragma unroll
+        for (uint32_t row_tile = 0; row_tile < BGJ_CUDA_TENSOR_NP_MULTI_P_TILES; row_tile++) {
+            #pragma unroll
+            for (uint32_t col_tile = 0; col_tile < BGJ_CUDA_TENSOR_NP_MULTI_N_TILES_PER_WARP; col_tile++) {
+                wmma::mma_sync(c_frag[row_tile][col_tile],
+                               a_frag[row_tile].frag,
+                               b_frag[col_tile].frag,
+                               c_frag[row_tile][col_tile]);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (uint32_t row_tile = 0; row_tile < BGJ_CUDA_TENSOR_NP_MULTI_P_TILES; row_tile++) {
+        #pragma unroll
+        for (uint32_t col_tile = 0; col_tile < BGJ_CUDA_TENSOR_NP_MULTI_N_TILES_PER_WARP; col_tile++) {
+            const uint32_t tile_p = (base_p_block + row_tile) * 16u;
+            const uint32_t tile_n = (base_n_block + col_tile) * 16u;
+            #pragma unroll
+            for (uint32_t element = 0; element < c_frag[row_tile][col_tile].num_elements; element++) {
+                uint32_t row;
+                uint32_t col;
+                bgj_cuda_tensor_accumulator_coord(lane_id, element, &row, &col);
+                const uint32_t p = tile_p + row;
+                const uint32_t n = tile_n + col;
+                const int32_t dp = c_frag[row_tile][col_tile].x[element];
+
+                if (p_norm[p] + n_norm[n] + dp < goal_norm) {
+                    bgj_cuda_push_result(results, result_count, overflow, result_capacity,
+                                         BGJ_CUDA_SOL_A, p_ids[p], n_ids[n]);
+                }
+                if (record_dp && p_dot[p] + n_dot[n] - dp < center_goal_norm) {
+                    bgj_cuda_push_result(results, result_count, overflow, result_capacity,
+                                         BGJ_CUDA_SOL_SA, p_ids[p], n_ids[n]);
+                }
+            }
+        }
+    }
+}
+
+__global__ __launch_bounds__(BGJ_CUDA_TENSOR_THREADS_PER_BLOCK, 1)
+void bgj_cuda_search_np_tensor_wide_reordered_kernel(const uint64_t *p_a_frags,
+                                                     const uint64_t *n_b_frags,
+                                                     const uint32_t *p_ids,
+                                                     const uint32_t *n_ids,
+                                                     const int32_t *p_norm,
+                                                     const int32_t *n_norm,
+                                                     const int32_t *p_dot,
+                                                     const int32_t *n_dot,
+                                                     uint32_t group_blocks_n,
+                                                     uint32_t k_blocks,
+                                                     int32_t goal_norm,
+                                                     int32_t center_goal_norm,
+                                                     int record_dp,
+                                                     bgj_cuda_result_t *results,
+                                                     uint32_t result_capacity,
+                                                     uint32_t *result_count,
+                                                     int *overflow)
+{
+    const uint32_t warp_id = threadIdx.x / BGJ_CUDA_WARP_SIZE;
+    const uint32_t lane_id = threadIdx.x % BGJ_CUDA_WARP_SIZE;
+    const uint32_t group_p = blockIdx.x / group_blocks_n;
+    const uint32_t group_n = blockIdx.x - group_p * group_blocks_n;
+    const uint32_t tile_block_p = group_p * BGJ_CUDA_TENSOR_WARPS_PER_BLOCK + warp_id;
+    const uint32_t base_n_block = group_n * BGJ_CUDA_TENSOR_NP_WIDE_TILES;
+
+    bgj_cuda_i8_a_frag_u a_frag;
+    bgj_cuda_i8_b_frag_u b_frag[BGJ_CUDA_TENSOR_NP_WIDE_TILES];
+    wmma::fragment<wmma::accumulator, 16, 16, 16, int> c_frag[BGJ_CUDA_TENSOR_NP_WIDE_TILES];
+
+    #pragma unroll
+    for (uint32_t col_tile = 0; col_tile < BGJ_CUDA_TENSOR_NP_WIDE_TILES; col_tile++) {
+        wmma::fill_fragment(c_frag[col_tile], 0);
+    }
+
+    for (uint32_t k_block = 0; k_block < k_blocks; k_block++) {
+        const uint64_t *a_src = p_a_frags +
+                                (((uint64_t)tile_block_p * k_blocks + k_block) *
+                                 BGJ_CUDA_WARP_SIZE + lane_id) *
+                                BGJ_CUDA_I8_A_FRAG_WORDS;
+        #pragma unroll
+        for (uint32_t word = 0; word < BGJ_CUDA_I8_A_FRAG_WORDS; word++) {
+            a_frag.word[word] = __ldg(a_src + word);
+        }
+        #pragma unroll
+        for (uint32_t col_tile = 0; col_tile < BGJ_CUDA_TENSOR_NP_WIDE_TILES; col_tile++) {
+            const uint64_t *b_src = n_b_frags +
+                                    (((uint64_t)(base_n_block + col_tile) * k_blocks + k_block) *
+                                     BGJ_CUDA_WARP_SIZE + lane_id) *
+                                    BGJ_CUDA_I8_B_FRAG_WORDS;
+            #pragma unroll
+            for (uint32_t word = 0; word < BGJ_CUDA_I8_B_FRAG_WORDS; word++) {
+                b_frag[col_tile].word[word] = __ldg(b_src + word);
+            }
+            wmma::mma_sync(c_frag[col_tile], a_frag.frag, b_frag[col_tile].frag, c_frag[col_tile]);
+        }
+    }
+
+    #pragma unroll
+    for (uint32_t col_tile = 0; col_tile < BGJ_CUDA_TENSOR_NP_WIDE_TILES; col_tile++) {
+        const uint32_t tile_p = tile_block_p * 16u;
+        const uint32_t tile_n = (base_n_block + col_tile) * 16u;
+        #pragma unroll
+        for (uint32_t element = 0; element < c_frag[col_tile].num_elements; element++) {
+            uint32_t row;
+            uint32_t col;
+            bgj_cuda_tensor_accumulator_coord(lane_id, element, &row, &col);
+            const uint32_t p = tile_p + row;
+            const uint32_t n = tile_n + col;
+            const int32_t dp = c_frag[col_tile].x[element];
+
+            if (p_norm[p] + n_norm[n] + dp < goal_norm) {
+                bgj_cuda_push_result(results, result_count, overflow, result_capacity,
+                                     BGJ_CUDA_SOL_A, p_ids[p], n_ids[n]);
+            }
+            if (record_dp && p_dot[p] + n_dot[n] - dp < center_goal_norm) {
+                bgj_cuda_push_result(results, result_count, overflow, result_capacity,
+                                     BGJ_CUDA_SOL_SA, p_ids[p], n_ids[n]);
+            }
         }
     }
 }
@@ -1024,6 +1215,13 @@ static int bgj_cuda_tensor_reorder_requested()
     return 1;
 }
 
+static int bgj_cuda_tensor_np_multi_requested()
+{
+    const char *env = getenv("BGJ_CUDA_TENSOR_NP_MULTI");
+    if (env && env[0]) return env[0] != '0';
+    return 0;
+}
+
 static uint32_t bgj_cuda_tensor_np_min_tiles()
 {
     const char *env = getenv("BGJ_CUDA_TENSOR_NP_MIN_TILES");
@@ -1212,29 +1410,100 @@ static int bgj_cuda_search_bucket_raw_impl(const int8_t *p_vecs,
                     (uint64_t)(wide_blocks_p / BGJ_CUDA_TENSOR_NP_WIDE_TILES) *
                     (uint64_t)wide_group_blocks_n;
                 if (wide_groups <= 0x7fffffffu) {
-                    bgj_cuda_search_np_tensor_wide_kernel<<<(uint32_t)wide_groups,
-                                                            BGJ_CUDA_TENSOR_THREADS_PER_BLOCK,
-                                                            0,
-                                                            stream>>>(scratch->p_vecs,
-                                                                      scratch->n_vecs,
-                                                                      scratch->p_ids,
-                                                                      scratch->n_ids,
-                                                                      scratch->p_norm,
-                                                                      scratch->n_norm,
-                                                                      scratch->p_dot,
-                                                                      scratch->n_dot,
-                                                                      wide_group_blocks_n,
-                                                                      vec_length,
-                                                                      goal_norm,
-                                                                      goal_norm - center_norm,
-                                                                      record_dp,
-                                                                      scratch->results,
-                                                                      result_capacity,
-                                                                      scratch->result_count,
-                                                                      scratch->overflow);
-                    CUDA_TRY(cudaGetLastError());
-                    tensor_np_num_p = wide_blocks_p * 16u;
-                    tensor_np_num_n = wide_blocks_n * 16u;
+                    int wide_launch_ok = 1;
+                    if (bgj_cuda_tensor_reorder_requested()) {
+                        const uint32_t k_blocks = vec_length / 16u;
+                        const uint64_t p_frag_words =
+                            (uint64_t)wide_blocks_p * k_blocks * BGJ_CUDA_WARP_SIZE *
+                            BGJ_CUDA_I8_A_FRAG_WORDS;
+                        const uint64_t n_frag_words =
+                            (uint64_t)wide_blocks_n * k_blocks * BGJ_CUDA_WARP_SIZE *
+                            BGJ_CUDA_I8_B_FRAG_WORDS;
+                        const uint64_t p_pack_grid =
+                            ((uint64_t)wide_blocks_p * k_blocks + BGJ_CUDA_TENSOR_WARPS_PER_BLOCK - 1u) /
+                            BGJ_CUDA_TENSOR_WARPS_PER_BLOCK;
+                        const uint64_t n_pack_grid =
+                            ((uint64_t)wide_blocks_n * k_blocks + BGJ_CUDA_TENSOR_WARPS_PER_BLOCK - 1u) /
+                            BGJ_CUDA_TENSOR_WARPS_PER_BLOCK;
+                        if (p_pack_grid <= 0x7fffffffu && n_pack_grid <= 0x7fffffffu) {
+                            CUDA_ENSURE(scratch->p_tensor_a_frags,
+                                        scratch->p_tensor_a_frag_capacity,
+                                        (size_t)p_frag_words * sizeof(uint64_t));
+                            CUDA_ENSURE(scratch->n_tensor_b_frags,
+                                        scratch->n_tensor_b_frag_capacity,
+                                        (size_t)n_frag_words * sizeof(uint64_t));
+                            bgj_cuda_pack_a_frag_kernel<<<(uint32_t)p_pack_grid,
+                                                          BGJ_CUDA_TENSOR_THREADS_PER_BLOCK,
+                                                          0,
+                                                          stream>>>(scratch->p_vecs,
+                                                                    wide_blocks_p,
+                                                                    k_blocks,
+                                                                    vec_length,
+                                                                    scratch->p_tensor_a_frags);
+                            CUDA_TRY(cudaGetLastError());
+                            bgj_cuda_pack_b_frag_kernel<<<(uint32_t)n_pack_grid,
+                                                          BGJ_CUDA_TENSOR_THREADS_PER_BLOCK,
+                                                          0,
+                                                          stream>>>(scratch->n_vecs,
+                                                                    wide_blocks_n,
+                                                                    k_blocks,
+                                                                    vec_length,
+                                                                    scratch->n_tensor_b_frags);
+                            CUDA_TRY(cudaGetLastError());
+                            bgj_cuda_search_np_tensor_wide_reordered_kernel<<<(uint32_t)wide_groups,
+                                                                              BGJ_CUDA_TENSOR_THREADS_PER_BLOCK,
+                                                                              0,
+                                                                              stream>>>(scratch->p_tensor_a_frags,
+                                                                                        scratch->n_tensor_b_frags,
+                                                                                        scratch->p_ids,
+                                                                                        scratch->n_ids,
+                                                                                        scratch->p_norm,
+                                                                                        scratch->n_norm,
+                                                                                        scratch->p_dot,
+                                                                                        scratch->n_dot,
+                                                                                        wide_group_blocks_n,
+                                                                                        k_blocks,
+                                                                                        goal_norm,
+                                                                                        goal_norm - center_norm,
+                                                                                        record_dp,
+                                                                                        scratch->results,
+                                                                                        result_capacity,
+                                                                                        scratch->result_count,
+                                                                                        scratch->overflow);
+                            CUDA_TRY(cudaGetLastError());
+                        } else {
+                            wide_launch_ok = 0;
+                        }
+                    } else {
+                        bgj_cuda_search_np_tensor_wide_kernel<<<(uint32_t)wide_groups,
+                                                                BGJ_CUDA_TENSOR_THREADS_PER_BLOCK,
+                                                                0,
+                                                                stream>>>(scratch->p_vecs,
+                                                                          scratch->n_vecs,
+                                                                          scratch->p_ids,
+                                                                          scratch->n_ids,
+                                                                          scratch->p_norm,
+                                                                          scratch->n_norm,
+                                                                          scratch->p_dot,
+                                                                          scratch->n_dot,
+                                                                          wide_group_blocks_n,
+                                                                          vec_length,
+                                                                          goal_norm,
+                                                                          goal_norm - center_norm,
+                                                                          record_dp,
+                                                                          scratch->results,
+                                                                          result_capacity,
+                                                                          scratch->result_count,
+                                                                          scratch->overflow);
+                        CUDA_TRY(cudaGetLastError());
+                    }
+                    if (wide_launch_ok) {
+                        tensor_np_num_p = wide_blocks_p * 16u;
+                        tensor_np_num_n = wide_blocks_n * 16u;
+                    } else {
+                        tensor_np_num_p = 0;
+                        tensor_np_num_n = 0;
+                    }
                 } else {
                     tensor_np_num_p = 0;
                     tensor_np_num_n = 0;
@@ -1278,49 +1547,60 @@ static int bgj_cuda_search_bucket_raw_impl(const int8_t *p_vecs,
             } else if (tensor_tiles >= tensor_np_min_tiles &&
                        bgj_cuda_tensor_reorder_requested()) {
                 const uint32_t k_blocks = vec_length / 16u;
-                const uint64_t p_frag_words =
-                    (uint64_t)tensor_blocks_p * k_blocks * BGJ_CUDA_WARP_SIZE *
-                    BGJ_CUDA_I8_A_FRAG_WORDS;
-                const uint64_t n_frag_words =
-                    (uint64_t)tensor_blocks_n * k_blocks * BGJ_CUDA_WARP_SIZE *
-                    BGJ_CUDA_I8_B_FRAG_WORDS;
-                const uint64_t tensor_grid = (tensor_tiles + BGJ_CUDA_TENSOR_WARPS_PER_BLOCK - 1u) /
-                                             BGJ_CUDA_TENSOR_WARPS_PER_BLOCK;
-                const uint64_t p_pack_grid =
-                    ((uint64_t)tensor_blocks_p * k_blocks + BGJ_CUDA_TENSOR_WARPS_PER_BLOCK - 1u) /
-                    BGJ_CUDA_TENSOR_WARPS_PER_BLOCK;
-                const uint64_t n_pack_grid =
-                    ((uint64_t)tensor_blocks_n * k_blocks + BGJ_CUDA_TENSOR_WARPS_PER_BLOCK - 1u) /
-                    BGJ_CUDA_TENSOR_WARPS_PER_BLOCK;
-                if (tensor_tiles <= 0xffffffffULL &&
-                    tensor_grid <= 0x7fffffffu &&
-                    p_pack_grid <= 0x7fffffffu &&
-                    n_pack_grid <= 0x7fffffffu) {
-                    CUDA_ENSURE(scratch->p_tensor_a_frags,
-                                scratch->p_tensor_a_frag_capacity,
-                                (size_t)p_frag_words * sizeof(uint64_t));
-                    CUDA_ENSURE(scratch->n_tensor_b_frags,
-                                scratch->n_tensor_b_frag_capacity,
-                                (size_t)n_frag_words * sizeof(uint64_t));
-                    bgj_cuda_pack_a_frag_kernel<<<(uint32_t)p_pack_grid,
-                                                  BGJ_CUDA_TENSOR_THREADS_PER_BLOCK,
-                                                  0,
-                                                  stream>>>(scratch->p_vecs,
-                                                            tensor_blocks_p,
-                                                            k_blocks,
-                                                            vec_length,
-                                                            scratch->p_tensor_a_frags);
-                    CUDA_TRY(cudaGetLastError());
-                    bgj_cuda_pack_b_frag_kernel<<<(uint32_t)n_pack_grid,
-                                                  BGJ_CUDA_TENSOR_THREADS_PER_BLOCK,
-                                                  0,
-                                                  stream>>>(scratch->n_vecs,
-                                                            tensor_blocks_n,
-                                                            k_blocks,
-                                                            vec_length,
-                                                            scratch->n_tensor_b_frags);
-                    CUDA_TRY(cudaGetLastError());
-                    bgj_cuda_search_np_tensor_reordered_kernel<<<(uint32_t)tensor_grid,
+                if (bgj_cuda_tensor_np_multi_requested() &&
+                    tensor_blocks_p >= BGJ_CUDA_TENSOR_NP_MULTI_P_TILES &&
+                    tensor_blocks_n >= BGJ_CUDA_TENSOR_NP_MULTI_N_TILES) {
+                    const uint32_t multi_blocks_p =
+                        (tensor_blocks_p / BGJ_CUDA_TENSOR_NP_MULTI_P_TILES) *
+                        BGJ_CUDA_TENSOR_NP_MULTI_P_TILES;
+                    const uint32_t multi_blocks_n =
+                        (tensor_blocks_n / BGJ_CUDA_TENSOR_NP_MULTI_N_TILES) *
+                        BGJ_CUDA_TENSOR_NP_MULTI_N_TILES;
+                    const uint32_t multi_group_blocks_n =
+                        multi_blocks_n / BGJ_CUDA_TENSOR_NP_MULTI_N_TILES;
+                    const uint64_t multi_groups =
+                        (uint64_t)(multi_blocks_p / BGJ_CUDA_TENSOR_NP_MULTI_P_TILES) *
+                        (uint64_t)multi_group_blocks_n;
+                    const uint64_t p_frag_words =
+                        (uint64_t)multi_blocks_p * k_blocks * BGJ_CUDA_WARP_SIZE *
+                        BGJ_CUDA_I8_A_FRAG_WORDS;
+                    const uint64_t n_frag_words =
+                        (uint64_t)multi_blocks_n * k_blocks * BGJ_CUDA_WARP_SIZE *
+                        BGJ_CUDA_I8_B_FRAG_WORDS;
+                    const uint64_t p_pack_grid =
+                        ((uint64_t)multi_blocks_p * k_blocks + BGJ_CUDA_TENSOR_WARPS_PER_BLOCK - 1u) /
+                        BGJ_CUDA_TENSOR_WARPS_PER_BLOCK;
+                    const uint64_t n_pack_grid =
+                        ((uint64_t)multi_blocks_n * k_blocks + BGJ_CUDA_TENSOR_WARPS_PER_BLOCK - 1u) /
+                        BGJ_CUDA_TENSOR_WARPS_PER_BLOCK;
+                    if (multi_groups <= 0x7fffffffu &&
+                        p_pack_grid <= 0x7fffffffu &&
+                        n_pack_grid <= 0x7fffffffu) {
+                        CUDA_ENSURE(scratch->p_tensor_a_frags,
+                                    scratch->p_tensor_a_frag_capacity,
+                                    (size_t)p_frag_words * sizeof(uint64_t));
+                        CUDA_ENSURE(scratch->n_tensor_b_frags,
+                                    scratch->n_tensor_b_frag_capacity,
+                                    (size_t)n_frag_words * sizeof(uint64_t));
+                        bgj_cuda_pack_a_frag_kernel<<<(uint32_t)p_pack_grid,
+                                                      BGJ_CUDA_TENSOR_THREADS_PER_BLOCK,
+                                                      0,
+                                                      stream>>>(scratch->p_vecs,
+                                                                multi_blocks_p,
+                                                                k_blocks,
+                                                                vec_length,
+                                                                scratch->p_tensor_a_frags);
+                        CUDA_TRY(cudaGetLastError());
+                        bgj_cuda_pack_b_frag_kernel<<<(uint32_t)n_pack_grid,
+                                                      BGJ_CUDA_TENSOR_THREADS_PER_BLOCK,
+                                                      0,
+                                                      stream>>>(scratch->n_vecs,
+                                                                multi_blocks_n,
+                                                                k_blocks,
+                                                                vec_length,
+                                                                scratch->n_tensor_b_frags);
+                        CUDA_TRY(cudaGetLastError());
+                        bgj_cuda_search_np_tensor_multi_kernel<<<(uint32_t)multi_groups,
                                                                  BGJ_CUDA_TENSOR_THREADS_PER_BLOCK,
                                                                  0,
                                                                  stream>>>(scratch->p_tensor_a_frags,
@@ -1331,8 +1611,7 @@ static int bgj_cuda_search_bucket_raw_impl(const int8_t *p_vecs,
                                                                            scratch->n_norm,
                                                                            scratch->p_dot,
                                                                            scratch->n_dot,
-                                                                           tensor_blocks_n,
-                                                                           (uint32_t)tensor_tiles,
+                                                                           multi_group_blocks_n,
                                                                            k_blocks,
                                                                            goal_norm,
                                                                            goal_norm - center_norm,
@@ -1341,10 +1620,82 @@ static int bgj_cuda_search_bucket_raw_impl(const int8_t *p_vecs,
                                                                            result_capacity,
                                                                            scratch->result_count,
                                                                            scratch->overflow);
-                    CUDA_TRY(cudaGetLastError());
+                        CUDA_TRY(cudaGetLastError());
+                        tensor_np_num_p = multi_blocks_p * 16u;
+                        tensor_np_num_n = multi_blocks_n * 16u;
+                    } else {
+                        tensor_np_num_p = 0;
+                        tensor_np_num_n = 0;
+                    }
                 } else {
-                    tensor_np_num_p = 0;
-                    tensor_np_num_n = 0;
+                    const uint64_t p_frag_words =
+                        (uint64_t)tensor_blocks_p * k_blocks * BGJ_CUDA_WARP_SIZE *
+                        BGJ_CUDA_I8_A_FRAG_WORDS;
+                    const uint64_t n_frag_words =
+                        (uint64_t)tensor_blocks_n * k_blocks * BGJ_CUDA_WARP_SIZE *
+                        BGJ_CUDA_I8_B_FRAG_WORDS;
+                    const uint64_t tensor_grid = (tensor_tiles + BGJ_CUDA_TENSOR_WARPS_PER_BLOCK - 1u) /
+                                                 BGJ_CUDA_TENSOR_WARPS_PER_BLOCK;
+                    const uint64_t p_pack_grid =
+                        ((uint64_t)tensor_blocks_p * k_blocks + BGJ_CUDA_TENSOR_WARPS_PER_BLOCK - 1u) /
+                        BGJ_CUDA_TENSOR_WARPS_PER_BLOCK;
+                    const uint64_t n_pack_grid =
+                        ((uint64_t)tensor_blocks_n * k_blocks + BGJ_CUDA_TENSOR_WARPS_PER_BLOCK - 1u) /
+                        BGJ_CUDA_TENSOR_WARPS_PER_BLOCK;
+                    if (tensor_tiles <= 0xffffffffULL &&
+                        tensor_grid <= 0x7fffffffu &&
+                        p_pack_grid <= 0x7fffffffu &&
+                        n_pack_grid <= 0x7fffffffu) {
+                        CUDA_ENSURE(scratch->p_tensor_a_frags,
+                                    scratch->p_tensor_a_frag_capacity,
+                                    (size_t)p_frag_words * sizeof(uint64_t));
+                        CUDA_ENSURE(scratch->n_tensor_b_frags,
+                                    scratch->n_tensor_b_frag_capacity,
+                                    (size_t)n_frag_words * sizeof(uint64_t));
+                        bgj_cuda_pack_a_frag_kernel<<<(uint32_t)p_pack_grid,
+                                                      BGJ_CUDA_TENSOR_THREADS_PER_BLOCK,
+                                                      0,
+                                                      stream>>>(scratch->p_vecs,
+                                                                tensor_blocks_p,
+                                                                k_blocks,
+                                                                vec_length,
+                                                                scratch->p_tensor_a_frags);
+                        CUDA_TRY(cudaGetLastError());
+                        bgj_cuda_pack_b_frag_kernel<<<(uint32_t)n_pack_grid,
+                                                      BGJ_CUDA_TENSOR_THREADS_PER_BLOCK,
+                                                      0,
+                                                      stream>>>(scratch->n_vecs,
+                                                                tensor_blocks_n,
+                                                                k_blocks,
+                                                                vec_length,
+                                                                scratch->n_tensor_b_frags);
+                        CUDA_TRY(cudaGetLastError());
+                        bgj_cuda_search_np_tensor_reordered_kernel<<<(uint32_t)tensor_grid,
+                                                                     BGJ_CUDA_TENSOR_THREADS_PER_BLOCK,
+                                                                     0,
+                                                                     stream>>>(scratch->p_tensor_a_frags,
+                                                                               scratch->n_tensor_b_frags,
+                                                                               scratch->p_ids,
+                                                                               scratch->n_ids,
+                                                                               scratch->p_norm,
+                                                                               scratch->n_norm,
+                                                                               scratch->p_dot,
+                                                                               scratch->n_dot,
+                                                                               tensor_blocks_n,
+                                                                               (uint32_t)tensor_tiles,
+                                                                               k_blocks,
+                                                                               goal_norm,
+                                                                               goal_norm - center_norm,
+                                                                               record_dp,
+                                                                               scratch->results,
+                                                                               result_capacity,
+                                                                               scratch->result_count,
+                                                                               scratch->overflow);
+                        CUDA_TRY(cudaGetLastError());
+                    } else {
+                        tensor_np_num_p = 0;
+                        tensor_np_num_n = 0;
+                    }
                 }
             } else if (tensor_tiles >= tensor_np_min_tiles) {
                 const uint64_t tensor_grid = (tensor_tiles + BGJ_CUDA_TENSOR_WARPS_PER_BLOCK - 1u) /

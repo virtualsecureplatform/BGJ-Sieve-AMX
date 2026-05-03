@@ -428,6 +428,9 @@ int main()
     setenv("BGJ_CUDA_TENSOR_NP_MIN_TILES", "1", 1);
     setenv("BGJ_CUDA_TENSOR_REORDER", "1", 1);
     ok = run_case("tensor-np-reorder-160", 64, 64, 160, true, 13, ThresholdMode::Selective) && ok;
+    setenv("BGJ_CUDA_TENSOR_NP_MULTI", "1", 1);
+    ok = run_case("tensor-np-multi-160", 64, 256, 160, true, 14, ThresholdMode::Selective) && ok;
+    unsetenv("BGJ_CUDA_TENSOR_NP_MULTI");
     unsetenv("BGJ_CUDA_TENSOR_REORDER");
     setenv("BGJ_CUDA_TENSOR_NP_SHARED_A", "1", 1);
     ok = run_case("tensor-np-shared-a-160", 64, 64, 160, true, 12, ThresholdMode::Selective) && ok;
