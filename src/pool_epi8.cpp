@@ -2178,3 +2178,11 @@ template class Pool_epi8_t<4>;
 #if COMPILE_POOL_EPI8_160
 template class Pool_epi8_t<5>;
 #endif
+
+#if COMPILE_POOL_EPI8_192
+template class Pool_epi8_t<6>;
+#endif
+
+#if COMPILE_POOL_EPI8_224
+template class Pool_epi8_t<7>;
+#endif

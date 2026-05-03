@@ -177,10 +177,10 @@ void __pump_red_epi8(Lattice_QP *L, long num_threads, double eta, long msd, long
         fprintf(stderr, "[Warning] sieving dimension too small, may get stuck, nothing done.\nYou can use Enum based algorithms instead.\n");
         return;
     }
-    if (msd > 96 + COMPILE_POOL_EPI8_128 * 32 + COMPILE_POOL_EPI8_160 * 32) {
+    if (msd > COMPILE_POOL_EPI8_MAX_DIM) {
         fprintf(stderr, "[Warning] sieving dimension(%ld) >= %d, nothing done\n"
-                "change COMPILE_POOL_EPI8_** in include/config.h to enable higher sieving dimension.\n", 
-                msd, 96 + COMPILE_POOL_EPI8_128 * 32 + COMPILE_POOL_EPI8_160 * 32);
+                "change COMPILE_POOL_EPI8_** in include/config.h to enable higher sieving dimension.\n",
+                msd, COMPILE_POOL_EPI8_MAX_DIM);
         return;
     }
     
@@ -298,9 +298,21 @@ void __pump_red_epi8(Lattice_QP *L, long num_threads, double eta, long msd, long
             p.set_num_threads(num_threads);
             __PUMP_RED_EPI8_ONE_TRY;
             #endif
-        } else {
+        } else if (msd <= 160) {
             #if COMPILE_POOL_EPI8_160
             Pool_epi8_t<5> p(L);
+            p.set_num_threads(num_threads);
+            __PUMP_RED_EPI8_ONE_TRY;
+            #endif
+        } else if (msd <= 192) {
+            #if COMPILE_POOL_EPI8_192
+            Pool_epi8_t<6> p(L);
+            p.set_num_threads(num_threads);
+            __PUMP_RED_EPI8_ONE_TRY;
+            #endif
+        } else {
+            #if COMPILE_POOL_EPI8_224
+            Pool_epi8_t<7> p(L);
             p.set_num_threads(num_threads);
             __PUMP_RED_EPI8_ONE_TRY;
             #endif

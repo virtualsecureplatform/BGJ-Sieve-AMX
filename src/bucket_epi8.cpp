@@ -2978,3 +2978,61 @@ template int Pool_epi8_t<5>::_search_nn<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, 0, 1>(
 template uint64_t Pool_epi8_t<5>::_pool_insert<1>(sol_list_epi8_t **sol_list, long num_sol_list, int32_t goal_norm, int32_t goal_index, bgj_profile_data_t<5> *prof);
 template uint64_t Pool_epi8_t<5>::_pool_insert<0>(sol_list_epi8_t **sol_list, long num_sol_list, int32_t goal_norm, int32_t goal_index, bgj_profile_data_t<5> *prof);
 #endif
+
+#if BGJ3_EPI8_BUCKET0_BATCHSIZE != BGJ2_EPI8_BUCKET0_BATCHSIZE
+#define INSTANTIATE_BUCKET_EPI8_BGJ3_BUCKET0(NB) \
+template int Pool_epi8_t<NB>::_pool_bucketing<BGJ3_EPI8_BUCKET0_BATCHSIZE, BGJ3_EPI8_REUSE0_USE_3RED, BGJ3_EPI8_USE_FARAWAY_CENTER, 0, 1>(bucket_epi8_t<BGJ3_EPI8_REUSE0_USE_3RED> **dst3, bucket_epi8_t<0> **dst2, double alpha3, double alpha2); \
+template int Pool_epi8_t<NB>::_pool_bucketing<BGJ3_EPI8_BUCKET0_BATCHSIZE, BGJ3_EPI8_REUSE0_USE_3RED, BGJ3_EPI8_USE_FARAWAY_CENTER, 0, 0>(bucket_epi8_t<BGJ3_EPI8_REUSE0_USE_3RED> **dst3, bucket_epi8_t<0> **dst2, double alpha3, double alpha2);
+#else
+#define INSTANTIATE_BUCKET_EPI8_BGJ3_BUCKET0(NB)
+#endif
+
+#if BGJ3_EPI8_BUCKET2_BATCHSIZE != BGJ2_EPI8_BUCKET2_BATCHSIZE
+#define INSTANTIATE_BUCKET_EPI8_BGJ3_BUCKET2(NB) \
+template int Pool_epi8_t<NB>::_sub_bucketing<BGJ3_EPI8_BUCKET2_BATCHSIZE, BGJ3_EPI8_USE_FARAWAY_CENTER, 1, 1, 1>(bucket_epi8_t<0> *main_bucket, bucket_epi8_t<0> **dst3, bucket_epi8_t<0> **dst2, double alpha3, double alpha2, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<NB> *prof); \
+template int Pool_epi8_t<NB>::_sub_bucketing<BGJ3_EPI8_BUCKET2_BATCHSIZE, BGJ3_EPI8_USE_FARAWAY_CENTER, 1, 0, 1>(bucket_epi8_t<0> *main_bucket, bucket_epi8_t<0> **dst3, bucket_epi8_t<0> **dst2, double alpha3, double alpha2, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<NB> *prof);
+#else
+#define INSTANTIATE_BUCKET_EPI8_BGJ3_BUCKET2(NB)
+#endif
+
+#if BGJ_NEED_SEARCH_3RED
+#define INSTANTIATE_BUCKET_EPI8_3RED_SEARCH(NB) \
+template int Pool_epi8_t<NB>::_search_cred<1, 1>(bucket_epi8_t<1> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<NB> *prof); \
+template int Pool_epi8_t<NB>::_search_np<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, 1, 1>(bucket_epi8_t<1> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<NB> *prof); \
+template int Pool_epi8_t<NB>::_search_pp<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, 1, 1>(bucket_epi8_t<1> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<NB> *prof); \
+template int Pool_epi8_t<NB>::_search_nn<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, 1, 1>(bucket_epi8_t<1> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<NB> *prof);
+#else
+#define INSTANTIATE_BUCKET_EPI8_3RED_SEARCH(NB)
+#endif
+
+#define INSTANTIATE_BUCKET_EPI8(NB) \
+template int Pool_epi8_t<NB>::_pool_bucketing<BGJ1_EPI8_BUCKET_BATCHSIZE, BGJ1_EPI8_USE_3RED, BGJ1_EPI8_USE_FARAWAY_CENTER, 1, 1>(bucket_epi8_t<BGJ1_EPI8_USE_3RED> **dst3, bucket_epi8_t<0> **dst2, double alpha3, double alpha2); \
+template int Pool_epi8_t<NB>::_pool_bucketing<BGJ1_EPI8_BUCKET_BATCHSIZE, BGJ1_EPI8_USE_3RED, BGJ1_EPI8_USE_FARAWAY_CENTER, 1, 0>(bucket_epi8_t<BGJ1_EPI8_USE_3RED> **dst3, bucket_epi8_t<0> **dst2, double alpha3, double alpha2); \
+template int Pool_epi8_t<NB>::_pool_bucketing<BGJ2_EPI8_BUCKET0_BATCHSIZE, BGJ2_EPI8_REUSE_USE_3RED, BGJ2_EPI8_USE_FARAWAY_CENTER, 0, 1>(bucket_epi8_t<BGJ2_EPI8_REUSE_USE_3RED> **dst3, bucket_epi8_t<0> **dst2, double alpha3, double alpha2); \
+template int Pool_epi8_t<NB>::_pool_bucketing<BGJ2_EPI8_BUCKET0_BATCHSIZE, BGJ2_EPI8_REUSE_USE_3RED, BGJ2_EPI8_USE_FARAWAY_CENTER, 0, 0>(bucket_epi8_t<BGJ2_EPI8_REUSE_USE_3RED> **dst3, bucket_epi8_t<0> **dst2, double alpha3, double alpha2); \
+INSTANTIATE_BUCKET_EPI8_BGJ3_BUCKET0(NB) \
+template int Pool_epi8_t<NB>::_sub_bucketing<BGJ2_EPI8_BUCKET1_BATCHSIZE, BGJ2_EPI8_USE_FARAWAY_CENTER, 1, 1, 1>(bucket_epi8_t<0> *main_bucket, bucket_epi8_t<0> **dst3, bucket_epi8_t<0> **dst2, double alpha3, double alpha2, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<NB> *prof); \
+template int Pool_epi8_t<NB>::_sub_bucketing<BGJ2_EPI8_BUCKET1_BATCHSIZE, BGJ2_EPI8_USE_FARAWAY_CENTER, 1, 0, 1>(bucket_epi8_t<0> *main_bucket, bucket_epi8_t<0> **dst3, bucket_epi8_t<0> **dst2, double alpha3, double alpha2, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<NB> *prof); \
+template int Pool_epi8_t<NB>::_sub_bucketing<BGJ3_EPI8_BUCKET1_BATCHSIZE, BGJ3_EPI8_USE_FARAWAY_CENTER, 0, 1, 1>(bucket_epi8_t<0> *main_bucket, bucket_epi8_t<0> **dst3, bucket_epi8_t<0> **dst2, double alpha3, double alpha2, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<NB> *prof); \
+template int Pool_epi8_t<NB>::_sub_bucketing<BGJ3_EPI8_BUCKET1_BATCHSIZE, BGJ3_EPI8_USE_FARAWAY_CENTER, 0, 0, 1>(bucket_epi8_t<0> *main_bucket, bucket_epi8_t<0> **dst3, bucket_epi8_t<0> **dst2, double alpha3, double alpha2, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<NB> *prof); \
+INSTANTIATE_BUCKET_EPI8_BGJ3_BUCKET2(NB) \
+INSTANTIATE_BUCKET_EPI8_3RED_SEARCH(NB) \
+template int Pool_epi8_t<NB>::_search_cred<0, 1>(bucket_epi8_t<0> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<NB> *prof); \
+template int Pool_epi8_t<NB>::_search_np<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, 0, 1>(bucket_epi8_t<0> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<NB> *prof); \
+template int Pool_epi8_t<NB>::_search_pp<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, 0, 1>(bucket_epi8_t<0> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<NB> *prof); \
+template int Pool_epi8_t<NB>::_search_nn<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, 0, 1>(bucket_epi8_t<0> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<NB> *prof); \
+template uint64_t Pool_epi8_t<NB>::_pool_insert<1>(sol_list_epi8_t **sol_list, long num_sol_list, int32_t goal_norm, int32_t goal_index, bgj_profile_data_t<NB> *prof); \
+template uint64_t Pool_epi8_t<NB>::_pool_insert<0>(sol_list_epi8_t **sol_list, long num_sol_list, int32_t goal_norm, int32_t goal_index, bgj_profile_data_t<NB> *prof);
+
+#if COMPILE_POOL_EPI8_192
+INSTANTIATE_BUCKET_EPI8(6)
+#endif
+
+#if COMPILE_POOL_EPI8_224
+INSTANTIATE_BUCKET_EPI8(7)
+#endif
+
+#undef INSTANTIATE_BUCKET_EPI8
+#undef INSTANTIATE_BUCKET_EPI8_3RED_SEARCH
+#undef INSTANTIATE_BUCKET_EPI8_BGJ3_BUCKET2
+#undef INSTANTIATE_BUCKET_EPI8_BGJ3_BUCKET0

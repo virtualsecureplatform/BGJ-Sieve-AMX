@@ -167,14 +167,28 @@ int main(int argc, char** argv) {
                     __last_lsh_pump_epi8(&L, num_threads, lsh_qr, lsh_er, msd, esd, log_level, 0, ssd);
                 }
             } else {
+#define FINAL_PUMP do {                                                                             \
+                    p.left_progressive_bgjfsieve(L.NumRows() - msd, L.NumRows(), num_threads, 16384+log_level - 3, ssd); \
+                    while (p.CSD < msd + esd) {                                                                 \
+                        p.extend_left();                                                                        \
+                        if (p.CSD >= 92) {                                                                      \
+                            p.bgj3_Sieve(log_level - 3, 1);                                                     \
+                        } else if (p.CSD > 80) {                                                                \
+                            p.bgj2_Sieve(log_level - 3, 1);                                                     \
+                        } else {                                                                                \
+                            p.bgj1_Sieve(log_level - 3, 1);                                                     \
+                        }                                                                                       \
+                        p.show_min_lift(0);                                                                     \
+                    }                                                                                           \
+                } while (0)
                 if (amx) {
                     #if defined(__AMX_INT8__)
                     Pool_epi8_t<5> p(&L);
-                    p.left_progressive_amx(L.NumRows() - msd, L.NumRows(), num_threads, 16384+log_level - 3, ssd); 
-                    while (p.CSD < msd + esd) {                                                                 
-                        p.extend_left();                                                                        
-                        p.bgj_amx_upsieve(log_level - 3, -1, -1.0, -1, -10.0);                                                       
-                        p.show_min_lift(0);                                                                     
+                    p.left_progressive_amx(L.NumRows() - msd, L.NumRows(), num_threads, 16384+log_level - 3, ssd);
+                    while (p.CSD < msd + esd) {
+                        p.extend_left();
+                        p.bgj_amx_upsieve(log_level - 3, -1, -1.0, -1, -10.0);
+                        p.show_min_lift(0);
                     }
                     for (;;) {
                         std::ifstream INstream(".in");
@@ -220,24 +234,25 @@ int main(int argc, char** argv) {
                             sleep(60);
                         }
                         INstream.close();
-                    }           
+                    }
                     #endif
-                } else if (msd + esd > 128) {                                                                                   
-                    #define FINAL_PUMP do {                                                                             \
-                        p.left_progressive_bgjfsieve(L.NumRows() - msd, L.NumRows(), num_threads, 16384+log_level - 3, ssd); \
-                        while (p.CSD < msd + esd) {                                                                 \
-                            p.extend_left();                                                                        \
-                            if (p.CSD >= 92) {                                                                      \
-                                p.bgj3_Sieve(log_level - 3, 1);                                                     \
-                            } else if (p.CSD > 80) {                                                                \
-                                p.bgj2_Sieve(log_level - 3, 1);                                                     \
-                            } else {                                                                                \
-                                p.bgj1_Sieve(log_level - 3, 1);                                                     \
-                            }                                                                                       \
-                            p.show_min_lift(0);                                                                     \
-                        }                                                                                           \
-                    } while (0)
-                    
+                } else if (msd + esd > 224) {
+                    printf("Error: msd + esd > 224, please recompile with a larger Pool_epi8_t\n");
+                } else if (msd + esd > 192) {
+                    #if COMPILE_POOL_EPI8_224
+                    Pool_epi8_t<7> p(&L);
+                    FINAL_PUMP;
+                    #else
+                    printf("Error: msd + esd > 192, please recompile with COMPILE_POOL_EPI8_224 = 1\n");
+                    #endif
+                } else if (msd + esd > 160) {
+                    #if COMPILE_POOL_EPI8_192
+                    Pool_epi8_t<6> p(&L);
+                    FINAL_PUMP;
+                    #else
+                    printf("Error: msd + esd > 160, please recompile with COMPILE_POOL_EPI8_192 = 1\n");
+                    #endif
+                } else if (msd + esd > 128) {
                     #if COMPILE_POOL_EPI8_160
                     Pool_epi8_t<5> p(&L);
                     FINAL_PUMP;
@@ -255,6 +270,7 @@ int main(int argc, char** argv) {
                     Pool_epi8_t<3> p(&L);
                     FINAL_PUMP;
                 }
+#undef FINAL_PUMP
             }
         } else {
             if (lsh) {

@@ -60,6 +60,10 @@ Cores, `BGJ_CUDA_TENSOR_SAME=0` to disable only same-side Tensor tiles, or
 CUDA bucket search uses a nonblocking per-thread CUDA stream. An experimental
 pool-cache path can keep current pool vectors on the GPU and pack bucket rows
 on-device; set `BGJ_CUDA_POOL_CACHE=1` to enable it.
+The default CUDA/BGJ build now instantiates `Pool_epi8_t<6>` and
+`Pool_epi8_t<7>`, allowing non-LSH BGJ/CUDA paths to use 192- and
+224-dimensional int8 pool vectors. The LSH and AMX paths remain capped by their
+own template coverage.
 
 For large instances, it's recommended to use [sparsepp](https://github.com/greg7mdp/sparsepp) to replace the default `std::unordered_set` used in the implementation of UidHashTable. This can be done by changing `USE_SPARSEPP` in `include/config.h` to 1 and manually placing the sparsepp headers into `dep/sparsepp/` before running make.
 

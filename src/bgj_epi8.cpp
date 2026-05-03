@@ -1547,3 +1547,19 @@ template void bgj_profile_data_t<5>::pool_bucket_check<1>(bucket_epi8_t<1> **buc
 
 template class Pool_epi8_t<5>;
 #endif
+
+#if COMPILE_POOL_EPI8_192
+template struct bgj_profile_data_t<6>;
+template void bgj_profile_data_t<6>::pool_bucket_check<0>(bucket_epi8_t<0> **bucket_list, long num_bucket, double alpha);
+template void bgj_profile_data_t<6>::pool_bucket_check<1>(bucket_epi8_t<1> **bucket_list, long num_bucket, double alpha);
+
+template class Pool_epi8_t<6>;
+#endif
+
+#if COMPILE_POOL_EPI8_224
+template struct bgj_profile_data_t<7>;
+template void bgj_profile_data_t<7>::pool_bucket_check<0>(bucket_epi8_t<0> **bucket_list, long num_bucket, double alpha);
+template void bgj_profile_data_t<7>::pool_bucket_check<1>(bucket_epi8_t<1> **bucket_list, long num_bucket, double alpha);
+
+template class Pool_epi8_t<7>;
+#endif

@@ -80,98 +80,89 @@ int main(int argc, char** argv) {
     #if COMPILE_POOL_EPI8_160
     Pool_epi8_t<5> p5(&L);
     #endif
+    #if COMPILE_POOL_EPI8_192
+    Pool_epi8_t<6> p6(&L);
+    #endif
+    #if COMPILE_POOL_EPI8_224
+    Pool_epi8_t<7> p7(&L);
+    #endif
+
+#if COMPILE_POOL_EPI8_128
+#define RUN_EPI8_128_OR_FALLBACK(METHOD, DIM) p4.METHOD(0, (DIM), num_threads, log_level)
+#else
+#define RUN_EPI8_128_OR_FALLBACK(METHOD, DIM) p3.METHOD((DIM) - 96, (DIM), num_threads, log_level)
+#endif
+
+#if COMPILE_POOL_EPI8_160
+#define RUN_EPI8_160_OR_FALLBACK(METHOD, DIM) p5.METHOD(0, (DIM), num_threads, log_level)
+#elif COMPILE_POOL_EPI8_128
+#define RUN_EPI8_160_OR_FALLBACK(METHOD, DIM) p4.METHOD((DIM) - 128, (DIM), num_threads, log_level)
+#else
+#define RUN_EPI8_160_OR_FALLBACK(METHOD, DIM) p3.METHOD((DIM) - 96, (DIM), num_threads, log_level)
+#endif
+
+#if COMPILE_POOL_EPI8_192
+#define RUN_EPI8_192_OR_FALLBACK(METHOD, DIM) p6.METHOD(0, (DIM), num_threads, log_level)
+#elif COMPILE_POOL_EPI8_160
+#define RUN_EPI8_192_OR_FALLBACK(METHOD, DIM) p5.METHOD((DIM) - 160, (DIM), num_threads, log_level)
+#elif COMPILE_POOL_EPI8_128
+#define RUN_EPI8_192_OR_FALLBACK(METHOD, DIM) p4.METHOD((DIM) - 128, (DIM), num_threads, log_level)
+#else
+#define RUN_EPI8_192_OR_FALLBACK(METHOD, DIM) p3.METHOD((DIM) - 96, (DIM), num_threads, log_level)
+#endif
+
+#if COMPILE_POOL_EPI8_224
+#define RUN_EPI8_224_OR_FALLBACK(METHOD, DIM) p7.METHOD(0, (DIM), num_threads, log_level)
+#elif COMPILE_POOL_EPI8_192
+#define RUN_EPI8_224_OR_FALLBACK(METHOD, DIM) p6.METHOD((DIM) - 192, (DIM), num_threads, log_level)
+#elif COMPILE_POOL_EPI8_160
+#define RUN_EPI8_224_OR_FALLBACK(METHOD, DIM) p5.METHOD((DIM) - 160, (DIM), num_threads, log_level)
+#elif COMPILE_POOL_EPI8_128
+#define RUN_EPI8_224_OR_FALLBACK(METHOD, DIM) p4.METHOD((DIM) - 128, (DIM), num_threads, log_level)
+#else
+#define RUN_EPI8_224_OR_FALLBACK(METHOD, DIM) p3.METHOD((DIM) - 96, (DIM), num_threads, log_level)
+#endif
+
+#if COMPILE_POOL_EPI8_224
+#define RUN_EPI8_MAX_OR_FALLBACK(METHOD, DIM) p7.METHOD((DIM) - 224, (DIM), num_threads, log_level)
+#elif COMPILE_POOL_EPI8_192
+#define RUN_EPI8_MAX_OR_FALLBACK(METHOD, DIM) p6.METHOD((DIM) - 192, (DIM), num_threads, log_level)
+#elif COMPILE_POOL_EPI8_160
+#define RUN_EPI8_MAX_OR_FALLBACK(METHOD, DIM) p5.METHOD((DIM) - 160, (DIM), num_threads, log_level)
+#elif COMPILE_POOL_EPI8_128
+#define RUN_EPI8_MAX_OR_FALLBACK(METHOD, DIM) p4.METHOD((DIM) - 128, (DIM), num_threads, log_level)
+#else
+#define RUN_EPI8_MAX_OR_FALLBACK(METHOD, DIM) p3.METHOD((DIM) - 96, (DIM), num_threads, log_level)
+#endif
+
+#define RUN_EPI8_PROGRESSIVE(METHOD) do {                                      \
+        const long dim__ = L.NumRows();                                        \
+        if (dim__ <= 96) {                                                     \
+            p3.METHOD(0, dim__, num_threads, log_level);                       \
+        } else if (dim__ <= 128) {                                             \
+            RUN_EPI8_128_OR_FALLBACK(METHOD, dim__);                          \
+        } else if (dim__ <= 160) {                                             \
+            RUN_EPI8_160_OR_FALLBACK(METHOD, dim__);                          \
+        } else if (dim__ <= 192) {                                             \
+            RUN_EPI8_192_OR_FALLBACK(METHOD, dim__);                          \
+        } else if (dim__ <= 224) {                                             \
+            RUN_EPI8_224_OR_FALLBACK(METHOD, dim__);                          \
+        } else {                                                               \
+            RUN_EPI8_MAX_OR_FALLBACK(METHOD, dim__);                          \
+        }                                                                      \
+    } while (0)
 
     if (algo == 0){
-        if (L.NumRows() <= 96) {
-            p3.left_progressive_bgjfsieve(0, L.NumRows(), num_threads, log_level);
-        } else if (L.NumRows() <= 128) {
-            #if COMPILE_POOL_EPI8_128
-            p4.left_progressive_bgjfsieve(0, L.NumRows(), num_threads, log_level);
-            #else
-            p3.left_progressive_bgjfsieve(L.NumRows() - 96, L.NumRows(), num_threads, log_level);
-            #endif
-        } else {
-            #if COMPILE_POOL_EPI8_160
-            p5.left_progressive_bgjfsieve(0, L.NumRows(), num_threads, log_level);
-            #elif COMPILE_POOL_EPI8_128
-            p4.left_progressive_bgjfsieve(L.NumRows() - 128, L.NumRows(), num_threads, log_level);
-            #else
-            p3.left_progressive_bgjfsieve(L.NumRows() - 96, L.NumRows(), num_threads, log_level);
-            #endif
-        }    
+        RUN_EPI8_PROGRESSIVE(left_progressive_bgjfsieve);
     } else if (algo == 1) {
-        if (L.NumRows() <= 96) {
-            p3.left_progressive_bgj1sieve(0, L.NumRows(), num_threads, log_level);
-        } else if (L.NumRows() <= 128) {
-            #if COMPILE_POOL_EPI8_128
-            p4.left_progressive_bgj1sieve(0, L.NumRows(), num_threads, log_level);
-            #else
-            p3.left_progressive_bgj1sieve(L.NumRows() - 96, L.NumRows(), num_threads, log_level);
-            #endif
-        } else {
-            #if COMPILE_POOL_EPI8_160
-            p5.left_progressive_bgj1sieve(0, L.NumRows(), num_threads, log_level);
-            #elif COMPILE_POOL_EPI8_128
-            p4.left_progressive_bgj1sieve(L.NumRows() - 128, L.NumRows(), num_threads, log_level);
-            #else
-            p3.left_progressive_bgj1sieve(L.NumRows() - 96, L.NumRows(), num_threads, log_level);
-            #endif
-        }    
+        RUN_EPI8_PROGRESSIVE(left_progressive_bgj1sieve);
     } else if (algo == 2) {
-        if (L.NumRows() <= 96) {
-            p3.left_progressive_bgj2sieve(0, L.NumRows(), num_threads, log_level);
-        } else if (L.NumRows() <= 128) {
-            #if COMPILE_POOL_EPI8_128
-            p4.left_progressive_bgj2sieve(0, L.NumRows(), num_threads, log_level);
-            #else
-            p3.left_progressive_bgj2sieve(L.NumRows() - 96, L.NumRows(), num_threads, log_level);
-            #endif
-        } else {
-            #if COMPILE_POOL_EPI8_160
-            p5.left_progressive_bgj2sieve(0, L.NumRows(), num_threads, log_level);
-            #elif COMPILE_POOL_EPI8_128
-            p4.left_progressive_bgj2sieve(L.NumRows() - 128, L.NumRows(), num_threads, log_level);
-            #else
-            p3.left_progressive_bgj2sieve(L.NumRows() - 96, L.NumRows(), num_threads, log_level);
-            #endif
-        }    
+        RUN_EPI8_PROGRESSIVE(left_progressive_bgj2sieve);
     } else if (algo == 3) {
-        if (L.NumRows() <= 96) {
-            p3.left_progressive_bgj3sieve(0, L.NumRows(), num_threads, log_level);
-        } else if (L.NumRows() <= 128) {
-            #if COMPILE_POOL_EPI8_128
-            p4.left_progressive_bgj3sieve(0, L.NumRows(), num_threads, log_level);
-            #else
-            p3.left_progressive_bgj3sieve(L.NumRows() - 96, L.NumRows(), num_threads, log_level);
-            #endif
-        } else {
-            #if COMPILE_POOL_EPI8_160
-            p5.left_progressive_bgj3sieve(0, L.NumRows(), num_threads, log_level);
-            #elif COMPILE_POOL_EPI8_128
-            p4.left_progressive_bgj3sieve(L.NumRows() - 128, L.NumRows(), num_threads, log_level);
-            #else
-            p3.left_progressive_bgj3sieve(L.NumRows() - 96, L.NumRows(), num_threads, log_level);
-            #endif
-        }
+        RUN_EPI8_PROGRESSIVE(left_progressive_bgj3sieve);
     } else if (algo == 7) {
         #if defined(HAVE_CUDA)
-        if (L.NumRows() <= 96) {
-            p3.left_progressive_bgj1sieve_cuda(0, L.NumRows(), num_threads, log_level);
-        } else if (L.NumRows() <= 128) {
-            #if COMPILE_POOL_EPI8_128
-            p4.left_progressive_bgj1sieve_cuda(0, L.NumRows(), num_threads, log_level);
-            #else
-            p3.left_progressive_bgj1sieve_cuda(L.NumRows() - 96, L.NumRows(), num_threads, log_level);
-            #endif
-        } else {
-            #if COMPILE_POOL_EPI8_160
-            p5.left_progressive_bgj1sieve_cuda(0, L.NumRows(), num_threads, log_level);
-            #elif COMPILE_POOL_EPI8_128
-            p4.left_progressive_bgj1sieve_cuda(L.NumRows() - 128, L.NumRows(), num_threads, log_level);
-            #else
-            p3.left_progressive_bgj1sieve_cuda(L.NumRows() - 96, L.NumRows(), num_threads, log_level);
-            #endif
-        }
+        RUN_EPI8_PROGRESSIVE(left_progressive_bgj1sieve_cuda);
         #else
         fprintf(stderr, "Error: CUDA support is not compiled in. Rebuild with `make CUDA=1`.\n");
         return 1;
@@ -181,5 +172,11 @@ int main(int argc, char** argv) {
         p5.left_progressive_amx(0, L.NumRows(), num_threads, log_level);
         #endif
     }
+#undef RUN_EPI8_PROGRESSIVE
+#undef RUN_EPI8_MAX_OR_FALLBACK
+#undef RUN_EPI8_224_OR_FALLBACK
+#undef RUN_EPI8_192_OR_FALLBACK
+#undef RUN_EPI8_160_OR_FALLBACK
+#undef RUN_EPI8_128_OR_FALLBACK
     return 0;
 }
