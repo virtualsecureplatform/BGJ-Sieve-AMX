@@ -73,8 +73,12 @@ bucket rows on-device; set `BGJ_CUDA_POOL_CACHE=0` to disable this and copy
 each bucket from the host instead. The raw pool interface also has an
 experimental batched entry point, `bgj_cuda_search_bucket_pool_batch_raw`,
 which submits several buckets on separate CUDA scratch streams and synchronizes
-once for counts before copying only the valid result ranges. It is currently
-used by the raw tests and benchmark harness rather than the full sieve loop.
+once for counts before copying only the valid result ranges. The BGJ1 CUDA
+sieve loop uses this batch path by default for one host thread when the first
+bucket in the group has at least `67108864` pair checks; set
+`BGJ_CUDA_BATCH=0` to disable it, `BGJ_CUDA_BATCH=1` to force it with multiple
+host threads, `BGJ_CUDA_BATCH_SIZE=<n>` to tune the group size, or
+`BGJ_CUDA_BATCH_MIN_DOTS=<n>` to tune the size threshold.
 The default CUDA/BGJ build now instantiates `Pool_epi8_t<6>` and
 `Pool_epi8_t<7>`, allowing non-LSH BGJ/CUDA paths to use 192- and
 224-dimensional int8 pool vectors. The LSH and AMX paths remain capped by their

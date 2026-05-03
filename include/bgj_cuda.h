@@ -21,5 +21,7 @@ int bgj_cuda_device_count();
 const char *bgj_cuda_last_error();
 int bgj_cuda_search_requested();
 void bgj_cuda_set_search_requested(int enabled);
+uint32_t bgj_cuda_batch_size(uint32_t host_threads);
+uint64_t bgj_cuda_batch_min_dots();
 
 #endif

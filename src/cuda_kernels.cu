@@ -8,7 +8,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <vector>
 
 using namespace nvcuda;
 
@@ -135,24 +134,47 @@ struct bgj_cuda_raw_scratch_t {
 static thread_local bgj_cuda_raw_scratch_t bgj_cuda_raw_scratch;
 
 struct bgj_cuda_raw_batch_scratch_t {
-    std::vector<bgj_cuda_raw_scratch_t *> items;
+    bgj_cuda_raw_scratch_t **items;
+    size_t size;
+    size_t capacity;
+
+    bgj_cuda_raw_batch_scratch_t()
+        : items(NULL),
+          size(0),
+          capacity(0)
+    {
+    }
 
     ~bgj_cuda_raw_batch_scratch_t()
     {
-        for (size_t i = 0; i < items.size(); i++) {
-            delete items[i];
+        for (size_t i = 0; i < size; i++) {
+            if (items[i]) {
+                items[i]->~bgj_cuda_raw_scratch_t();
+                free(items[i]);
+            }
         }
+        free(items);
     }
 
     bgj_cuda_raw_scratch_t *get(uint32_t index)
     {
-        while (items.size() <= (size_t)index) {
-            bgj_cuda_raw_scratch_t *scratch = new (std::nothrow) bgj_cuda_raw_scratch_t;
-            if (!scratch) return NULL;
-            try {
-                items.push_back(scratch);
-            } catch (...) {
-                delete scratch;
+        if ((size_t)index >= capacity) {
+            size_t new_capacity = capacity ? capacity : 8;
+            while (new_capacity <= (size_t)index) new_capacity *= 2;
+            bgj_cuda_raw_scratch_t **new_items =
+                (bgj_cuda_raw_scratch_t **)realloc(items, new_capacity * sizeof(bgj_cuda_raw_scratch_t *));
+            if (!new_items) return NULL;
+            items = new_items;
+            for (size_t i = capacity; i < new_capacity; i++) items[i] = NULL;
+            capacity = new_capacity;
+        }
+        while (size <= (size_t)index) {
+            void *memory = malloc(sizeof(bgj_cuda_raw_scratch_t));
+            if (!memory) return NULL;
+            bgj_cuda_raw_scratch_t *scratch = new (memory) bgj_cuda_raw_scratch_t;
+            items[size] = scratch;
+            size++;
+            if (!scratch) {
                 return NULL;
             }
         }
