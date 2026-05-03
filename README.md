@@ -104,9 +104,18 @@ debugging.
 An experimental CUDA candidate materializer is available with
 `BGJ_CUDA_MATERIALIZE=1`. It chunks solution records, uses signed INT8 cuBLAS
 GEMM for coefficient reconstruction, and uses cuBLAS SGEMM for the float
-reconstruction stage. It is off by default because current end-to-end SVP-50
-A100 timings are slower than the CPU materializer; tune the chunk size with
-`BGJ_CUDA_MATERIALIZE_CHUNK=<n>` when profiling it.
+reconstruction stage. It keeps the basis resident on the GPU across repeated
+calls when the hashed `_b_dual`/`_b_local` content is unchanged and stages
+device-to-host output through reusable pinned host buffers. Disable those with
+`BGJ_CUDA_MATERIALIZE_BASIS_CACHE=0` and
+`BGJ_CUDA_MATERIALIZE_PINNED_HOST=0` when isolating transfer costs. Tune the
+cuBLAS chunk size with `BGJ_CUDA_MATERIALIZE_CHUNK=<n>` when profiling it.
+A fused one-kernel small-batch materializer is also available with
+`BGJ_CUDA_MATERIALIZE_FUSED=1` and capped by
+`BGJ_CUDA_MATERIALIZE_FUSED_MAX=<n>`, but it is not the default on A100 because
+cached cuBLAS is usually faster in the current microbenchmarks. The
+materializer remains off by default because current end-to-end SVP-60/70 A100
+timings are still slower than the optimized AVX2 CPU materializer.
 The default CUDA/BGJ build now instantiates `Pool_epi8_t<6>` and
 `Pool_epi8_t<7>`, allowing non-LSH BGJ/CUDA paths to use 192- and
 224-dimensional int8 pool vectors. The LSH and AMX paths remain capped by their

@@ -1181,6 +1181,38 @@ static int ensure_cuda_capacity(void **ptr, size_t *capacity, size_t requested)
     return 1;
 }
 
+static int ensure_cuda_host_capacity(void **ptr, size_t *capacity, size_t requested)
+{
+    if (requested <= *capacity) return 1;
+    cudaError_t err = cudaFreeHost(*ptr);
+    if (err != cudaSuccess) {
+        set_cuda_error("cudaFreeHost", err);
+        return 0;
+    }
+    *ptr = NULL;
+    *capacity = 0;
+    err = cudaHostAlloc(ptr, requested, cudaHostAllocDefault);
+    if (err != cudaSuccess) {
+        set_cuda_error("cudaHostAlloc", err);
+        return 0;
+    }
+    *capacity = requested;
+    return 1;
+}
+
+static uint64_t bgj_cuda_hash_bytes(const void *data, size_t size)
+{
+    const uint8_t *bytes = (const uint8_t *)data;
+    uint64_t hash = 1469598103934665603ULL;
+    for (size_t i = 0; i < size; i++) {
+        hash ^= (uint64_t)bytes[i];
+        hash *= 1099511628211ULL;
+    }
+    hash ^= (uint64_t)size;
+    hash *= 1099511628211ULL;
+    return hash;
+}
+
 struct bgj_cuda_shared_pool_cache_t {
     int8_t *vecs;
     size_t capacity;
@@ -1288,6 +1320,9 @@ struct bgj_cuda_materialize_scratch_t {
     int8_t *dst_vec;
     int32_t *dst_vnorm;
     int32_t *dst_vsum;
+    int8_t *host_dst_vec;
+    int32_t *host_dst_vnorm;
+    int32_t *host_dst_vsum;
     cudaStream_t stream;
     cublasHandle_t handle;
     size_t desc_capacity;
@@ -1302,6 +1337,17 @@ struct bgj_cuda_materialize_scratch_t {
     size_t dst_vec_capacity;
     size_t dst_vnorm_capacity;
     size_t dst_vsum_capacity;
+    size_t host_dst_vec_capacity;
+    size_t host_dst_vnorm_capacity;
+    size_t host_dst_vsum_capacity;
+    const uint8_t *basis_b_dual_host;
+    const float *basis_b_local_host;
+    uint32_t basis_vec_length;
+    uint32_t basis_csd;
+    uint64_t basis_b_dual_hash;
+    uint64_t basis_b_local_hash;
+    int basis_ready;
+    int b_dual_i8_ready;
     int stream_ready;
     int handle_ready;
     pthread_mutex_t lock;
@@ -1319,6 +1365,9 @@ struct bgj_cuda_materialize_scratch_t {
           dst_vec(NULL),
           dst_vnorm(NULL),
           dst_vsum(NULL),
+          host_dst_vec(NULL),
+          host_dst_vnorm(NULL),
+          host_dst_vsum(NULL),
           stream(NULL),
           handle(NULL),
           desc_capacity(0),
@@ -1333,6 +1382,17 @@ struct bgj_cuda_materialize_scratch_t {
           dst_vec_capacity(0),
           dst_vnorm_capacity(0),
           dst_vsum_capacity(0),
+          host_dst_vec_capacity(0),
+          host_dst_vnorm_capacity(0),
+          host_dst_vsum_capacity(0),
+          basis_b_dual_host(NULL),
+          basis_b_local_host(NULL),
+          basis_vec_length(0),
+          basis_csd(0),
+          basis_b_dual_hash(0),
+          basis_b_local_hash(0),
+          basis_ready(0),
+          b_dual_i8_ready(0),
           stream_ready(0),
           handle_ready(0)
     {
@@ -1355,6 +1415,9 @@ struct bgj_cuda_materialize_scratch_t {
         cudaFree(dst_vec);
         cudaFree(dst_vnorm);
         cudaFree(dst_vsum);
+        cudaFreeHost(host_dst_vec);
+        cudaFreeHost(host_dst_vnorm);
+        cudaFreeHost(host_dst_vsum);
         if (stream_ready) cudaStreamDestroy(stream);
         pthread_mutex_destroy(&lock);
     }
@@ -1372,6 +1435,11 @@ static int bgj_cuda_prepare_materialize_stream(bgj_cuda_materialize_scratch_t *s
         }
         scratch->stream_ready = 1;
     }
+    return 1;
+}
+
+static int bgj_cuda_prepare_materialize_handle(bgj_cuda_materialize_scratch_t *scratch)
+{
     if (!scratch->handle_ready) {
         cublasStatus_t status = cublasCreate(&scratch->handle);
         if (status != CUBLAS_STATUS_SUCCESS) {
@@ -1390,6 +1458,111 @@ static int bgj_cuda_prepare_materialize_stream(bgj_cuda_materialize_scratch_t *s
         set_cublas_error("cublasSetStream materialize", status);
         return 0;
     }
+    return 1;
+}
+
+static int bgj_cuda_materialize_pinned_host_requested()
+{
+    const char *env = getenv("BGJ_CUDA_MATERIALIZE_PINNED_HOST");
+    if (env && env[0]) return env[0] != '0';
+    return 1;
+}
+
+static int bgj_cuda_materialize_copy_outputs(bgj_cuda_materialize_scratch_t *scratch,
+                                             uint32_t count,
+                                             uint32_t vec_length,
+                                             int8_t *dst_vec,
+                                             int32_t *dst_vnorm,
+                                             int32_t *dst_vsum)
+{
+    const size_t vec_bytes = (size_t)count * vec_length * sizeof(int8_t);
+    const size_t i32_bytes = (size_t)count * sizeof(int32_t);
+    cudaError_t err;
+
+    if (!bgj_cuda_materialize_pinned_host_requested()) {
+        err = cudaMemcpyAsync(dst_vec,
+                              scratch->dst_vec,
+                              vec_bytes,
+                              cudaMemcpyDeviceToHost,
+                              scratch->stream);
+        if (err != cudaSuccess) {
+            set_cuda_error("cudaMemcpyAsync materialize dst_vec", err);
+            return 0;
+        }
+        err = cudaMemcpyAsync(dst_vnorm,
+                              scratch->dst_vnorm,
+                              i32_bytes,
+                              cudaMemcpyDeviceToHost,
+                              scratch->stream);
+        if (err != cudaSuccess) {
+            set_cuda_error("cudaMemcpyAsync materialize dst_vnorm", err);
+            return 0;
+        }
+        err = cudaMemcpyAsync(dst_vsum,
+                              scratch->dst_vsum,
+                              i32_bytes,
+                              cudaMemcpyDeviceToHost,
+                              scratch->stream);
+        if (err != cudaSuccess) {
+            set_cuda_error("cudaMemcpyAsync materialize dst_vsum", err);
+            return 0;
+        }
+        err = cudaStreamSynchronize(scratch->stream);
+        if (err != cudaSuccess) {
+            set_cuda_error("cudaStreamSynchronize materialize output", err);
+            return 0;
+        }
+        return 1;
+    }
+
+    if (!ensure_cuda_host_capacity((void **)&scratch->host_dst_vec,
+                                   &scratch->host_dst_vec_capacity,
+                                   vec_bytes) ||
+        !ensure_cuda_host_capacity((void **)&scratch->host_dst_vnorm,
+                                   &scratch->host_dst_vnorm_capacity,
+                                   i32_bytes) ||
+        !ensure_cuda_host_capacity((void **)&scratch->host_dst_vsum,
+                                   &scratch->host_dst_vsum_capacity,
+                                   i32_bytes)) {
+        return 0;
+    }
+
+    err = cudaMemcpyAsync(scratch->host_dst_vec,
+                          scratch->dst_vec,
+                          vec_bytes,
+                          cudaMemcpyDeviceToHost,
+                          scratch->stream);
+    if (err != cudaSuccess) {
+        set_cuda_error("cudaMemcpyAsync pinned materialize dst_vec", err);
+        return 0;
+    }
+    err = cudaMemcpyAsync(scratch->host_dst_vnorm,
+                          scratch->dst_vnorm,
+                          i32_bytes,
+                          cudaMemcpyDeviceToHost,
+                          scratch->stream);
+    if (err != cudaSuccess) {
+        set_cuda_error("cudaMemcpyAsync pinned materialize dst_vnorm", err);
+        return 0;
+    }
+    err = cudaMemcpyAsync(scratch->host_dst_vsum,
+                          scratch->dst_vsum,
+                          i32_bytes,
+                          cudaMemcpyDeviceToHost,
+                          scratch->stream);
+    if (err != cudaSuccess) {
+        set_cuda_error("cudaMemcpyAsync pinned materialize dst_vsum", err);
+        return 0;
+    }
+    err = cudaStreamSynchronize(scratch->stream);
+    if (err != cudaSuccess) {
+        set_cuda_error("cudaStreamSynchronize pinned materialize output", err);
+        return 0;
+    }
+
+    memcpy(dst_vec, scratch->host_dst_vec, vec_bytes);
+    memcpy(dst_vnorm, scratch->host_dst_vnorm, i32_bytes);
+    memcpy(dst_vsum, scratch->host_dst_vsum, i32_bytes);
     return 1;
 }
 
@@ -1526,6 +1699,107 @@ static void bgj_cuda_materialize_finish_kernel(const float *fvec,
     }
 }
 
+__global__ __launch_bounds__(BGJ_CUDA_MATERIALIZE_THREADS, 1)
+static void bgj_cuda_materialize_fused_kernel(const int8_t *pool_vecs,
+                                              uint32_t vec_length,
+                                              const bgj_cuda_materialize_desc_t *desc,
+                                              uint32_t count,
+                                              const uint8_t *b_dual,
+                                              const float *b_local,
+                                              uint32_t csd,
+                                              int32_t dhalf,
+                                              int32_t dshift,
+                                              int8_t *dst_vec,
+                                              int32_t *dst_vnorm,
+                                              int32_t *dst_vsum)
+{
+    const uint32_t cand = blockIdx.x;
+    if (cand >= count) return;
+
+    __shared__ int8_t tmp[BGJ_CUDA_MATERIALIZE_MAX_DIM];
+    __shared__ int16_t exact[BGJ_CUDA_MATERIALIZE_MAX_DIM];
+    __shared__ int32_t coeff[BGJ_CUDA_MATERIALIZE_MAX_DIM];
+    __shared__ int32_t ireduce[BGJ_CUDA_MATERIALIZE_THREADS];
+    __shared__ float freduce[BGJ_CUDA_MATERIALIZE_THREADS];
+    __shared__ int reject_flag;
+
+    const uint32_t tid = threadIdx.x;
+    const bgj_cuda_materialize_desc_t d = desc[cand];
+
+    for (uint32_t j = tid; j < vec_length; j += blockDim.x) {
+        const int x = (int)pool_vecs[(uint64_t)d.x * vec_length + j];
+        const int y = (int)pool_vecs[(uint64_t)d.y * vec_length + j];
+        int v = 0;
+        switch (d.type) {
+        case BGJ_CUDA_SOL_A:
+            v = x + y;
+            break;
+        case BGJ_CUDA_SOL_S:
+            v = x - y;
+            break;
+        case BGJ_CUDA_SOL_AA:
+            v = x + y + (int)pool_vecs[(uint64_t)d.z * vec_length + j];
+            break;
+        case BGJ_CUDA_SOL_SA:
+            v = x - y + (int)pool_vecs[(uint64_t)d.z * vec_length + j];
+            break;
+        case BGJ_CUDA_SOL_SS:
+            v = x - y - (int)pool_vecs[(uint64_t)d.z * vec_length + j];
+            break;
+        default:
+            v = 0;
+            break;
+        }
+        tmp[j] = (int8_t)bgj_cuda_wrap_i8(v);
+        exact[j] = (int16_t)v;
+    }
+    __syncthreads();
+
+    for (uint32_t i = tid; i < csd; i += blockDim.x) {
+        int32_t dot = 0;
+        const uint8_t *dual_row = b_dual + (uint64_t)i * vec_length;
+        for (uint32_t j = 0; j < vec_length; j++) {
+            dot += ((int32_t)dual_row[j] - 128) * (int32_t)tmp[j];
+        }
+        coeff[i] = (dot + dhalf) >> dshift;
+    }
+    if (tid == 0) reject_flag = 0;
+    __syncthreads();
+
+    int local_sum = 0;
+    float local_norm = 0.0f;
+    int local_reject = 0;
+    for (uint32_t j = tid; j < vec_length; j += blockDim.x) {
+        float value = 0.0f;
+        for (uint32_t i = j; i < csd; i++) {
+            value += (float)coeff[i] * b_local[(uint64_t)i * vec_length + j];
+        }
+        const int rounded = __float2int_rn(value);
+        const int wrapped = bgj_cuda_wrap_i8(rounded);
+        dst_vec[(uint64_t)cand * vec_length + j] = (int8_t)wrapped;
+        local_sum += wrapped;
+        local_norm += value * value;
+        const int diff = (int)exact[j] - wrapped;
+        if ((diff < -3 || diff > 3) || wrapped == -128) local_reject = 1;
+    }
+
+    if (local_reject) atomicExch(&reject_flag, 1);
+    ireduce[tid] = local_sum;
+    freduce[tid] = local_norm;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            ireduce[tid] += ireduce[tid + stride];
+            freduce[tid] += freduce[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        dst_vsum[cand] = 128 * ireduce[0];
+        dst_vnorm[cand] = reject_flag ? 2147483647 : __float2int_rn(0.5f * freduce[0]);
+    }
+}
+
 static uint32_t bgj_cuda_materialize_chunk_size()
 {
     const char *env = getenv("BGJ_CUDA_MATERIALIZE_CHUNK");
@@ -1536,6 +1810,33 @@ static uint32_t bgj_cuda_materialize_chunk_size()
         if (end != env && parsed > 0) value = parsed;
     }
     if (value < 1024UL) value = 1024UL;
+    if (value > 1048576UL) value = 1048576UL;
+    return (uint32_t)value;
+}
+
+static int bgj_cuda_materialize_basis_cache_requested()
+{
+    const char *env = getenv("BGJ_CUDA_MATERIALIZE_BASIS_CACHE");
+    if (env && env[0]) return env[0] != '0';
+    return 1;
+}
+
+static int bgj_cuda_materialize_fused_requested()
+{
+    const char *env = getenv("BGJ_CUDA_MATERIALIZE_FUSED");
+    if (env && env[0]) return env[0] != '0';
+    return 0;
+}
+
+static uint32_t bgj_cuda_materialize_fused_max_count()
+{
+    const char *env = getenv("BGJ_CUDA_MATERIALIZE_FUSED_MAX");
+    unsigned long value = 8192UL;
+    if (env && env[0]) {
+        char *end = NULL;
+        unsigned long parsed = strtoul(env, &end, 10);
+        if (end != env && parsed > 0) value = parsed;
+    }
     if (value > 1048576UL) value = 1048576UL;
     return (uint32_t)value;
 }
@@ -1584,7 +1885,14 @@ extern "C" int bgj_cuda_materialize_sol_list_raw(const int8_t *pool_vecs,
     int beta_i = 0;
     float alpha_f = 1.0f;
     float beta_f = 0.0f;
+    int use_fused = 0;
     const size_t pool_vec_bytes = (size_t)pool_size * vec_length * sizeof(int8_t);
+    const size_t b_dual_bytes = (size_t)csd * vec_length * sizeof(uint8_t);
+    const size_t b_local_bytes = (size_t)csd * vec_length * sizeof(float);
+    const int basis_cache = bgj_cuda_materialize_basis_cache_requested();
+    uint64_t b_dual_hash = 0;
+    uint64_t b_local_hash = 0;
+    int upload_basis = 1;
     if (!bgj_cuda_prepare_materialize_stream(scratch)) goto fail;
     if (!bgj_cuda_prepare_shared_pool_cache(pool_vecs,
                                             pool_epoch,
@@ -1596,17 +1904,89 @@ extern "C" int bgj_cuda_materialize_sol_list_raw(const int8_t *pool_vecs,
         goto fail;
     }
 
-    CUDA_ENSURE(scratch->b_dual, scratch->b_dual_capacity, (size_t)csd * vec_length * sizeof(uint8_t));
-    CUDA_ENSURE(scratch->b_dual_i8, scratch->b_dual_i8_capacity, (size_t)csd * vec_length * sizeof(int8_t));
-    CUDA_ENSURE(scratch->b_local, scratch->b_local_capacity, (size_t)csd * vec_length * sizeof(float));
+    if (b_dual_bytes > scratch->b_dual_capacity || b_local_bytes > scratch->b_local_capacity) {
+        scratch->basis_ready = 0;
+        scratch->b_dual_i8_ready = 0;
+    }
+    CUDA_ENSURE(scratch->b_dual, scratch->b_dual_capacity, b_dual_bytes);
+    CUDA_ENSURE(scratch->b_local, scratch->b_local_capacity, b_local_bytes);
 
-    CUDA_TRY(cudaMemcpyAsync(scratch->b_dual, b_dual,
-                             (size_t)csd * vec_length * sizeof(uint8_t),
-                             cudaMemcpyHostToDevice, scratch->stream));
-    CUDA_TRY(cudaMemcpyAsync(scratch->b_local, b_local,
-                             (size_t)csd * vec_length * sizeof(float),
-                             cudaMemcpyHostToDevice, scratch->stream));
-    {
+    if (basis_cache) {
+        b_dual_hash = bgj_cuda_hash_bytes(b_dual, b_dual_bytes);
+        b_local_hash = bgj_cuda_hash_bytes(b_local, b_local_bytes);
+        upload_basis =
+            !scratch->basis_ready ||
+            scratch->basis_b_dual_host != b_dual ||
+            scratch->basis_b_local_host != b_local ||
+            scratch->basis_vec_length != vec_length ||
+            scratch->basis_csd != csd ||
+            scratch->basis_b_dual_hash != b_dual_hash ||
+            scratch->basis_b_local_hash != b_local_hash;
+    }
+    if (upload_basis) {
+        CUDA_TRY(cudaMemcpyAsync(scratch->b_dual, b_dual,
+                                 b_dual_bytes,
+                                 cudaMemcpyHostToDevice, scratch->stream));
+        CUDA_TRY(cudaMemcpyAsync(scratch->b_local, b_local,
+                                 b_local_bytes,
+                                 cudaMemcpyHostToDevice, scratch->stream));
+        scratch->basis_b_dual_host = b_dual;
+        scratch->basis_b_local_host = b_local;
+        scratch->basis_vec_length = vec_length;
+        scratch->basis_csd = csd;
+        scratch->basis_b_dual_hash = b_dual_hash;
+        scratch->basis_b_local_hash = b_local_hash;
+        scratch->basis_ready = basis_cache ? 1 : 0;
+        scratch->b_dual_i8_ready = 0;
+    }
+
+    use_fused = bgj_cuda_materialize_fused_requested() &&
+                count <= bgj_cuda_materialize_fused_max_count();
+    if (use_fused) {
+        CUDA_ENSURE(scratch->desc, scratch->desc_capacity, (size_t)count * sizeof(bgj_cuda_materialize_desc_t));
+        CUDA_ENSURE(scratch->dst_vec, scratch->dst_vec_capacity, (size_t)count * vec_length * sizeof(int8_t));
+        CUDA_ENSURE(scratch->dst_vnorm, scratch->dst_vnorm_capacity, (size_t)count * sizeof(int32_t));
+        CUDA_ENSURE(scratch->dst_vsum, scratch->dst_vsum_capacity, (size_t)count * sizeof(int32_t));
+        CUDA_TRY(cudaMemcpyAsync(scratch->desc, desc,
+                                 (size_t)count * sizeof(bgj_cuda_materialize_desc_t),
+                                 cudaMemcpyHostToDevice,
+                                 scratch->stream));
+        bgj_cuda_materialize_fused_kernel<<<count,
+                                            BGJ_CUDA_MATERIALIZE_THREADS,
+                                            0,
+                                            scratch->stream>>>(device_pool_vecs,
+                                                               vec_length,
+                                                               scratch->desc,
+                                                               count,
+                                                               scratch->b_dual,
+                                                               scratch->b_local,
+                                                               csd,
+                                                               dhalf,
+                                                               dshift,
+                                                               scratch->dst_vec,
+                                                               scratch->dst_vnorm,
+                                                               scratch->dst_vsum);
+        CUDA_TRY(cudaGetLastError());
+        if (!bgj_cuda_materialize_copy_outputs(scratch,
+                                               count,
+                                               vec_length,
+                                               dst_vec,
+                                               dst_vnorm,
+                                               dst_vsum)) {
+            goto fail;
+        }
+        pthread_mutex_unlock(&scratch->lock);
+        set_plain_error("no CUDA error");
+        return 1;
+    }
+
+    if (!bgj_cuda_prepare_materialize_handle(scratch)) goto fail;
+
+    if ((size_t)csd * vec_length * sizeof(int8_t) > scratch->b_dual_i8_capacity) {
+        scratch->b_dual_i8_ready = 0;
+    }
+    CUDA_ENSURE(scratch->b_dual_i8, scratch->b_dual_i8_capacity, (size_t)csd * vec_length * sizeof(int8_t));
+    if (!scratch->b_dual_i8_ready) {
         const uint64_t dual_total = (uint64_t)csd * vec_length;
         uint32_t dual_blocks = (uint32_t)((dual_total + 255u) / 256u);
         if (dual_blocks > 65535u) dual_blocks = 65535u;
@@ -1615,6 +1995,7 @@ extern "C" int bgj_cuda_materialize_sol_list_raw(const int8_t *pool_vecs,
             dual_total,
             scratch->b_dual_i8);
         CUDA_TRY(cudaGetLastError());
+        scratch->b_dual_i8_ready = 1;
     }
 
     chunk_limit = bgj_cuda_materialize_chunk_size();
@@ -1706,23 +2087,15 @@ extern "C" int bgj_cuda_materialize_sol_list_raw(const int8_t *pool_vecs,
                                                                 scratch->dst_vsum);
         CUDA_TRY(cudaGetLastError());
 
-        CUDA_TRY(cudaMemcpyAsync(dst_vec + (uint64_t)offset * vec_length,
-                                 scratch->dst_vec,
-                                 (size_t)chunk_count * vec_length * sizeof(int8_t),
-                                 cudaMemcpyDeviceToHost,
-                                 scratch->stream));
-        CUDA_TRY(cudaMemcpyAsync(dst_vnorm + offset,
-                                 scratch->dst_vnorm,
-                                 (size_t)chunk_count * sizeof(int32_t),
-                                 cudaMemcpyDeviceToHost,
-                                 scratch->stream));
-        CUDA_TRY(cudaMemcpyAsync(dst_vsum + offset,
-                                 scratch->dst_vsum,
-                                 (size_t)chunk_count * sizeof(int32_t),
-                                 cudaMemcpyDeviceToHost,
-                                 scratch->stream));
+        if (!bgj_cuda_materialize_copy_outputs(scratch,
+                                               chunk_count,
+                                               vec_length,
+                                               dst_vec + (uint64_t)offset * vec_length,
+                                               dst_vnorm + offset,
+                                               dst_vsum + offset)) {
+            goto fail;
+        }
     }
-    CUDA_TRY(cudaStreamSynchronize(scratch->stream));
 
     pthread_mutex_unlock(&scratch->lock);
     set_plain_error("no CUDA error");
