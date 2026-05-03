@@ -147,6 +147,19 @@ $ clang++ -O2 -g -std=c++11 -DHAVE_CUDA tests/bgj_cuda_materialize_test.cpp src/
 $ /tmp/bgj_cuda_materialize_test
 ```
 
+There is also a standalone materializer microbenchmark. It compares the raw
+CUDA materializer against a scalar host implementation of the same arithmetic;
+use end-to-end BGJ insert timings to compare against the library's optimized
+AVX2 CPU materializer.
+
+```bash
+$ clang++ -O3 -g -std=c++11 -DHAVE_CUDA tests/bgj_cuda_materialize_bench.cpp src/libllib.a \
+    -Iinclude -Idep/ntl/include -Ldep/ntl/lib -lntl -Ldep/gmp/lib -lgmp -lm \
+    -L/usr/local/cuda/lib64 -Wl,-rpath=/usr/local/cuda/lib64 -lcudart -lcublas \
+    -fopenmp=libomp -stdlib=libc++ -pthread -o /tmp/bgj_cuda_materialize_bench
+$ /tmp/bgj_cuda_materialize_bench 128 16384 3 8192 1
+```
+
 For end-to-end A100 tuning on seed-42 SVP-challenge ladders, use:
 
 ```bash
