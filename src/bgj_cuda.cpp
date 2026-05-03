@@ -30,6 +30,11 @@ uint64_t bgj_cuda_batch_min_dots()
     return 0xffffffffffffffffULL;
 }
 
+int bgj_cuda_materialize_requested()
+{
+    return 0;
+}
+
 int bgj_cuda_device_count()
 {
     return 0;
@@ -149,6 +154,13 @@ static int bgj_cuda_sort_results_requested()
 {
     const char *env = getenv("BGJ_CUDA_SORT_RESULTS");
     return env && env[0] && env[0] != '0';
+}
+
+int bgj_cuda_materialize_requested()
+{
+    const char *env = getenv("BGJ_CUDA_MATERIALIZE");
+    if (env && env[0]) return env[0] != '0';
+    return 0;
 }
 
 uint32_t bgj_cuda_batch_size(uint32_t host_threads)

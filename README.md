@@ -101,6 +101,12 @@ records are consumed in device result order by default, matching G6K's queue
 path and avoiding a full host-side sort of dense result buffers; set
 `BGJ_CUDA_SORT_RESULTS=1` to restore the older CPU-order approximation for
 debugging.
+An experimental CUDA candidate materializer is available with
+`BGJ_CUDA_MATERIALIZE=1`. It chunks solution records, uses signed INT8 cuBLAS
+GEMM for coefficient reconstruction, and uses cuBLAS SGEMM for the float
+reconstruction stage. It is off by default because current end-to-end SVP-50
+A100 timings are slower than the CPU materializer; tune the chunk size with
+`BGJ_CUDA_MATERIALIZE_CHUNK=<n>` when profiling it.
 The default CUDA/BGJ build now instantiates `Pool_epi8_t<6>` and
 `Pool_epi8_t<7>`, allowing non-LSH BGJ/CUDA paths to use 192- and
 224-dimensional int8 pool vectors. The LSH and AMX paths remain capped by their
@@ -123,12 +129,22 @@ directly or with Tensor disabled:
 ```bash
 $ clang++ -O2 -g -std=c++11 -DHAVE_CUDA tests/bgj_cuda_raw_bench.cpp src/libllib.a \
     -Iinclude -Idep/ntl/include -Ldep/ntl/lib -lntl -Ldep/gmp/lib -lgmp -lm \
-    -L/usr/local/cuda/lib64 -Wl,-rpath=/usr/local/cuda/lib64 -lcudart \
+    -L/usr/local/cuda/lib64 -Wl,-rpath=/usr/local/cuda/lib64 -lcudart -lcublas \
     -fopenmp=libomp -stdlib=libc++ -pthread -o /tmp/bgj_cuda_raw_bench
 $ /tmp/bgj_cuda_raw_bench
 $ BGJ_CUDA_TENSOR=0 /tmp/bgj_cuda_raw_bench
 $ /tmp/bgj_cuda_raw_bench 160 8192 8192 100 1 1 8
 $ /tmp/bgj_cuda_raw_bench 224 8192 8192 50 1 1 1 8
+```
+
+The raw CUDA materializer has a small correctness test:
+
+```bash
+$ clang++ -O2 -g -std=c++11 -DHAVE_CUDA tests/bgj_cuda_materialize_test.cpp src/libllib.a \
+    -Iinclude -Idep/ntl/include -Ldep/ntl/lib -lntl -Ldep/gmp/lib -lgmp -lm \
+    -L/usr/local/cuda/lib64 -Wl,-rpath=/usr/local/cuda/lib64 -lcudart -lcublas \
+    -fopenmp=libomp -stdlib=libc++ -pthread -o /tmp/bgj_cuda_materialize_test
+$ /tmp/bgj_cuda_materialize_test
 ```
 
 For end-to-end A100 tuning on seed-42 SVP-challenge ladders, use:

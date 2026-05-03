@@ -1062,6 +1062,7 @@ struct Pool_epi8_t {
         int _search_bgj1_cuda(bucket_epi8_t<record_dp> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<nb> *prof = NULL);
         template <bool record_dp, bool profiling>
         int _search_bgj1_cuda_batch(bucket_epi8_t<record_dp> **buckets, long num_bucket, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<nb> *prof = NULL);
+        int _sol_list_to_vec_cuda(sol_list_epi8_t **sol_list, long num_sol_list, int8_t *dst_vec, uint64_t *dst_vu, int32_t *dst_vnorm, int32_t *dst_vsum);
         #endif
         int _sol_list_to_vec(sol_list_epi8_t **sol_list, long num_sol_list, int8_t *dst_vec, uint64_t *dst_vu, int32_t *dst_vnorm, int32_t *dst_vsum);
         template <bool profiling>

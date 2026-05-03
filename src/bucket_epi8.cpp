@@ -1,5 +1,8 @@
 #include "../include/bucket_epi8.h"
 #include "../include/bgj_epi8.h"
+#if defined(HAVE_CUDA)
+#include "../include/bgj_cuda.h"
+#endif
 
 
 ///////////////// bucket_epi8_t /////////////////
@@ -2417,6 +2420,99 @@ int Pool_epi8_t<nb>::_search_nn(bucket_epi8_t<record_dp> *bkt, sol_list_epi8_t *
     return 1;
 }
 
+#if defined(HAVE_CUDA)
+template <uint32_t nb>
+int Pool_epi8_t<nb>::_sol_list_to_vec_cuda(sol_list_epi8_t **sol_list, long num_sol_list, int8_t *dst_vec, uint64_t *dst_vu, int32_t *dst_vnorm, int32_t *dst_vsum) {
+    if (!bgj_cuda_materialize_requested() || bgj_cuda_device_count() <= 0) return 0;
+    if (num_sol_list <= 0) return 1;
+
+    long num_total_sol = 0;
+    for (long thread = 0; thread < num_sol_list; thread++) {
+        num_total_sol += sol_list[thread]->num_sol();
+    }
+    if (num_total_sol == 0) return 1;
+    if (num_total_sol > 0xffffffffL ||
+        num_vec < 0 || num_vec > 0xffffffffL ||
+        vec_length <= 0 || vec_length > 0xffffffffL ||
+        CSD <= 0 || CSD > 0xffffffffL) {
+        return 0;
+    }
+
+    bgj_cuda_materialize_desc_t *desc =
+        (bgj_cuda_materialize_desc_t *) NEW_VEC(num_total_sol, sizeof(bgj_cuda_materialize_desc_t));
+    if (!desc) return 0;
+
+    long out = 0;
+    for (long thread = 0; thread < num_sol_list; thread++) {
+        sol_list_epi8_t *sol = sol_list[thread];
+        for (long i = 0; i < sol->num_a; i++) {
+            const uint32_t x = sol->a_list[2 * i];
+            const uint32_t y = sol->a_list[2 * i + 1];
+            desc[out] = {BGJ_CUDA_SOL_A, x, y, 0};
+            dst_vu[out] = vu[x] + vu[y];
+            out++;
+        }
+        for (long i = 0; i < sol->num_s; i++) {
+            const uint32_t x = sol->s_list[2 * i];
+            const uint32_t y = sol->s_list[2 * i + 1];
+            desc[out] = {BGJ_CUDA_SOL_S, x, y, 0};
+            dst_vu[out] = vu[x] - vu[y];
+            out++;
+        }
+        for (long i = 0; i < sol->num_aa; i++) {
+            const uint32_t c = sol->aa_list[3 * i];
+            const uint32_t x = sol->aa_list[3 * i + 1];
+            const uint32_t y = sol->aa_list[3 * i + 2];
+            desc[out] = {BGJ_CUDA_SOL_AA, c, x, y};
+            dst_vu[out] = vu[c] + vu[x] + vu[y];
+            out++;
+        }
+        for (long i = 0; i < sol->num_sa; i++) {
+            const uint32_t c = sol->sa_list[3 * i];
+            const uint32_t x = sol->sa_list[3 * i + 1];
+            const uint32_t y = sol->sa_list[3 * i + 2];
+            desc[out] = {BGJ_CUDA_SOL_SA, c, x, y};
+            dst_vu[out] = vu[c] - vu[x] + vu[y];
+            out++;
+        }
+        for (long i = 0; i < sol->num_ss; i++) {
+            const uint32_t c = sol->ss_list[3 * i];
+            const uint32_t x = sol->ss_list[3 * i + 1];
+            const uint32_t y = sol->ss_list[3 * i + 2];
+            desc[out] = {BGJ_CUDA_SOL_SS, c, x, y};
+            dst_vu[out] = vu[c] - vu[x] - vu[y];
+            out++;
+        }
+    }
+
+    const int ok = bgj_cuda_materialize_sol_list_raw(vec,
+                                                     pool_epoch,
+                                                     (uint32_t)num_vec,
+                                                     (uint32_t)vec_length,
+                                                     desc,
+                                                     (uint32_t)num_total_sol,
+                                                     _b_dual,
+                                                     _b_local ? _b_local[0] : NULL,
+                                                     (uint32_t)CSD,
+                                                     _dhalf,
+                                                     _dshift,
+                                                     dst_vec,
+                                                     dst_vnorm,
+                                                     dst_vsum);
+    FREE_VEC(desc);
+    if (!ok) {
+        static int warned = 0;
+        if (!warned) {
+            fprintf(stderr, "[Warning] CUDA materialization failed: %s. Falling back to CPU materialization.\n",
+                    bgj_cuda_last_error());
+            warned = 1;
+        }
+        return 0;
+    }
+    return 1;
+}
+#endif
+
 template <uint32_t nb>
 int Pool_epi8_t<nb>::_sol_list_to_vec(sol_list_epi8_t **sol_list, long num_sol_list, int8_t *dst_vec, uint64_t *dst_vu, int32_t *dst_vnorm, int32_t *dst_vsum) {
     long *begin_ind = (long *) NEW_VEC(num_sol_list, sizeof(long));
@@ -2721,7 +2817,13 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
     uint64_t *vu_to_insert = (uint64_t *) NEW_VEC(num_total_sol, sizeof(uint64_t));
     int32_t *vnorm_to_insert = (int32_t *) NEW_VEC(num_total_sol, sizeof(int32_t));
     int32_t *vsum_to_insert = (int32_t *) NEW_VEC(num_total_sol, sizeof(int32_t));
-    _sol_list_to_vec(sol_list, num_sol_list, vec_to_insert, vu_to_insert, vnorm_to_insert, vsum_to_insert);
+    #if defined(HAVE_CUDA)
+    if (!(bgj_cuda_search_requested() &&
+          _sol_list_to_vec_cuda(sol_list, num_sol_list, vec_to_insert, vu_to_insert, vnorm_to_insert, vsum_to_insert)))
+    #endif
+    {
+        _sol_list_to_vec(sol_list, num_sol_list, vec_to_insert, vu_to_insert, vnorm_to_insert, vsum_to_insert);
+    }
 
     long empty_final_ind[MAX_NTHREADS];
     long nonempty_final_ind[MAX_NTHREADS];

@@ -16,7 +16,7 @@ endif
 ifeq ($(CUDA), 1)
 	CFLAGS += -DHAVE_CUDA
 	CUDA_LIBDIR = $(if $(filter x86_64 ppc64le powerpc64le,$(shell uname -m)),lib64,lib)
-	LIBS += -L$(CUDA_PATH)/$(CUDA_LIBDIR) -Wl,-rpath=$(CUDA_PATH)/$(CUDA_LIBDIR) -lcudart
+	LIBS += -L$(CUDA_PATH)/$(CUDA_LIBDIR) -Wl,-rpath=$(CUDA_PATH)/$(CUDA_LIBDIR) -lcudart -lcublas
 endif
 
 all: $(BIN)
