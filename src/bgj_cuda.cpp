@@ -138,6 +138,13 @@ static int bgj_cuda_pool_cache_requested()
     return 1;
 }
 
+static int bgj_cuda_overflow_fallback_requested()
+{
+    const char *env = getenv("BGJ_CUDA_OVERFLOW_FALLBACK");
+    if (env && env[0]) return env[0] != '0';
+    return 0;
+}
+
 uint32_t bgj_cuda_batch_size(uint32_t host_threads)
 {
     if (!bgj_cuda_pool_cache_requested()) return 1;
@@ -464,7 +471,7 @@ int Pool_epi8_t<nb>::_search_bgj1_cuda(bucket_epi8_t<record_dp> *bkt,
                                               &result_count,
                                               &overflow);
 
-    if (!ok || overflow) {
+    if (!ok || (overflow && bgj_cuda_overflow_fallback_requested())) {
         return 0;
     }
 
@@ -579,7 +586,7 @@ int Pool_epi8_t<nb>::_search_bgj1_cuda_batch(bucket_epi8_t<record_dp> **buckets,
     if (!ok) return 0;
 
     for (uint32_t i = 0; i < batch_size; i++) {
-        if (overflows[i]) return 0;
+        if (overflows[i] && bgj_cuda_overflow_fallback_requested()) return 0;
     }
     for (uint32_t i = 0; i < batch_size; i++) {
         if (!bgj_cuda_consume_bgj1_results<nb, record_dp, profiling>(this,

@@ -94,7 +94,9 @@ host threads, `BGJ_CUDA_BATCH_SIZE=<n>` to tune the group size, or
 fallback bucket counts, dot counts, and timings.
 Dense buckets can produce many CUDA solution records; `BGJ_CUDA_MAX_RESULTS`
 sets the per-bucket result capacity and defaults to `16777216` for the A100
-tuning path.
+tuning path. On overflow the CUDA path now consumes the capped result prefix and
+continues, matching G6K-GPU-Tensor's bounded queue behavior; set
+`BGJ_CUDA_OVERFLOW_FALLBACK=1` to restore CPU fallback on overflow.
 The default CUDA/BGJ build now instantiates `Pool_epi8_t<6>` and
 `Pool_epi8_t<7>`, allowing non-LSH BGJ/CUDA paths to use 192- and
 224-dimensional int8 pool vectors. The LSH and AMX paths remain capped by their

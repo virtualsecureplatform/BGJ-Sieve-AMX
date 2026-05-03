@@ -2037,7 +2037,7 @@ static int bgj_cuda_finish_submitted_bucket(bgj_cuda_raw_scratch_t *scratch,
 
     *overflow = submitted_overflow || (submitted_result_count > result_capacity);
     *result_count = submitted_result_count > result_capacity ? result_capacity : submitted_result_count;
-    if (!*overflow && *result_count) {
+    if (*result_count) {
         CUDA_TRY(cudaMemcpyAsync(results,
                                  scratch->results,
                                  (size_t)(*result_count) * sizeof(bgj_cuda_result_t),
