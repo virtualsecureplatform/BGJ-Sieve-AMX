@@ -92,6 +92,9 @@ host threads, `BGJ_CUDA_BATCH_SIZE=<n>` to tune the group size, or
 `BGJ_CUDA_BATCH_MIN_DOTS=<n>` to tune the size threshold. With BGJ log level
 `2` or higher, the BGJ1 profile prints CUDA single-bucket, batched, cred, and
 fallback bucket counts, dot counts, and timings.
+Dense buckets can produce many CUDA solution records; `BGJ_CUDA_MAX_RESULTS`
+sets the per-bucket result capacity and defaults to `16777216` for the A100
+tuning path.
 The default CUDA/BGJ build now instantiates `Pool_epi8_t<6>` and
 `Pool_epi8_t<7>`, allowing non-LSH BGJ/CUDA paths to use 192- and
 224-dimensional int8 pool vectors. The LSH and AMX paths remain capped by their

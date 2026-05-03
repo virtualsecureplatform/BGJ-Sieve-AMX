@@ -128,7 +128,7 @@ static uint32_t bgj_cuda_max_results()
         unsigned long value = strtoul(env, NULL, 10);
         if (value > 0 && value <= 0xffffffffUL) return (uint32_t)value;
     }
-    return 1u << 22;
+    return 1u << 24;
 }
 
 static int bgj_cuda_pool_cache_requested()
