@@ -104,6 +104,10 @@ struct bgj_profile_data_t {
     double search2_time = 0.0;
     double sort_time = 0.0;
     double insert_time = 0.0;
+    double cuda_cred_time0 = 0.0;
+    double cuda_single_time0 = 0.0;
+    double cuda_batch_time0 = 0.0;
+    double cuda_fallback_time0 = 0.0;
 
     uint64_t bucket0_ndp = 0;
     uint64_t bucket1_ndp = 0;
@@ -111,6 +115,13 @@ struct bgj_profile_data_t {
     uint64_t search0_ndp = 0;
     uint64_t search1_ndp = 0;
     uint64_t search2_ndp = 0;
+    uint64_t cuda_single_ndp0 = 0;
+    uint64_t cuda_batch_ndp0 = 0;
+    uint64_t cuda_fallback_ndp0 = 0;
+    uint64_t cuda_single_bucket0 = 0;
+    uint64_t cuda_batch_bucket0 = 0;
+    uint64_t cuda_batch_call0 = 0;
+    uint64_t cuda_fallback_bucket0 = 0;
 
     uint64_t try_add2 = 0;
     uint64_t succ_add2 = 0;
