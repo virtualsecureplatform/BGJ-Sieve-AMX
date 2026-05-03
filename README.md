@@ -55,7 +55,10 @@ tiles per CTA to keep more warps resident on A100. The positive/negative tile
 path defaults to Tensor only after at least 512 full tiles are available;
 same-side positive/positive and negative/negative Tensor tiles run only for
 larger bucket sides. Fringe pairs and smaller buckets still use the CUDA
-`dp4a` kernel. Set `BGJ_CUDA_TENSOR=0` to disable Tensor Cores,
+`dp4a` kernel. Tensor paths prepackage int8 WMMA fragments by default so
+repeated tile loads use the A100 read-only cache. Set
+`BGJ_CUDA_TENSOR=0` to disable Tensor Cores,
+`BGJ_CUDA_TENSOR_REORDER=0` to disable the fragment prepack path,
 `BGJ_CUDA_TENSOR_NP_MIN_TILES=<n>` to tune the positive/negative Tensor
 threshold, `BGJ_CUDA_TENSOR_SAME=0` to disable only same-side Tensor tiles, or
 `BGJ_CUDA_TENSOR_SAME_MIN_TILES=<n>` to tune the same-side threshold. A
