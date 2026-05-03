@@ -29,6 +29,25 @@ extern "C" int bgj_cuda_search_bucket_raw(const int8_t *p_vecs,
                                            uint32_t result_capacity,
                                            uint32_t *result_count,
                                            int *overflow);
+extern "C" int bgj_cuda_search_bucket_pool_raw(const int8_t *pool_vecs,
+                                                uint64_t pool_epoch,
+                                                uint32_t pool_size,
+                                                const uint32_t *p_ids,
+                                                const uint32_t *n_ids,
+                                                const int32_t *p_norm,
+                                                const int32_t *n_norm,
+                                                const int32_t *p_dot,
+                                                const int32_t *n_dot,
+                                                uint32_t num_p,
+                                                uint32_t num_n,
+                                                uint32_t vec_length,
+                                                int32_t goal_norm,
+                                                int32_t center_norm,
+                                                int record_dp,
+                                                bgj_cuda_result_t *results,
+                                                uint32_t result_capacity,
+                                                uint32_t *result_count,
+                                                int *overflow);
 
 namespace {
 
@@ -105,6 +124,17 @@ Bucket make_bucket(uint32_t num_p, uint32_t num_n, uint32_t vec_length, uint32_t
     fill_side(num_p, vec_length, 100000u + seed * 1000u, bucket.p_vecs,
               bucket.p_ids, bucket.p_norm, bucket.p_dot, rng);
     fill_side(num_n, vec_length, 200000u + seed * 1000u, bucket.n_vecs,
+              bucket.n_ids, bucket.n_norm, bucket.n_dot, rng);
+    return bucket;
+}
+
+Bucket make_compact_bucket(uint32_t num_p, uint32_t num_n, uint32_t vec_length, uint32_t seed)
+{
+    std::mt19937 rng(seed);
+    Bucket bucket;
+    fill_side(num_p, vec_length, 0, bucket.p_vecs,
+              bucket.p_ids, bucket.p_norm, bucket.p_dot, rng);
+    fill_side(num_n, vec_length, num_p, bucket.n_vecs,
               bucket.n_ids, bucket.n_norm, bucket.n_dot, rng);
     return bucket;
 }
@@ -318,6 +348,60 @@ bool run_overflow_case()
     return true;
 }
 
+bool run_pool_case()
+{
+    const uint32_t num_p = 21;
+    const uint32_t num_n = 18;
+    const uint32_t vec_length = 32;
+    Bucket bucket = make_compact_bucket(num_p, num_n, vec_length, 123);
+    Scores scores;
+    collect_scores(bucket, vec_length, scores);
+
+    const int32_t goal_norm = threshold_for(scores.two_red, ThresholdMode::Selective);
+    const int32_t three_red_goal = threshold_for(scores.three_red, ThresholdMode::Selective);
+    const int32_t center_norm = goal_norm - three_red_goal;
+    const std::vector<bgj_cuda_result_t> oracle =
+        cpu_oracle(bucket, vec_length, goal_norm, center_norm, true);
+
+    std::vector<int8_t> pool((size_t)(num_p + num_n) * vec_length);
+    for (uint32_t i = 0; i < num_p; i++) {
+        std::copy(bucket.p_vecs.begin() + (size_t)i * vec_length,
+                  bucket.p_vecs.begin() + (size_t)(i + 1) * vec_length,
+                  pool.begin() + (size_t)bucket.p_ids[i] * vec_length);
+    }
+    for (uint32_t i = 0; i < num_n; i++) {
+        std::copy(bucket.n_vecs.begin() + (size_t)i * vec_length,
+                  bucket.n_vecs.begin() + (size_t)(i + 1) * vec_length,
+                  pool.begin() + (size_t)bucket.n_ids[i] * vec_length);
+    }
+
+    const uint32_t capacity = std::max<uint32_t>(16u, (uint32_t)oracle.size() + 16u);
+    std::vector<bgj_cuda_result_t> gpu(capacity);
+    uint32_t result_count = 0;
+    int overflow = 0;
+    const int ok = bgj_cuda_search_bucket_pool_raw(pool.data(), 1, num_p + num_n,
+                                                   bucket.p_ids.data(), bucket.n_ids.data(),
+                                                   bucket.p_norm.data(), bucket.n_norm.data(),
+                                                   bucket.p_dot.data(), bucket.n_dot.data(),
+                                                   num_p, num_n, vec_length, goal_norm, center_norm,
+                                                   1, gpu.data(), capacity,
+                                                   &result_count, &overflow);
+    if (!ok) {
+        std::cerr << "pool-cache: CUDA call failed: " << bgj_cuda_raw_last_error() << "\n";
+        return false;
+    }
+    if (overflow) {
+        std::cerr << "pool-cache: unexpected overflow\n";
+        return false;
+    }
+    gpu.resize(result_count);
+    const bool matched = compare_results("pool-cache", gpu, oracle);
+    if (matched) {
+        std::cout << "pool-cache: ok, results=" << result_count << "\n";
+    }
+    return matched;
+}
+
 }  // namespace
 
 int main()
@@ -338,6 +422,7 @@ int main()
     ok = run_case("np-no-dp-len1", 9, 7, 1, false, 6, ThresholdMode::Selective) && ok;
     ok = run_case("mixed-32", 17, 19, 32, true, 7, ThresholdMode::Selective) && ok;
     ok = run_case("mixed-96", 6, 5, 96, true, 8, ThresholdMode::Selective) && ok;
+    ok = run_pool_case() && ok;
     ok = run_overflow_case() && ok;
 
     if (!ok) return 1;

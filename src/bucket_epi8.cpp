@@ -2870,6 +2870,7 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
         prof->insert_inner_log(length_stat, num_linfty_failed, num_l2_failed, num_not_try);
     }
 
+    if (num_total_insert) mark_pool_dirty();
     return num_total_insert;
 }
 

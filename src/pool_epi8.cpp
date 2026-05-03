@@ -81,6 +81,7 @@ void Pool_epi8_t<nb>::clear_pool() {
     num_empty = 0;
     sorted_index = 0;
     _pool_size = 0;
+    mark_pool_dirty();
 }
 
 
@@ -134,6 +135,7 @@ int Pool_epi8_t<nb>::set_sieving_context(long l, long r) {
     index_l = l;
     index_r = r;
     CSD = r - l;
+    mark_pool_dirty();
     _compute_gh2();
     uid->reset_hash_function(CSD);
     for (long i = 0; i < CSD; i++) uid->insert_uid(uid->uid_coeffs[i]);
@@ -177,6 +179,7 @@ int Pool_epi8_t<nb>::sampling(long N) {
         num_empty -= num_insert;
         if (num_empty < 0) num_empty = 0;
         num_vec += num_insert;
+        mark_pool_dirty();
         return 0;
     }
     return -1;
@@ -231,6 +234,7 @@ int Pool_epi8_t<nb>::shrink(long N) {
 
     num_vec = N;
     sorted_index = 0;
+    mark_pool_dirty();
     
     
     return 1;
@@ -444,6 +448,7 @@ int Pool_epi8_t<nb>::extend_left() {
     PROCESS_COLLISION_LIST;
     _reconstruct_all_cvec();
     FREE_VEC((void *)_b_dual_old);
+    mark_pool_dirty();
     return 1;
 }
 
@@ -562,6 +567,7 @@ int Pool_epi8_t<nb>::shrink_left() {
 
     _reconstruct_all_cvec();
     FREE_VEC((void *)_b_dual_old);
+    mark_pool_dirty();
 
     return 1;
 }
@@ -1018,6 +1024,7 @@ int Pool_epi8_t<nb>::insert(long index, double eta) {
     _reconstruct_all_cvec();
     FREE_VEC((void *)_b_dual_old);
     FREE_MAT(_b_local_old);
+    mark_pool_dirty();
 
     return 1;
 }
@@ -1536,7 +1543,8 @@ int Pool_epi8_t<nb>::load(const char *file_name) {
             cvec[3LL*cind+2LL] = (cnorm > 65535) ? 65535 : cnorm;
         }
     }
-    
+    mark_pool_dirty();
+
     return 0;
     
     err:

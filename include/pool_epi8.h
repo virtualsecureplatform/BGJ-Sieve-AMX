@@ -409,6 +409,7 @@ struct Pool_epi8_t {
     // data
         long num_empty = 0;
         long num_vec = 0;
+        uint64_t pool_epoch = 1;
         int8_t *vec = NULL;
         uint16_t *cvec = NULL;      // cvec_size = 3
         int32_t *vnorm = NULL;      // we store round(1/2 * ||v||^2) here
@@ -458,6 +459,10 @@ struct Pool_epi8_t {
         bool check_pool_status(long q = 0, int supress_minor = 1);
         // check lose of dimension
         bool check_dim_lose(long q = 0);
+        inline void mark_pool_dirty() {
+            pool_epoch++;
+            if (pool_epoch == 0) pool_epoch = 1;
+        }
 
     // Sieving
         // bgj sieve

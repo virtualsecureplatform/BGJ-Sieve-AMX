@@ -12,6 +12,7 @@ using namespace nvcuda;
 static char bgj_cuda_error[512] = "no CUDA error";
 
 struct bgj_cuda_raw_scratch_t {
+    int8_t *pool_vecs;
     int8_t *p_vecs;
     int8_t *n_vecs;
     uint32_t *p_ids;
@@ -23,7 +24,9 @@ struct bgj_cuda_raw_scratch_t {
     bgj_cuda_result_t *results;
     uint32_t *result_count;
     int *overflow;
+    cudaStream_t stream;
 
+    size_t pool_vec_capacity;
     size_t p_vec_capacity;
     size_t n_vec_capacity;
     size_t p_id_capacity;
@@ -35,9 +38,15 @@ struct bgj_cuda_raw_scratch_t {
     size_t result_capacity;
     size_t result_count_capacity;
     size_t overflow_capacity;
+    const int8_t *pool_host_key;
+    uint64_t pool_epoch;
+    uint32_t pool_size;
+    uint32_t pool_vec_length;
+    int stream_ready;
 
     bgj_cuda_raw_scratch_t()
-        : p_vecs(NULL),
+        : pool_vecs(NULL),
+          p_vecs(NULL),
           n_vecs(NULL),
           p_ids(NULL),
           n_ids(NULL),
@@ -48,6 +57,8 @@ struct bgj_cuda_raw_scratch_t {
           results(NULL),
           result_count(NULL),
           overflow(NULL),
+          stream(NULL),
+          pool_vec_capacity(0),
           p_vec_capacity(0),
           n_vec_capacity(0),
           p_id_capacity(0),
@@ -58,12 +69,19 @@ struct bgj_cuda_raw_scratch_t {
           n_dot_capacity(0),
           result_capacity(0),
           result_count_capacity(0),
-          overflow_capacity(0)
+          overflow_capacity(0),
+          pool_host_key(NULL),
+          pool_epoch(0),
+          pool_size(0),
+          pool_vec_length(0),
+          stream_ready(0)
     {
     }
 
     ~bgj_cuda_raw_scratch_t()
     {
+        if (stream_ready) cudaStreamSynchronize(stream);
+        cudaFree(pool_vecs);
         cudaFree(p_vecs);
         cudaFree(n_vecs);
         cudaFree(p_ids);
@@ -75,6 +93,7 @@ struct bgj_cuda_raw_scratch_t {
         cudaFree(results);
         cudaFree(result_count);
         cudaFree(overflow);
+        if (stream_ready) cudaStreamDestroy(stream);
     }
 };
 
@@ -434,6 +453,23 @@ __global__ void bgj_cuda_search_bucket_kernel(const int8_t *p_vecs,
     }
 }
 
+__global__ void bgj_cuda_pack_pool_vecs_kernel(const int8_t *pool_vecs,
+                                               const uint32_t *ids,
+                                               uint32_t num_vecs,
+                                               uint32_t vec_length,
+                                               int8_t *out_vecs)
+{
+    const uint64_t total = (uint64_t)num_vecs * vec_length;
+    const uint64_t stride = (uint64_t)blockDim.x * gridDim.x;
+    for (uint64_t pos = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+         pos < total;
+         pos += stride) {
+        const uint32_t row = (uint32_t)(pos / vec_length);
+        const uint32_t col = (uint32_t)(pos - (uint64_t)row * vec_length);
+        out_vecs[pos] = pool_vecs[(uint64_t)ids[row] * vec_length + col];
+    }
+}
+
 #define CUDA_TRY(call)                                      \
     do {                                                    \
         cudaError_t err__ = (call);                         \
@@ -459,6 +495,18 @@ static int ensure_cuda_capacity(void **ptr, size_t *capacity, size_t requested)
         return 0;
     }
     *capacity = requested;
+    return 1;
+}
+
+static int bgj_cuda_prepare_stream(bgj_cuda_raw_scratch_t *scratch)
+{
+    if (scratch->stream_ready) return 1;
+    cudaError_t err = cudaStreamCreateWithFlags(&scratch->stream, cudaStreamNonBlocking);
+    if (err != cudaSuccess) {
+        set_cuda_error("cudaStreamCreateWithFlags", err);
+        return 0;
+    }
+    scratch->stream_ready = 1;
     return 1;
 }
 
@@ -512,8 +560,11 @@ static int bgj_cuda_tensor_capable()
     return capable;
 }
 
-extern "C" int bgj_cuda_search_bucket_raw(const int8_t *p_vecs,
+static int bgj_cuda_search_bucket_raw_impl(const int8_t *p_vecs,
                                            const int8_t *n_vecs,
+                                           const int8_t *pool_vecs_host,
+                                           uint64_t pool_epoch,
+                                           uint32_t pool_size,
                                            const uint32_t *p_ids,
                                            const uint32_t *n_ids,
                                            const int32_t *p_norm,
@@ -539,11 +590,18 @@ extern "C" int bgj_cuda_search_bucket_raw(const int8_t *p_vecs,
     uint32_t tensor_same_num_p = 0;
     uint32_t tensor_same_num_n = 0;
     uint32_t tensor_same_min_tiles = 0;
+    const int use_pool = pool_vecs_host != NULL;
 
     if (result_capacity == 0) {
         set_plain_error("result capacity is zero");
         return 0;
     }
+    if (use_pool && pool_size == 0 && (num_p || num_n)) {
+        set_plain_error("pool size is zero");
+        return 0;
+    }
+    if (!bgj_cuda_prepare_stream(scratch)) return 0;
+    cudaStream_t stream = scratch->stream;
 
     const size_t p_vec_bytes = (size_t)num_p * (size_t)vec_length * sizeof(int8_t);
     const size_t n_vec_bytes = (size_t)num_n * (size_t)vec_length * sizeof(int8_t);
@@ -552,16 +610,48 @@ extern "C" int bgj_cuda_search_bucket_raw(const int8_t *p_vecs,
     const size_t p_i32_bytes = (size_t)num_p * sizeof(int32_t);
     const size_t n_i32_bytes = (size_t)num_n * sizeof(int32_t);
 
+    if (use_pool) {
+        const size_t pool_vec_bytes = (size_t)pool_size * (size_t)vec_length * sizeof(int8_t);
+        if (scratch->pool_host_key != pool_vecs_host ||
+            scratch->pool_epoch != pool_epoch ||
+            scratch->pool_size != pool_size ||
+            scratch->pool_vec_length != vec_length) {
+            CUDA_ENSURE(scratch->pool_vecs, scratch->pool_vec_capacity, pool_vec_bytes);
+            CUDA_TRY(cudaMemcpyAsync(scratch->pool_vecs,
+                                     pool_vecs_host,
+                                     pool_vec_bytes,
+                                     cudaMemcpyHostToDevice,
+                                     stream));
+            scratch->pool_host_key = pool_vecs_host;
+            scratch->pool_epoch = pool_epoch;
+            scratch->pool_size = pool_size;
+            scratch->pool_vec_length = vec_length;
+        }
+    }
+
     if (num_p) {
         CUDA_ENSURE(scratch->p_vecs, scratch->p_vec_capacity, p_vec_bytes);
         CUDA_ENSURE(scratch->p_ids, scratch->p_id_capacity, p_id_bytes);
         CUDA_ENSURE(scratch->p_norm, scratch->p_i32_capacity, p_i32_bytes);
-        CUDA_TRY(cudaMemcpy(scratch->p_vecs, p_vecs, p_vec_bytes, cudaMemcpyHostToDevice));
-        CUDA_TRY(cudaMemcpy(scratch->p_ids, p_ids, p_id_bytes, cudaMemcpyHostToDevice));
-        CUDA_TRY(cudaMemcpy(scratch->p_norm, p_norm, p_i32_bytes, cudaMemcpyHostToDevice));
+        CUDA_TRY(cudaMemcpyAsync(scratch->p_ids, p_ids, p_id_bytes, cudaMemcpyHostToDevice, stream));
+        CUDA_TRY(cudaMemcpyAsync(scratch->p_norm, p_norm, p_i32_bytes, cudaMemcpyHostToDevice, stream));
+        if (use_pool) {
+            const uint32_t threads = 256;
+            uint32_t blocks = (uint32_t)((p_vec_bytes + threads - 1) / threads);
+            if (blocks == 0) blocks = 1;
+            if (blocks > 65535) blocks = 65535;
+            bgj_cuda_pack_pool_vecs_kernel<<<blocks, threads, 0, stream>>>(scratch->pool_vecs,
+                                                                           scratch->p_ids,
+                                                                           num_p,
+                                                                           vec_length,
+                                                                           scratch->p_vecs);
+            CUDA_TRY(cudaGetLastError());
+        } else {
+            CUDA_TRY(cudaMemcpyAsync(scratch->p_vecs, p_vecs, p_vec_bytes, cudaMemcpyHostToDevice, stream));
+        }
         if (record_dp) {
             CUDA_ENSURE(scratch->p_dot, scratch->p_dot_capacity, p_i32_bytes);
-            CUDA_TRY(cudaMemcpy(scratch->p_dot, p_dot, p_i32_bytes, cudaMemcpyHostToDevice));
+            CUDA_TRY(cudaMemcpyAsync(scratch->p_dot, p_dot, p_i32_bytes, cudaMemcpyHostToDevice, stream));
         }
     }
 
@@ -569,20 +659,33 @@ extern "C" int bgj_cuda_search_bucket_raw(const int8_t *p_vecs,
         CUDA_ENSURE(scratch->n_vecs, scratch->n_vec_capacity, n_vec_bytes);
         CUDA_ENSURE(scratch->n_ids, scratch->n_id_capacity, n_id_bytes);
         CUDA_ENSURE(scratch->n_norm, scratch->n_i32_capacity, n_i32_bytes);
-        CUDA_TRY(cudaMemcpy(scratch->n_vecs, n_vecs, n_vec_bytes, cudaMemcpyHostToDevice));
-        CUDA_TRY(cudaMemcpy(scratch->n_ids, n_ids, n_id_bytes, cudaMemcpyHostToDevice));
-        CUDA_TRY(cudaMemcpy(scratch->n_norm, n_norm, n_i32_bytes, cudaMemcpyHostToDevice));
+        CUDA_TRY(cudaMemcpyAsync(scratch->n_ids, n_ids, n_id_bytes, cudaMemcpyHostToDevice, stream));
+        CUDA_TRY(cudaMemcpyAsync(scratch->n_norm, n_norm, n_i32_bytes, cudaMemcpyHostToDevice, stream));
+        if (use_pool) {
+            const uint32_t threads = 256;
+            uint32_t blocks = (uint32_t)((n_vec_bytes + threads - 1) / threads);
+            if (blocks == 0) blocks = 1;
+            if (blocks > 65535) blocks = 65535;
+            bgj_cuda_pack_pool_vecs_kernel<<<blocks, threads, 0, stream>>>(scratch->pool_vecs,
+                                                                           scratch->n_ids,
+                                                                           num_n,
+                                                                           vec_length,
+                                                                           scratch->n_vecs);
+            CUDA_TRY(cudaGetLastError());
+        } else {
+            CUDA_TRY(cudaMemcpyAsync(scratch->n_vecs, n_vecs, n_vec_bytes, cudaMemcpyHostToDevice, stream));
+        }
         if (record_dp) {
             CUDA_ENSURE(scratch->n_dot, scratch->n_dot_capacity, n_i32_bytes);
-            CUDA_TRY(cudaMemcpy(scratch->n_dot, n_dot, n_i32_bytes, cudaMemcpyHostToDevice));
+            CUDA_TRY(cudaMemcpyAsync(scratch->n_dot, n_dot, n_i32_bytes, cudaMemcpyHostToDevice, stream));
         }
     }
 
     CUDA_ENSURE(scratch->results, scratch->result_capacity, (size_t)result_capacity * sizeof(bgj_cuda_result_t));
     CUDA_ENSURE(scratch->result_count, scratch->result_count_capacity, sizeof(uint32_t));
     CUDA_ENSURE(scratch->overflow, scratch->overflow_capacity, sizeof(int));
-    CUDA_TRY(cudaMemset(scratch->result_count, 0, sizeof(uint32_t)));
-    CUDA_TRY(cudaMemset(scratch->overflow, 0, sizeof(int)));
+    CUDA_TRY(cudaMemsetAsync(scratch->result_count, 0, sizeof(uint32_t), stream));
+    CUDA_TRY(cudaMemsetAsync(scratch->overflow, 0, sizeof(int), stream));
 
     if (bgj_cuda_tensor_requested() &&
         bgj_cuda_tensor_capable() &&
@@ -595,22 +698,22 @@ extern "C" int bgj_cuda_search_bucket_raw(const int8_t *p_vecs,
             const uint32_t tensor_blocks_n = tensor_np_num_n / 16u;
             if (tensor_blocks_p <= 65535u && tensor_blocks_n <= 65535u) {
                 dim3 blocks(tensor_blocks_n, tensor_blocks_p);
-                bgj_cuda_search_np_tensor_kernel<<<blocks, 32>>>(scratch->p_vecs,
-                                                                 scratch->n_vecs,
-                                                                 scratch->p_ids,
-                                                                 scratch->n_ids,
-                                                                 scratch->p_norm,
-                                                                 scratch->n_norm,
-                                                                 scratch->p_dot,
-                                                                 scratch->n_dot,
-                                                                 vec_length,
-                                                                 goal_norm,
-                                                                 goal_norm - center_norm,
-                                                                 record_dp,
-                                                                 scratch->results,
-                                                                 result_capacity,
-                                                                 scratch->result_count,
-                                                                 scratch->overflow);
+                bgj_cuda_search_np_tensor_kernel<<<blocks, 32, 0, stream>>>(scratch->p_vecs,
+                                                                            scratch->n_vecs,
+                                                                            scratch->p_ids,
+                                                                            scratch->n_ids,
+                                                                            scratch->p_norm,
+                                                                            scratch->n_norm,
+                                                                            scratch->p_dot,
+                                                                            scratch->n_dot,
+                                                                            vec_length,
+                                                                            goal_norm,
+                                                                            goal_norm - center_norm,
+                                                                            record_dp,
+                                                                            scratch->results,
+                                                                            result_capacity,
+                                                                            scratch->result_count,
+                                                                            scratch->overflow);
                 CUDA_TRY(cudaGetLastError());
             } else {
                 tensor_np_num_p = 0;
@@ -623,20 +726,20 @@ extern "C" int bgj_cuda_search_bucket_raw(const int8_t *p_vecs,
             const uint32_t tensor_blocks_p = tensor_same_num_p / 16u;
             const uint64_t tensor_tiles_p = ((uint64_t)tensor_blocks_p * (tensor_blocks_p + 1u)) / 2u;
             if (tensor_blocks_p >= tensor_same_min_tiles && tensor_tiles_p <= 0x7fffffffu) {
-                bgj_cuda_search_same_tensor_kernel<<<(uint32_t)tensor_tiles_p, 32>>>(scratch->p_vecs,
-                                                                                    scratch->p_ids,
-                                                                                    scratch->p_norm,
-                                                                                    scratch->p_dot,
-                                                                                    tensor_blocks_p,
-                                                                                    vec_length,
-                                                                                    goal_norm,
-                                                                                    goal_norm - center_norm,
-                                                                                    record_dp,
-                                                                                    0,
-                                                                                    scratch->results,
-                                                                                    result_capacity,
-                                                                                    scratch->result_count,
-                                                                                    scratch->overflow);
+                bgj_cuda_search_same_tensor_kernel<<<(uint32_t)tensor_tiles_p, 32, 0, stream>>>(scratch->p_vecs,
+                                                                                               scratch->p_ids,
+                                                                                               scratch->p_norm,
+                                                                                               scratch->p_dot,
+                                                                                               tensor_blocks_p,
+                                                                                               vec_length,
+                                                                                               goal_norm,
+                                                                                               goal_norm - center_norm,
+                                                                                               record_dp,
+                                                                                               0,
+                                                                                               scratch->results,
+                                                                                               result_capacity,
+                                                                                               scratch->result_count,
+                                                                                               scratch->overflow);
                 CUDA_TRY(cudaGetLastError());
             } else {
                 tensor_same_num_p = 0;
@@ -648,20 +751,20 @@ extern "C" int bgj_cuda_search_bucket_raw(const int8_t *p_vecs,
             const uint32_t tensor_blocks_n = tensor_same_num_n / 16u;
             const uint64_t tensor_tiles_n = ((uint64_t)tensor_blocks_n * (tensor_blocks_n + 1u)) / 2u;
             if (tensor_blocks_n >= tensor_same_min_tiles && tensor_tiles_n <= 0x7fffffffu) {
-                bgj_cuda_search_same_tensor_kernel<<<(uint32_t)tensor_tiles_n, 32>>>(scratch->n_vecs,
-                                                                                    scratch->n_ids,
-                                                                                    scratch->n_norm,
-                                                                                    scratch->n_dot,
-                                                                                    tensor_blocks_n,
-                                                                                    vec_length,
-                                                                                    goal_norm,
-                                                                                    goal_norm - center_norm,
-                                                                                    record_dp,
-                                                                                    1,
-                                                                                    scratch->results,
-                                                                                    result_capacity,
-                                                                                    scratch->result_count,
-                                                                                    scratch->overflow);
+                bgj_cuda_search_same_tensor_kernel<<<(uint32_t)tensor_tiles_n, 32, 0, stream>>>(scratch->n_vecs,
+                                                                                               scratch->n_ids,
+                                                                                               scratch->n_norm,
+                                                                                               scratch->n_dot,
+                                                                                               tensor_blocks_n,
+                                                                                               vec_length,
+                                                                                               goal_norm,
+                                                                                               goal_norm - center_norm,
+                                                                                               record_dp,
+                                                                                               1,
+                                                                                               scratch->results,
+                                                                                               result_capacity,
+                                                                                               scratch->result_count,
+                                                                                               scratch->overflow);
                 CUDA_TRY(cudaGetLastError());
             } else {
                 tensor_same_num_n = 0;
@@ -690,42 +793,45 @@ extern "C" int bgj_cuda_search_bucket_raw(const int8_t *p_vecs,
         if (blocks == 0) blocks = 1;
         if (blocks > 65535) blocks = 65535;
         if (total) {
-            bgj_cuda_search_bucket_kernel<<<blocks, threads>>>(scratch->p_vecs,
-                                                               scratch->n_vecs,
-                                                               scratch->p_ids,
-                                                               scratch->n_ids,
-                                                               scratch->p_norm,
-                                                               scratch->n_norm,
-                                                               scratch->p_dot,
-                                                               scratch->n_dot,
-                                                               num_p,
-                                                               num_n,
-                                                               tensor_np_num_p,
-                                                               tensor_np_num_n,
-                                                               tensor_same_num_p,
-                                                               tensor_same_num_n,
-                                                               vec_length,
-                                                               goal_norm,
-                                                               goal_norm - center_norm,
-                                                               record_dp,
-                                                               scratch->results,
-                                                               result_capacity,
-                                                               scratch->result_count,
-                                                               scratch->overflow);
+            bgj_cuda_search_bucket_kernel<<<blocks, threads, 0, stream>>>(scratch->p_vecs,
+                                                                          scratch->n_vecs,
+                                                                          scratch->p_ids,
+                                                                          scratch->n_ids,
+                                                                          scratch->p_norm,
+                                                                          scratch->n_norm,
+                                                                          scratch->p_dot,
+                                                                          scratch->n_dot,
+                                                                          num_p,
+                                                                          num_n,
+                                                                          tensor_np_num_p,
+                                                                          tensor_np_num_n,
+                                                                          tensor_same_num_p,
+                                                                          tensor_same_num_n,
+                                                                          vec_length,
+                                                                          goal_norm,
+                                                                          goal_norm - center_norm,
+                                                                          record_dp,
+                                                                          scratch->results,
+                                                                          result_capacity,
+                                                                          scratch->result_count,
+                                                                          scratch->overflow);
             CUDA_TRY(cudaGetLastError());
         }
     }
 
-    CUDA_TRY(cudaMemcpy(&h_result_count, scratch->result_count, sizeof(uint32_t), cudaMemcpyDeviceToHost));
-    CUDA_TRY(cudaMemcpy(&h_overflow, scratch->overflow, sizeof(int), cudaMemcpyDeviceToHost));
+    CUDA_TRY(cudaMemcpyAsync(&h_result_count, scratch->result_count, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_TRY(cudaMemcpyAsync(&h_overflow, scratch->overflow, sizeof(int), cudaMemcpyDeviceToHost, stream));
+    CUDA_TRY(cudaStreamSynchronize(stream));
 
     *overflow = h_overflow || (h_result_count > result_capacity);
     *result_count = h_result_count > result_capacity ? result_capacity : h_result_count;
     if (!*overflow && *result_count) {
-        CUDA_TRY(cudaMemcpy(results,
-                            scratch->results,
-                            (size_t)(*result_count) * sizeof(bgj_cuda_result_t),
-                            cudaMemcpyDeviceToHost));
+        CUDA_TRY(cudaMemcpyAsync(results,
+                                 scratch->results,
+                                 (size_t)(*result_count) * sizeof(bgj_cuda_result_t),
+                                 cudaMemcpyDeviceToHost,
+                                 stream));
+        CUDA_TRY(cudaStreamSynchronize(stream));
     }
 
     set_plain_error("no CUDA error");
@@ -733,6 +839,91 @@ extern "C" int bgj_cuda_search_bucket_raw(const int8_t *p_vecs,
 
 fail:
     return 0;
+}
+
+extern "C" int bgj_cuda_search_bucket_raw(const int8_t *p_vecs,
+                                           const int8_t *n_vecs,
+                                           const uint32_t *p_ids,
+                                           const uint32_t *n_ids,
+                                           const int32_t *p_norm,
+                                           const int32_t *n_norm,
+                                           const int32_t *p_dot,
+                                           const int32_t *n_dot,
+                                           uint32_t num_p,
+                                           uint32_t num_n,
+                                           uint32_t vec_length,
+                                           int32_t goal_norm,
+                                           int32_t center_norm,
+                                           int record_dp,
+                                           bgj_cuda_result_t *results,
+                                           uint32_t result_capacity,
+                                           uint32_t *result_count,
+                                           int *overflow)
+{
+    return bgj_cuda_search_bucket_raw_impl(p_vecs,
+                                           n_vecs,
+                                           NULL,
+                                           0,
+                                           0,
+                                           p_ids,
+                                           n_ids,
+                                           p_norm,
+                                           n_norm,
+                                           p_dot,
+                                           n_dot,
+                                           num_p,
+                                           num_n,
+                                           vec_length,
+                                           goal_norm,
+                                           center_norm,
+                                           record_dp,
+                                           results,
+                                           result_capacity,
+                                           result_count,
+                                           overflow);
+}
+
+extern "C" int bgj_cuda_search_bucket_pool_raw(const int8_t *pool_vecs,
+                                                uint64_t pool_epoch,
+                                                uint32_t pool_size,
+                                                const uint32_t *p_ids,
+                                                const uint32_t *n_ids,
+                                                const int32_t *p_norm,
+                                                const int32_t *n_norm,
+                                                const int32_t *p_dot,
+                                                const int32_t *n_dot,
+                                                uint32_t num_p,
+                                                uint32_t num_n,
+                                                uint32_t vec_length,
+                                                int32_t goal_norm,
+                                                int32_t center_norm,
+                                                int record_dp,
+                                                bgj_cuda_result_t *results,
+                                                uint32_t result_capacity,
+                                                uint32_t *result_count,
+                                                int *overflow)
+{
+    return bgj_cuda_search_bucket_raw_impl(NULL,
+                                           NULL,
+                                           pool_vecs,
+                                           pool_epoch,
+                                           pool_size,
+                                           p_ids,
+                                           n_ids,
+                                           p_norm,
+                                           n_norm,
+                                           p_dot,
+                                           n_dot,
+                                           num_p,
+                                           num_n,
+                                           vec_length,
+                                           goal_norm,
+                                           center_norm,
+                                           record_dp,
+                                           results,
+                                           result_capacity,
+                                           result_count,
+                                           overflow);
 }
 
 #undef CUDA_ENSURE

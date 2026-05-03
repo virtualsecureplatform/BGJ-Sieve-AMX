@@ -59,6 +59,25 @@ extern "C" int bgj_cuda_search_bucket_raw(const int8_t *p_vecs,
                                            uint32_t result_capacity,
                                            uint32_t *result_count,
                                            int *overflow);
+extern "C" int bgj_cuda_search_bucket_pool_raw(const int8_t *pool_vecs,
+                                                uint64_t pool_epoch,
+                                                uint32_t pool_size,
+                                                const uint32_t *p_ids,
+                                                const uint32_t *n_ids,
+                                                const int32_t *p_norm,
+                                                const int32_t *n_norm,
+                                                const int32_t *p_dot,
+                                                const int32_t *n_dot,
+                                                uint32_t num_p,
+                                                uint32_t num_n,
+                                                uint32_t vec_length,
+                                                int32_t goal_norm,
+                                                int32_t center_norm,
+                                                int record_dp,
+                                                bgj_cuda_result_t *results,
+                                                uint32_t result_capacity,
+                                                uint32_t *result_count,
+                                                int *overflow);
 
 int bgj_cuda_device_count()
 {
@@ -80,6 +99,13 @@ static uint32_t bgj_cuda_max_results()
         if (value > 0 && value <= 0xffffffffUL) return (uint32_t)value;
     }
     return 1u << 22;
+}
+
+static int bgj_cuda_pool_cache_requested()
+{
+    const char *env = getenv("BGJ_CUDA_POOL_CACHE");
+    if (env && env[0]) return env[0] != '0';
+    return 0;
 }
 
 static int bgj_cuda_rank_of(const std::vector<int32_t> &rank,
@@ -160,31 +186,37 @@ int Pool_epi8_t<nb>::_search_bgj1_cuda(bucket_epi8_t<record_dp> *bkt,
     if (bgj_cuda_device_count() <= 0) return 0;
     if (bkt->num_pvec < 0 || bkt->num_nvec < 0) return 0;
     if (bkt->num_pvec > 0xffffffffL || bkt->num_nvec > 0xffffffffL) return 0;
+    if (num_vec < 0 || num_vec > 0xffffffffL) return 0;
 
     const uint32_t num_p = (uint32_t)bkt->num_pvec;
     const uint32_t num_n = (uint32_t)bkt->num_nvec;
     if (num_p + num_n == 0) return 1;
 
-    const size_t p_bytes = (size_t)num_p * (size_t)vec_length * sizeof(int8_t);
-    const size_t n_bytes = (size_t)num_n * (size_t)vec_length * sizeof(int8_t);
     static thread_local std::vector<int8_t> p_vec_storage;
     static thread_local std::vector<int8_t> n_vec_storage;
     static thread_local std::vector<bgj_cuda_result_t> result_storage;
+    const int use_pool_cache = bgj_cuda_pool_cache_requested();
+    int8_t *p_vecs = NULL;
+    int8_t *n_vecs = NULL;
 
-    try {
-        p_vec_storage.resize(p_bytes);
-        n_vec_storage.resize(n_bytes);
-    } catch (...) {
-        return 0;
-    }
-    int8_t *p_vecs = p_bytes ? p_vec_storage.data() : NULL;
-    int8_t *n_vecs = n_bytes ? n_vec_storage.data() : NULL;
+    if (!use_pool_cache) {
+        const size_t p_bytes = (size_t)num_p * (size_t)vec_length * sizeof(int8_t);
+        const size_t n_bytes = (size_t)num_n * (size_t)vec_length * sizeof(int8_t);
+        try {
+            p_vec_storage.resize(p_bytes);
+            n_vec_storage.resize(n_bytes);
+        } catch (...) {
+            return 0;
+        }
+        p_vecs = p_bytes ? p_vec_storage.data() : NULL;
+        n_vecs = n_bytes ? n_vec_storage.data() : NULL;
 
-    for (uint32_t i = 0; i < num_p; i++) {
-        memcpy(p_vecs + (size_t)i * vec_length, vec + (size_t)bkt->pvec[i] * vec_length, vec_length);
-    }
-    for (uint32_t i = 0; i < num_n; i++) {
-        memcpy(n_vecs + (size_t)i * vec_length, vec + (size_t)bkt->nvec[i] * vec_length, vec_length);
+        for (uint32_t i = 0; i < num_p; i++) {
+            memcpy(p_vecs + (size_t)i * vec_length, vec + (size_t)bkt->pvec[i] * vec_length, vec_length);
+        }
+        for (uint32_t i = 0; i < num_n; i++) {
+            memcpy(n_vecs + (size_t)i * vec_length, vec + (size_t)bkt->nvec[i] * vec_length, vec_length);
+        }
     }
 
     const uint32_t result_capacity = bgj_cuda_max_results();
@@ -197,7 +229,27 @@ int Pool_epi8_t<nb>::_search_bgj1_cuda(bucket_epi8_t<record_dp> *bkt,
 
     uint32_t result_count = 0;
     int overflow = 0;
-    const int ok = bgj_cuda_search_bucket_raw(p_vecs,
+    const int ok = use_pool_cache ?
+                   bgj_cuda_search_bucket_pool_raw(vec,
+                                                   pool_epoch,
+                                                   (uint32_t)num_vec,
+                                                   bkt->pvec,
+                                                   bkt->nvec,
+                                                   bkt->pnorm,
+                                                   bkt->nnorm,
+                                                   record_dp ? bkt->pdot : NULL,
+                                                   record_dp ? bkt->ndot : NULL,
+                                                   num_p,
+                                                   num_n,
+                                                   (uint32_t)vec_length,
+                                                   goal_norm,
+                                                   bkt->center_norm,
+                                                   record_dp ? 1 : 0,
+                                                   results,
+                                                   result_capacity,
+                                                   &result_count,
+                                                   &overflow) :
+                   bgj_cuda_search_bucket_raw(p_vecs,
                                               n_vecs,
                                               bkt->pvec,
                                               bkt->nvec,
