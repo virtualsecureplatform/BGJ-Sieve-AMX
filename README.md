@@ -49,10 +49,13 @@ overflows, the code falls back to the existing CPU search for that bucket. The
 default result buffer holds `4194304` candidates per bucket and can be changed
 with `BGJ_CUDA_MAX_RESULTS`.
 
-On A100-class GPUs, CUDA search uses an experimental INT8 Tensor Core path for
-full 16x16 positive/negative bucket tiles by default. Fringe pairs and
-same-side bucket pairs still use the CUDA `dp4a` kernel. Set
-`BGJ_CUDA_TENSOR=0` to disable the Tensor Core path.
+On A100-class GPUs, CUDA search uses experimental INT8 Tensor Core paths for
+full 16x16 bucket tiles by default. The positive/negative tile path runs
+whenever full tiles are available; same-side positive/positive and
+negative/negative Tensor tiles run only for larger bucket sides. Fringe pairs
+still use the CUDA `dp4a` kernel. Set `BGJ_CUDA_TENSOR=0` to disable Tensor
+Cores, `BGJ_CUDA_TENSOR_SAME=0` to disable only same-side Tensor tiles, or
+`BGJ_CUDA_TENSOR_SAME_MIN_TILES=<n>` to tune the same-side threshold.
 
 For large instances, it's recommended to use [sparsepp](https://github.com/greg7mdp/sparsepp) to replace the default `std::unordered_set` used in the implementation of UidHashTable. This can be done by changing `USE_SPARSEPP` in `include/config.h` to 1 and manually placing the sparsepp headers into `dep/sparsepp/` before running make.
 
