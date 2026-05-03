@@ -27,9 +27,8 @@
 
 #define REJ_ENTRY128 1
 
-// download it from github manually and put 
-// it in dep/sparsepp before enabling this
-#define USE_SPARSEPP 0
+// sparsepp is vendored in dep/sparsepp and used for the insert-heavy UID table.
+#define USE_SPARSEPP 1
 // ....do not enable it if USE_SPARSEPP is 1
 #define UID_OP_INLINE 0
 

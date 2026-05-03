@@ -139,7 +139,10 @@ Use `--validate-svpchallenge-generator` to compare the online generator against
 the downloadable seed-0 dim-140 example, and `--prepare-only` to fetch and
 preprocess lattices without launching sieving jobs.
 
-For large instances, it's recommended to use [sparsepp](https://github.com/greg7mdp/sparsepp) to replace the default `std::unordered_set` used in the implementation of UidHashTable. This can be done by changing `USE_SPARSEPP` in `include/config.h` to 1 and manually placing the sparsepp headers into `dep/sparsepp/` before running make.
+For large instances, the build uses [sparsepp](https://github.com/greg7mdp/sparsepp)
+for `UidHashTable` by default. The UID table is insert-heavy during CUDA sieving;
+using sparsepp avoids the `std::unordered_set` rehash/pointer-chasing bottleneck
+that otherwise dominates larger SVP-challenge inputs.
 
 For large instances, you may need to modify the values of `AMX_MAX_NTHREADS` in line 16 of `include/bgj_amx.h` and `MAX_NTHREADS` in line 42 of `include/bgj_epi8.h`, then recompile the code. The default value for both is set to 112.
 
