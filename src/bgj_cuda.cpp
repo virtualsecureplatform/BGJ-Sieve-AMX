@@ -165,7 +165,7 @@ uint64_t bgj_cuda_batch_min_dots()
         unsigned long long value = strtoull(env, NULL, 10);
         if (value > 0) return (uint64_t)value;
     }
-    return 64ULL * 1024ULL * 1024ULL;
+    return 128ULL * 1024ULL;
 }
 
 static int bgj_cuda_rank_of(const std::vector<int32_t> &rank,

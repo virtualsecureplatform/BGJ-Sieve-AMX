@@ -86,7 +86,7 @@ experimental batched entry point, `bgj_cuda_search_bucket_pool_batch_raw`,
 which submits several buckets on separate CUDA scratch streams and synchronizes
 once for counts before copying only the valid result ranges. The BGJ1 CUDA
 sieve loop uses this batch path by default for one host thread when the first
-bucket in the group has at least `67108864` pair checks; set
+bucket in the group has at least `131072` pair checks; set
 `BGJ_CUDA_BATCH=0` to disable it, `BGJ_CUDA_BATCH=1` to force it with multiple
 host threads, `BGJ_CUDA_BATCH_SIZE=<n>` to tune the group size, or
 `BGJ_CUDA_BATCH_MIN_DOTS=<n>` to tune the size threshold. With BGJ log level
@@ -96,6 +96,16 @@ The default CUDA/BGJ build now instantiates `Pool_epi8_t<6>` and
 `Pool_epi8_t<7>`, allowing non-LSH BGJ/CUDA paths to use 192- and
 224-dimensional int8 pool vectors. The LSH and AMX paths remain capped by their
 own template coverage.
+
+Raw SVP-challenge q-ary bases should be preprocessed before direct `bgj_epi8`
+runs. The challenge files contain very large unreduced entries, while the int8
+BGJ path expects a reduced/local basis. Use `app/lattice_preprocess` to run
+exact NTL LLL and write a reduced NTL-format basis:
+
+```bash
+$ app/lattice_preprocess ../G6K-GPU-Tensor/svpchallenge/svpchallenge-dim-080-seed-00.txt /tmp/svp80-lll.txt
+$ app/bgj_epi8 /tmp/svp80-lll.txt cuda 1 2 42
+```
 
 A raw CUDA benchmark for small bucket-size sweeps lives in
 `tests/bgj_cuda_raw_bench.cpp`. Build it against the CUDA library, then run it
@@ -111,6 +121,17 @@ $ BGJ_CUDA_TENSOR=0 /tmp/bgj_cuda_raw_bench
 $ /tmp/bgj_cuda_raw_bench 160 8192 8192 100 1 1 8
 $ /tmp/bgj_cuda_raw_bench 224 8192 8192 50 1 1 1 8
 ```
+
+For end-to-end A100 tuning on seed-42 SVP-challenge ladders, use:
+
+```bash
+$ bench/bgj_cuda_seed42.py --preset ladder --stop-on-timeout --stop-on-failure \
+    --timeout-sec 900 --time-budget-sec 10800
+```
+
+The harness preprocesses available SVP-challenge instances with
+`app/lattice_preprocess`, writes live logs, and records CSV/JSONL summaries
+under `bench/results/`.
 
 For large instances, it's recommended to use [sparsepp](https://github.com/greg7mdp/sparsepp) to replace the default `std::unordered_set` used in the implementation of UidHashTable. This can be done by changing `USE_SPARSEPP` in `include/config.h` to 1 and manually placing the sparsepp headers into `dep/sparsepp/` before running make.
 

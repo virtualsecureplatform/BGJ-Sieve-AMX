@@ -4,8 +4,11 @@
 /app/svp_check
 /app/svp_solver
 /app/svp_tool
+/app/lattice_preprocess
 /src/*.o
 /src/libllib.a
+/bench/results/
+__pycache__/
 
 # Local dependency installs and extracted archives
 /dep/gmp/

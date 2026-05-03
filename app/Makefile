@@ -1,4 +1,4 @@
-BIN = bgj_epi8 svp_solver pump_red svp_tool svp_check
+BIN = bgj_epi8 svp_solver pump_red svp_tool svp_check lattice_preprocess
 CXX = clang++
 CFLAGS = -O3 -g -funroll-loops -ftree-vectorize -fopenmp=libomp -march=native -stdlib=libc++ -pthread -Wno-deprecated-declarations
 LIBS = -L../src -lllib -L../dep/ntl/lib -lntl -L../dep/gmp/lib -lgmp -lm
