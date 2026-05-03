@@ -102,13 +102,52 @@ extern "C" int bgj_cuda_raw_device_count()
     return count;
 }
 
-__device__ int bgj_cuda_dot_i8(const int8_t *a, const int8_t *b, uint32_t vec_length)
+__device__ __forceinline__ int bgj_cuda_dot_i8_scalar(const int8_t *a,
+                                                      const int8_t *b,
+                                                      uint32_t vec_length)
 {
     int acc = 0;
     for (uint32_t i = 0; i < vec_length; i++) {
         acc += (int)a[i] * (int)b[i];
     }
     return acc;
+}
+
+__device__ __forceinline__ int bgj_cuda_pack_i8x4(const int8_t *x)
+{
+    return (int)(uint8_t)x[0] |
+           ((int)(uint8_t)x[1] << 8) |
+           ((int)(uint8_t)x[2] << 16) |
+           ((int)(uint8_t)x[3] << 24);
+}
+
+__device__ __forceinline__ int bgj_cuda_dot_i8(const int8_t *a,
+                                               const int8_t *b,
+                                               uint32_t vec_length)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 610)
+    int acc = 0;
+    uint32_t i = 0;
+
+    if ((((uintptr_t)a | (uintptr_t)b) & 3u) == 0) {
+        const int *a4 = (const int *)a;
+        const int *b4 = (const int *)b;
+        for (; i + 4 <= vec_length; i += 4) {
+            acc = __dp4a(a4[i >> 2], b4[i >> 2], acc);
+        }
+    } else {
+        for (; i + 4 <= vec_length; i += 4) {
+            acc = __dp4a(bgj_cuda_pack_i8x4(a + i), bgj_cuda_pack_i8x4(b + i), acc);
+        }
+    }
+
+    for (; i < vec_length; i++) {
+        acc += (int)a[i] * (int)b[i];
+    }
+    return acc;
+#else
+    return bgj_cuda_dot_i8_scalar(a, b, vec_length);
+#endif
 }
 
 __device__ void bgj_cuda_push_result(bgj_cuda_result_t *results,
