@@ -129,79 +129,85 @@ __device__ void bgj_cuda_push_result(bgj_cuda_result_t *results,
     }
 }
 
-__global__ void bgj_cuda_search_np_kernel(const int8_t *p_vecs,
-                                          const int8_t *n_vecs,
-                                          const uint32_t *p_ids,
-                                          const uint32_t *n_ids,
-                                          const int32_t *p_norm,
-                                          const int32_t *n_norm,
-                                          const int32_t *p_dot,
-                                          const int32_t *n_dot,
-                                          uint32_t num_p,
-                                          uint32_t num_n,
-                                          uint32_t vec_length,
-                                          int32_t goal_norm,
-                                          int32_t center_goal_norm,
-                                          int record_dp,
-                                          bgj_cuda_result_t *results,
-                                          uint32_t result_capacity,
-                                          uint32_t *result_count,
-                                          int *overflow)
+__global__ void bgj_cuda_search_bucket_kernel(const int8_t *p_vecs,
+                                              const int8_t *n_vecs,
+                                              const uint32_t *p_ids,
+                                              const uint32_t *n_ids,
+                                              const int32_t *p_norm,
+                                              const int32_t *n_norm,
+                                              const int32_t *p_dot,
+                                              const int32_t *n_dot,
+                                              uint32_t num_p,
+                                              uint32_t num_n,
+                                              uint32_t vec_length,
+                                              int32_t goal_norm,
+                                              int32_t center_goal_norm,
+                                              int record_dp,
+                                              bgj_cuda_result_t *results,
+                                              uint32_t result_capacity,
+                                              uint32_t *result_count,
+                                              int *overflow)
 {
-    const uint64_t total = (uint64_t)num_p * (uint64_t)num_n;
+    const uint64_t np_total = (uint64_t)num_p * (uint64_t)num_n;
+    const uint64_t pp_total = num_p > 1 ? (uint64_t)num_p * (uint64_t)num_p : 0;
+    const uint64_t nn_total = num_n > 1 ? (uint64_t)num_n * (uint64_t)num_n : 0;
+    const uint64_t total = np_total + pp_total + nn_total;
     const uint64_t stride = (uint64_t)blockDim.x * (uint64_t)gridDim.x;
-    uint64_t pair = (uint64_t)blockIdx.x * (uint64_t)blockDim.x + (uint64_t)threadIdx.x;
+    uint64_t work = (uint64_t)blockIdx.x * (uint64_t)blockDim.x + (uint64_t)threadIdx.x;
 
-    for (; pair < total; pair += stride) {
-        const uint32_t p = (uint32_t)(pair / num_n);
-        const uint32_t n = (uint32_t)(pair - (uint64_t)p * num_n);
-        const int32_t dp = bgj_cuda_dot_i8(p_vecs + (uint64_t)p * vec_length,
-                                           n_vecs + (uint64_t)n * vec_length,
-                                           vec_length);
+    for (; work < total; work += stride) {
+        if (work < np_total) {
+            const uint32_t p = (uint32_t)(work / num_n);
+            const uint32_t n = (uint32_t)(work - (uint64_t)p * num_n);
+            const int32_t dp = bgj_cuda_dot_i8(p_vecs + (uint64_t)p * vec_length,
+                                               n_vecs + (uint64_t)n * vec_length,
+                                               vec_length);
 
-        if (p_norm[p] + n_norm[n] + dp < goal_norm) {
-            bgj_cuda_push_result(results, result_count, overflow, result_capacity,
-                                 BGJ_CUDA_SOL_A, p_ids[p], n_ids[n]);
+            if (p_norm[p] + n_norm[n] + dp < goal_norm) {
+                bgj_cuda_push_result(results, result_count, overflow, result_capacity,
+                                     BGJ_CUDA_SOL_A, p_ids[p], n_ids[n]);
+            }
+            if (record_dp && p_dot[p] + n_dot[n] - dp < center_goal_norm) {
+                bgj_cuda_push_result(results, result_count, overflow, result_capacity,
+                                     BGJ_CUDA_SOL_SA, p_ids[p], n_ids[n]);
+            }
+        } else if (work < np_total + pp_total) {
+            const uint64_t local = work - np_total;
+            const uint32_t i = (uint32_t)(local / num_p);
+            const uint32_t j = (uint32_t)(local - (uint64_t)i * num_p);
+            if (j <= i) continue;
+
+            const int32_t dp = bgj_cuda_dot_i8(p_vecs + (uint64_t)i * vec_length,
+                                               p_vecs + (uint64_t)j * vec_length,
+                                               vec_length);
+
+            if (p_norm[i] + p_norm[j] - dp < goal_norm) {
+                bgj_cuda_push_result(results, result_count, overflow, result_capacity,
+                                     BGJ_CUDA_SOL_S, p_ids[i], p_ids[j]);
+            }
+            if (record_dp && p_dot[i] + p_dot[j] + dp < center_goal_norm) {
+                bgj_cuda_push_result(results, result_count, overflow, result_capacity,
+                                     BGJ_CUDA_SOL_SS, p_ids[i], p_ids[j]);
+            }
+        } else {
+            const uint64_t local = work - np_total - pp_total;
+            const uint32_t i = (uint32_t)(local / num_n);
+            const uint32_t j = (uint32_t)(local - (uint64_t)i * num_n);
+            if (j <= i) continue;
+
+            const int32_t dp = bgj_cuda_dot_i8(n_vecs + (uint64_t)i * vec_length,
+                                               n_vecs + (uint64_t)j * vec_length,
+                                               vec_length);
+
+            if (n_norm[i] + n_norm[j] - dp < goal_norm) {
+                bgj_cuda_push_result(results, result_count, overflow, result_capacity,
+                                     BGJ_CUDA_SOL_S, n_ids[i], n_ids[j]);
+            }
+            if (record_dp && n_dot[i] + n_dot[j] + dp < center_goal_norm) {
+                bgj_cuda_push_result(results, result_count, overflow, result_capacity,
+                                     BGJ_CUDA_SOL_AA, n_ids[i], n_ids[j]);
+            }
         }
-        if (record_dp && p_dot[p] + n_dot[n] - dp < center_goal_norm) {
-            bgj_cuda_push_result(results, result_count, overflow, result_capacity,
-                                 BGJ_CUDA_SOL_SA, p_ids[p], n_ids[n]);
-        }
-    }
-}
-
-__global__ void bgj_cuda_search_same_kernel(const int8_t *vecs,
-                                            const uint32_t *ids,
-                                            const int32_t *norm,
-                                            const int32_t *center_dot,
-                                            uint32_t num_vecs,
-                                            uint32_t vec_length,
-                                            int32_t goal_norm,
-                                            int32_t center_goal_norm,
-                                            int record_dp,
-                                            int negative_bucket,
-                                            bgj_cuda_result_t *results,
-                                            uint32_t result_capacity,
-                                            uint32_t *result_count,
-                                            int *overflow)
-{
-    const uint32_t j = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t i = blockIdx.y * blockDim.y + threadIdx.y;
-
-    if (i >= num_vecs || j >= num_vecs || j <= i) return;
-
-    const int32_t dp = bgj_cuda_dot_i8(vecs + (uint64_t)i * vec_length,
-                                       vecs + (uint64_t)j * vec_length,
-                                       vec_length);
-
-    if (norm[i] + norm[j] - dp < goal_norm) {
-        bgj_cuda_push_result(results, result_count, overflow, result_capacity,
-                             BGJ_CUDA_SOL_S, ids[i], ids[j]);
-    }
-    if (record_dp && center_dot[i] + center_dot[j] + dp < center_goal_norm) {
-        bgj_cuda_push_result(results, result_count, overflow, result_capacity,
-                             negative_bucket ? BGJ_CUDA_SOL_AA : BGJ_CUDA_SOL_SS,
-                             ids[i], ids[j]);
     }
 }
 
@@ -305,81 +311,35 @@ extern "C" int bgj_cuda_search_bucket_raw(const int8_t *p_vecs,
     CUDA_TRY(cudaMemset(scratch->result_count, 0, sizeof(uint32_t)));
     CUDA_TRY(cudaMemset(scratch->overflow, 0, sizeof(int)));
 
-    if (num_p && num_n) {
-        const uint64_t total = (uint64_t)num_p * (uint64_t)num_n;
+    {
+        const uint64_t total = (uint64_t)num_p * (uint64_t)num_n +
+                               (num_p > 1 ? (uint64_t)num_p * (uint64_t)num_p : 0) +
+                               (num_n > 1 ? (uint64_t)num_n * (uint64_t)num_n : 0);
         const uint32_t threads = 256;
         uint32_t blocks = (uint32_t)((total + threads - 1) / threads);
         if (blocks == 0) blocks = 1;
         if (blocks > 65535) blocks = 65535;
-        bgj_cuda_search_np_kernel<<<blocks, threads>>>(scratch->p_vecs,
-                                                       scratch->n_vecs,
-                                                       scratch->p_ids,
-                                                       scratch->n_ids,
-                                                       scratch->p_norm,
-                                                       scratch->n_norm,
-                                                       scratch->p_dot,
-                                                       scratch->n_dot,
-                                                       num_p,
-                                                       num_n,
-                                                       vec_length,
-                                                       goal_norm,
-                                                       goal_norm - center_norm,
-                                                       record_dp,
-                                                       scratch->results,
-                                                       result_capacity,
-                                                       scratch->result_count,
-                                                       scratch->overflow);
-        CUDA_TRY(cudaGetLastError());
-    }
-
-    if (num_p > 1) {
-        dim3 threads(16, 16);
-        dim3 blocks((num_p + threads.x - 1) / threads.x,
-                    (num_p + threads.y - 1) / threads.y);
-        if (blocks.x > 65535 || blocks.y > 65535) {
-            set_plain_error("bucket too large for same-side CUDA grid");
-            goto fail;
+        if (total) {
+            bgj_cuda_search_bucket_kernel<<<blocks, threads>>>(scratch->p_vecs,
+                                                               scratch->n_vecs,
+                                                               scratch->p_ids,
+                                                               scratch->n_ids,
+                                                               scratch->p_norm,
+                                                               scratch->n_norm,
+                                                               scratch->p_dot,
+                                                               scratch->n_dot,
+                                                               num_p,
+                                                               num_n,
+                                                               vec_length,
+                                                               goal_norm,
+                                                               goal_norm - center_norm,
+                                                               record_dp,
+                                                               scratch->results,
+                                                               result_capacity,
+                                                               scratch->result_count,
+                                                               scratch->overflow);
+            CUDA_TRY(cudaGetLastError());
         }
-        bgj_cuda_search_same_kernel<<<blocks, threads>>>(scratch->p_vecs,
-                                                         scratch->p_ids,
-                                                         scratch->p_norm,
-                                                         scratch->p_dot,
-                                                         num_p,
-                                                         vec_length,
-                                                         goal_norm,
-                                                         goal_norm - center_norm,
-                                                         record_dp,
-                                                         0,
-                                                         scratch->results,
-                                                         result_capacity,
-                                                         scratch->result_count,
-                                                         scratch->overflow);
-        CUDA_TRY(cudaGetLastError());
-    }
-
-    if (num_n > 1) {
-        dim3 threads(16, 16);
-        dim3 blocks((num_n + threads.x - 1) / threads.x,
-                    (num_n + threads.y - 1) / threads.y);
-        if (blocks.x > 65535 || blocks.y > 65535) {
-            set_plain_error("bucket too large for same-side CUDA grid");
-            goto fail;
-        }
-        bgj_cuda_search_same_kernel<<<blocks, threads>>>(scratch->n_vecs,
-                                                         scratch->n_ids,
-                                                         scratch->n_norm,
-                                                         scratch->n_dot,
-                                                         num_n,
-                                                         vec_length,
-                                                         goal_norm,
-                                                         goal_norm - center_norm,
-                                                         record_dp,
-                                                         1,
-                                                         scratch->results,
-                                                         result_capacity,
-                                                         scratch->result_count,
-                                                         scratch->overflow);
-        CUDA_TRY(cudaGetLastError());
     }
 
     CUDA_TRY(cudaMemcpy(&h_result_count, scratch->result_count, sizeof(uint32_t), cudaMemcpyDeviceToHost));
