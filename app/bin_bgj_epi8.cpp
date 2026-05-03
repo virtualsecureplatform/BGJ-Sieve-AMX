@@ -6,6 +6,7 @@
 #include "../include/lattice.h"
 #include "../include/pool_epi8.h"
 #include "../include/bgj_cuda.h"
+#include "../include/sampler.h"
 
 
 int main(int argc, char** argv) {
@@ -13,6 +14,7 @@ int main(int argc, char** argv) {
     long algo = -2;
     long num_threads = -2;
     long log_level = -2;
+    long seed = -2;
     long print_min_lift = 0;
 
     for (long i = 0; i < argc; i++) {
@@ -37,19 +39,22 @@ int main(int argc, char** argv) {
         if (!strcasecmp(argv[i], "-l") || !strcasecmp(argv[i], "--log")) {
             if (i < argc - 1) log_level = atol(argv[i+1]);
         }
+        if (!strcasecmp(argv[i], "-s") || !strcasecmp(argv[i], "--seed")) {
+            if (i < argc - 1) seed = atol(argv[i+1]);
+        }
         if (!strcasecmp(argv[i], "-p") || !strcasecmp(argv[i], "--print")) {
             print_min_lift = 1;
         }
     }
     if (argc < 2 || help) {
         #if defined(__AMX_INT8__) && defined(HAVE_CUDA)
-        printf("Usage: %s <lattice_file> [bgjf|bgj1|bgj2|bgj3|cuda|amx] [num_threads] [log_level]\n", argv[0]);
+        printf("Usage: %s <lattice_file> [bgjf|bgj1|bgj2|bgj3|cuda|amx] [num_threads] [log_level] [seed]\n", argv[0]);
         #elif defined(__AMX_INT8__)
-        printf("Usage: %s <lattice_file> [bgjf|bgj1|bgj2|bgj3|amx] [num_threads] [log_level]\n", argv[0]);
+        printf("Usage: %s <lattice_file> [bgjf|bgj1|bgj2|bgj3|amx] [num_threads] [log_level] [seed]\n", argv[0]);
         #elif defined(HAVE_CUDA)
-        printf("Usage: %s <lattice_file> [bgjf|bgj1|bgj2|bgj3|cuda] [num_threads] [log_level]\n", argv[0]);
+        printf("Usage: %s <lattice_file> [bgjf|bgj1|bgj2|bgj3|cuda] [num_threads] [log_level] [seed]\n", argv[0]);
         #else
-        printf("Usage: %s <lattice_file> [bgjf|bgj1|bgj2|bgj3] [num_threads] [log_level]\n", argv[0]);
+        printf("Usage: %s <lattice_file> [bgjf|bgj1|bgj2|bgj3] [num_threads] [log_level] [seed]\n", argv[0]);
         #endif
         return 0;
     }
@@ -70,6 +75,12 @@ int main(int argc, char** argv) {
     }
     if (num_threads == -2) num_threads = (argc > 3) ? atol(argv[3]) : 1;
     if (log_level == -2) log_level = (argc > 4) ? atol(argv[4]) : 0;
+    if (seed == -2) {
+        const char *seed_env = getenv("BGJ_SEED");
+        if (seed_env && seed_env[0]) seed = atol(seed_env);
+    }
+    if (seed == -2 && argc > 5) seed = atol(argv[5]);
+    if (seed != -2) SetSamplerSeed((uint64_t)seed);
     log_level += print_min_lift * 16384;
 
     Lattice_QP L(argv[1]);

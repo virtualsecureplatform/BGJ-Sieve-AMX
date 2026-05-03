@@ -1421,7 +1421,7 @@ struct bgj_mbucket_t {
             do {
                 count++;
                 pass = 1;
-                center1_ind[i] = rand() % _num_pvec;     // we always select positive centers!!!
+                center1_ind[i] = Uniform_long(_num_pvec);     // we always select positive centers!!!
                 for (long j = 0; j < i; j++){
                     //if ((vec + vec_size * _pvec[center1_ind[i]])[-1] > 1.05 * goal_norm) pass = 0;
                     if (center1_ind[j] == center1_ind[i]) pass = 0;
@@ -1451,7 +1451,7 @@ struct bgj_mbucket_t {
             do {
                 count++;
                 pass = 1;
-                center1_ind[i] = rand() % _num_pvec;     // we always select positive centers!!!
+                center1_ind[i] = Uniform_long(_num_pvec);     // we always select positive centers!!!
                 for (long j = 0; j < i; j++){
                     //if ((vec + vec_size * _pvec[center1_ind[i]])[-1] > 1.05 * goal_norm) pass = 0;
                     if (center1_ind[j] == center1_ind[i]) pass = 0;
@@ -1898,7 +1898,7 @@ int Pool::bgj2_Sieve(long log_level, long lps_auto_adj, long num_empty){
                 float *ptr;
                 do {
                     pass = 1;
-                    ind[i] = rand() % goal_index;
+                    ind[i] = Uniform_long(goal_index);
                     for (long j = 0; j < i; j++){
                         if (ind[j] == ind[i]) pass = 0;
                     }

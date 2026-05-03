@@ -69,7 +69,7 @@ int Pool::three_Sieve(three_Sieve_params params, int show_details, long maxcc){
                     break;
                 }
                 //centering
-                long index = rand()%(num_vec);
+                long index = Uniform_long(num_vec);
                 long *cptr = cvec+index*cvec_size;
                 float *ptr = (float *) cptr[5];
                 long **bucketp = new long*[num_vec];

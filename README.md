@@ -43,6 +43,17 @@ BGJ1 path:
 $ ./bgj_epi8 L_100 cuda
 ```
 
+For reproducible CUDA/BGJ profiling, pass a fixed sampler seed as the fifth
+positional argument, with `-s/--seed`, or with `BGJ_SEED`:
+
+```bash
+$ ./bgj_epi8 L_100 cuda 1 2 42
+$ BGJ_SEED=42 ./bgj_epi8 L_100 cuda 1 2
+```
+
+The seed controls the library sampler and the internal randomized choices used
+by sieving. `svp_tool -s` and `svp_solver -s` use the same sampler seed path.
+
 You can also force CUDA-assisted bucket search for a compiled-in `bgj1` run
 with `BGJ_CUDA_SEARCH=1`. If CUDA is unavailable or an internal result buffer
 overflows, the code falls back to the existing CPU search for that bucket. The

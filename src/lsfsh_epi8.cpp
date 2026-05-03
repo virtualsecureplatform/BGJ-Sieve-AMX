@@ -494,7 +494,7 @@ struct lsh_mblock_provider_t {
         float **center = (float **) NEW_MAT(num_pop, dh_dim, sizeof(float));
         do {
             for (long i = 0; i < num_pop; i++) {
-                for (long j = 0; j < dh_dim; j++) center[i][j] = rand() % 65536;
+                for (long j = 0; j < dh_dim; j++) center[i][j] = Uniform_long(65536);
                 for (long j = dh_dim - 1; j >= 0; j--) {
                     red_avx2(center[i], b_head_fp[j], round(idiag[j] * center[i][j]), dh_dim);
                 }

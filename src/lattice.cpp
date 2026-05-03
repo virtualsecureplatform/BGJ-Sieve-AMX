@@ -2,6 +2,7 @@
 #include "../include/utils.h"
 #include "../include/vec.h"
 #include "../include/quad.h"
+#include "../include/sampler.h"
 #include <fstream>
 
 //constructions and distruction
@@ -232,7 +233,7 @@ void Lattice_QP::tail_shuffle(long l){
     //shuffle [n-l, n]
     for (long epoch = 0; epoch < 13; epoch ++){
         for (long i = n-l; i < n; i++){
-            long j = rand()%l + n-l;
+            long j = Uniform_long(l) + n-l;
             if (i != j){
                 copy(tmp.hi, tmp.lo, b.hi[i], b.lo[i], m8);
                 copy(b.hi[i], b.lo[i], b.hi[j], b.lo[j], m8);
@@ -240,9 +241,9 @@ void Lattice_QP::tail_shuffle(long l){
             }
         }
         for (long i = n-l; i < n; i++){
-            long j = rand()%l + n-l;
+            long j = Uniform_long(l) + n-l;
             if (i != j){
-                long q = rand()%5 - 2;
+                long q = Uniform_long(5) - 2;
                 red(b.hi[i], b.lo[i], b.hi[j], b.lo[j], NTL::to_quad_float(q), m8);
             }
         }

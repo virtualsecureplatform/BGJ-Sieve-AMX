@@ -11,6 +11,7 @@
 #include "../include/utils.h"
 #include "../include/lattice.h"
 #include "../include/pool_epi8.h"
+#include "../include/sampler.h"
 
 #if 1
 struct timeval _solver_timer_start, _solver_timer_end;
@@ -343,7 +344,7 @@ int main(int argc, char** argv) {
     LLL(det2, L_ZZ, 1, 3, 0);
     
     Lattice_QP L(L_ZZ);
-    srand(seed);
+    SetSamplerSeed((uint64_t)seed);
     _svp_solver_red(&L, algo);
     TIMER_END;
     

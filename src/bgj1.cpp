@@ -2402,7 +2402,7 @@ int Pool::bgj1_Sieve(long log_level, long lps_auto_adj, long num_empty){
                 float *ptr;
                 do {
                     pass = 1;
-                    ind[i] = rand() % goal_index;
+                    ind[i] = Uniform_long(goal_index);
                     for (long j = 0; j < i; j++){
                         if (ind[j] == ind[i]) pass = 0;
                     }
@@ -2996,7 +2996,7 @@ int Pool::bgj1_Sieve(long log_level, long lps_auto_adj, long num_empty){
                         add(coeff_dst, src1, coeff_size);
                         add(coeff_dst, src2, coeff_size);
                         compute_vec(dst);
-                        //if (CSD == 80 && rand() % 100 == 0) {
+                        //if (CSD == 80 && Uniform_long(100) == 0) {
                         //    float n1 = sqrt(local_buffer[thread]->a_list[i*2][-1]/gh2) - 1;
                         //    float n2 = sqrt(local_buffer[thread]->a_list[i*2+1][-1]/gh2) - 1;
                         //    float nd = sqrt(dst[-1]/gh2) - 1;
@@ -3027,7 +3027,7 @@ int Pool::bgj1_Sieve(long log_level, long lps_auto_adj, long num_empty){
                         add(coeff_dst, src2, coeff_size);
                         add(coeff_dst, src3, coeff_size);
                         compute_vec(dst);
-                        //if (CSD == 80 && rand() % 100 == 0) {
+                        //if (CSD == 80 && Uniform_long(100) == 0) {
                         //    float n1 = sqrt(local_buffer[thread]->aa_list[i*3][-1]/gh2) - 1;
                         //    float n2 = sqrt(local_buffer[thread]->aa_list[i*3+1][-1]/gh2) - 1;
                         //    float n3 = sqrt(local_buffer[thread]->aa_list[i*3+2][-1]/gh2) - 1;

@@ -10,6 +10,7 @@
 #include "../include/utils.h"
 #include "../include/lattice.h"
 #include "../include/pool_epi8.h"
+#include "../include/sampler.h"
 
 
 #if 1
@@ -119,7 +120,7 @@ int main(int argc, char** argv) {
     if (lsh && lsh_er == 0.0 && !fin) lsh_er = amx ? 0.1 : 0.2;
     if (help) { show_help(argc, argv); return 0; }
     
-    srand(seed);
+    SetSamplerSeed((uint64_t)seed);
     
     printf("command: ");
     for (long i = 0; i < argc; i++) {

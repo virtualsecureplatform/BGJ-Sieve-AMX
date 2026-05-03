@@ -3,13 +3,76 @@
 #include "../include/utils.h"
 #include "../include/vec.h"
 
+#include <atomic>
 
-
-#define POWER264 18446744073709551616.0 
+#define POWER264 18446744073709551616.0
 
 #define ADJUST_SIGMA_WHEN_TOOSMALL 1
 
-std::mt19937_64 gen64(std::random_device{}());
+namespace {
+std::atomic<bool> sampler_seeded(false);
+std::atomic<uint64_t> sampler_seed_base(0);
+std::atomic<uint64_t> sampler_seed_counter(0);
+std::atomic<uint64_t> sampler_epoch(1);
+
+uint64_t splitmix64(uint64_t x)
+{
+    x += 0x9e3779b97f4a7c15ULL;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+
+uint64_t entropy_seed()
+{
+    std::random_device rd;
+    uint64_t hi = (uint64_t)rd();
+    uint64_t lo = (uint64_t)rd();
+    return (hi << 32) ^ lo;
+}
+
+uint64_t next_sampler_seed()
+{
+    if (!sampler_seeded.load(std::memory_order_acquire)) return entropy_seed();
+    uint64_t stream = sampler_seed_counter.fetch_add(1, std::memory_order_relaxed);
+    return splitmix64(sampler_seed_base.load(std::memory_order_relaxed) + stream);
+}
+
+uint64_t derive_sampler_seed(int seed)
+{
+    uint64_t s = (uint64_t)(uint32_t)seed;
+    if (!sampler_seeded.load(std::memory_order_acquire)) return s;
+    uint64_t base = sampler_seed_base.load(std::memory_order_relaxed);
+    return splitmix64(base ^ (s + 0x9e3779b97f4a7c15ULL));
+}
+
+uint64_t thread_local_u64()
+{
+    static thread_local std::mt19937_64 tls_gen;
+    static thread_local uint64_t tls_epoch = 0;
+    uint64_t epoch = sampler_epoch.load(std::memory_order_acquire);
+    if (tls_epoch != epoch) {
+        tls_gen.seed(next_sampler_seed());
+        tls_epoch = epoch;
+    }
+    return tls_gen();
+}
+}
+
+DGS1d::DGS1d()
+{
+    this->gen64.seed(next_sampler_seed());
+}
+
+DGS1d::DGS1d(int seed)
+{
+    this->gen64.seed(derive_sampler_seed(seed));
+}
+
+void DGS1d::set_seed(int seed)
+{
+    this->gen64.seed(derive_sampler_seed(seed));
+}
 
 int DGS1d::discrete_gaussian(double mu, double sigma2){
     long mu0 = round(mu);
@@ -80,7 +143,22 @@ long *NaiveDGS::gen_coeff(double sigma2, long ind_l, long ind_r){
 }
 
 uint64_t Uniform_u64(){
-    return gen64();
+    return thread_local_u64();
+}
+
+long Uniform_long(long bound)
+{
+    if (bound <= 0) return 0;
+    return (long)(Uniform_u64() % (uint64_t)bound);
+}
+
+void SetSamplerSeed(uint64_t seed)
+{
+    sampler_seed_base.store(seed, std::memory_order_relaxed);
+    sampler_seed_counter.store(0, std::memory_order_relaxed);
+    sampler_seeded.store(true, std::memory_order_release);
+    sampler_epoch.fetch_add(1, std::memory_order_acq_rel);
+    srand((unsigned int)seed);
 }
 
 NTL::Vec<double> random_vec(long n, double l){
@@ -114,7 +192,7 @@ Lattice_QP *random_qary_lattice(long dim, long q, long m){
     for (; i < m; i++) L->get_b().hi[i][i] = q;
     for (; i < dim; i++) {
         L->get_b().hi[i][i] = 1.0;
-        for (long j = 0; j < m; j++) L->get_b().hi[i][j] = gen64()%q;
+        for (long j = 0; j < m; j++) L->get_b().hi[i][j] = Uniform_u64()%q;
     }
     return L;
 }

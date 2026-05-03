@@ -93,7 +93,7 @@ int Pool::fc_Sieve(fc_Sieve_params params){
                 if (num_index_per_center*2 <= CSD){
                     long _22827xyz = 0;
                     do {
-                        long x = rand()%CSD;
+                        long x = Uniform_long(CSD);
                         bool ain = false;
                         for (long j = 0; j < _22827xyz; j++){
                             if (x == bucket_list[i].sparse_ind[j]){
@@ -110,7 +110,7 @@ int Pool::fc_Sieve(fc_Sieve_params params){
                     long *not_in_list = new long[CSD - num_index_per_center];
                     long _22827xyz = 0;
                     do {
-                        long x = rand()%CSD;
+                        long x = Uniform_long(CSD);
                         bool ain = false;
                         for (long j = 0; j < _22827xyz; j++){
                             if (x == not_in_list[j]){
@@ -138,7 +138,7 @@ int Pool::fc_Sieve(fc_Sieve_params params){
                         }
                     }
                     for (long j = 0; j < num_index_per_center; j++){
-                        long swapind = rand()%num_index_per_center;
+                        long swapind = Uniform_long(num_index_per_center);
                         long tmp = bucket_list[i].sparse_ind[j];
                         bucket_list[i].sparse_ind[j] = bucket_list[i].sparse_ind[swapind];
                         bucket_list[i].sparse_ind[swapind] = tmp;

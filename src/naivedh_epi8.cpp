@@ -240,7 +240,7 @@ int gen_dual_vec_list(float *dst, Lattice_QP *L, long log_level, long nlist) {
         long dst_ind;
         long count = 0;
         do {
-            dst_ind = rand() % nlist;
+            dst_ind = Uniform_long(nlist);
             count++;
         } while (dp_sum[dst_ind] * nlist < sum_dp && count < 3);
         
@@ -251,7 +251,7 @@ int gen_dual_vec_list(float *dst, Lattice_QP *L, long log_level, long nlist) {
         float new_norm;
         while (nrem --> 0) {
             long pass = 1;
-            src += (rand() % 163) + 1;
+            src += Uniform_long(163) + 1;
             if (src >= num_short_vec) src -= num_short_vec;
             
             for (long i = 0; i < nlist; i++) if (select_ind[i] == src) pass = 0;

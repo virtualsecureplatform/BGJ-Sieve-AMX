@@ -1576,7 +1576,7 @@ bool Pool_epi8_t<nb>::check_pool_status(long q, int supress_minor) {
         fprintf(stderr, "pool_size = %ld.\n", num_vec);
     }
     for (long ind = 0; ind < num_vec; ind++) {
-        if (q && (rand() % q != 0)) continue;
+        if (q && (Uniform_long(q) != 0)) continue;
         // check sum
         int32_t sum = 0;
         for (long i = 0; i < CSD; i++) sum += (vec+ind*vec_length)[i];
@@ -1637,7 +1637,7 @@ bool Pool_epi8_t<nb>::check_pool_status(long q, int supress_minor) {
     #if defined(__AMX_INT8__) && BOOST_AMX_SIEVE
     #else
     for (long cind = 0; cind < num_vec; cind++) {
-        if (q && (rand() % q != 0)) continue;
+        if (q && (Uniform_long(q) != 0)) continue;
         long ind = *((uint32_t *)(cvec+3LL*cind));
         int32_t nn = vnorm[ind] >> 1;
         uint16_t cn = (nn > 65535) ? 65535 : nn;
@@ -1678,7 +1678,7 @@ bool Pool_epi8_t<nb>::check_dim_lose(long q) {
 
     __attribute__ ((aligned (32))) int32_t coeff[vec_length];
     for (long ind = 0; ind < num_vec; ind++) {
-        if (q && (rand() % q != 0)) continue;
+        if (q && (Uniform_long(q) != 0)) continue;
         num_checked++;
         _compute_coeff(coeff, ind);
         for (long i = 0; i < CSD; i++) {

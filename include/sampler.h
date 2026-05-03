@@ -10,14 +10,16 @@ class Lattice_QP;
 
 /* random generator. */
 uint64_t Uniform_u64();
+long Uniform_long(long bound);
+void SetSamplerSeed(uint64_t seed);
 
 class DGS1d{
     public:
-        DGS1d(){this->gen64.seed(std::random_device{}());}
-        DGS1d(int seed){this->gen64.seed(seed);}
+        DGS1d();
+        DGS1d(int seed);
         ~DGS1d(){}
         int discrete_gaussian(double mu, double sigma2);
-        void set_seed(int seed){this->gen64.seed(seed);}
+        void set_seed(int seed);
         inline uint64_t Uniform_u64(){return gen64();}
     private:
         std::mt19937_64 gen64;

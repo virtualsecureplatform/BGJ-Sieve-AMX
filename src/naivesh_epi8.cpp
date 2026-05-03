@@ -393,12 +393,12 @@ void Pool_epi8_t<nb>::_opt_nsh_threshold(float *dual_vec, uint32_t *compress_pos
             compress_pos[6 * i + 4] = i;
             compress_pos[6 * i + 5] = i;
         } else {
-            compress_pos[6 * i + 0] = rand() % tail_dim;
-            compress_pos[6 * i + 1] = rand() % tail_dim;
-            compress_pos[6 * i + 2] = rand() % tail_dim;
-            compress_pos[6 * i + 3] = rand() % tail_dim;
-            compress_pos[6 * i + 4] = rand() % tail_dim;
-            compress_pos[6 * i + 5] = rand() % tail_dim;
+            compress_pos[6 * i + 0] = Uniform_long(tail_dim);
+            compress_pos[6 * i + 1] = Uniform_long(tail_dim);
+            compress_pos[6 * i + 2] = Uniform_long(tail_dim);
+            compress_pos[6 * i + 3] = Uniform_long(tail_dim);
+            compress_pos[6 * i + 4] = Uniform_long(tail_dim);
+            compress_pos[6 * i + 5] = Uniform_long(tail_dim);
         }
     }
     // generate dual vector
@@ -496,7 +496,7 @@ void Pool_epi8_t<nb>::_opt_nsh_threshold(float *dual_vec, uint32_t *compress_pos
                 float _head_sum_len = sqrt(exp_length * exp_length - _tail_sum_len * _tail_sum_len);
 
                 // hpart
-                for (long i = 0; i < dh_dim; i++) ftmp1[i] = rand() & 0xffff;
+                for (long i = 0; i < dh_dim; i++) ftmp1[i] = Uniform_u64() & 0xffff;
                 for (long i = dh_dim - 1; i >= 0; i--) {
                     red_avx2(ftmp1, b_local[i], roundf(b_local_idiag[i] * ftmp1[i]), dh_dim);
                 }

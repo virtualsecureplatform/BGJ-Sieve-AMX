@@ -119,11 +119,11 @@ void Pool::Simhash_setup(){
     }
     for (long i = 0; i < 256; i++){
         compress_pos[i*6+0] = i % MSD;
-        compress_pos[i*6+1] = rand() % MSD;
-        compress_pos[i*6+2] = rand() % MSD;
-        compress_pos[i*6+3] = rand() % MSD;
-        compress_pos[i*6+4] = rand() % MSD;
-        compress_pos[i*6+5] = rand() % MSD;
+        compress_pos[i*6+1] = Uniform_long(MSD);
+        compress_pos[i*6+2] = Uniform_long(MSD);
+        compress_pos[i*6+3] = Uniform_long(MSD);
+        compress_pos[i*6+4] = Uniform_long(MSD);
+        compress_pos[i*6+5] = Uniform_long(MSD);
     }
     return;
 }

@@ -292,7 +292,7 @@ int Pool_epi8_t<nb>::_pool_bucketing_amx(bucket_amx_t **rbucket0, bucket_amx_t *
         int pass;
         do {
             pass = 1;
-            center_ind_list[i] = rand() % num_vec;
+            center_ind_list[i] = Uniform_long(num_vec);
             if (num_try_find_center < AMX_MAX_NUM_TRYCENTER) {
                 for (long j = 0; j < i; j++){
                     if (center_ind_list[j] == center_ind_list[i]) pass = 0;
@@ -951,7 +951,7 @@ int Pool_epi8_t<nb>::_parallel_sub_bucketing_amx(bucket_amx_t *main_bucket, buck
         int pass;
         do {
             pass = 1;
-            center_ind_list[i] = main_bucket->pvec[rand() % main_bucket->num_pvec];
+            center_ind_list[i] = main_bucket->pvec[Uniform_long(main_bucket->num_pvec)];
             if (num_try_find_center < AMX_MAX_NUM_TRYCENTER) {
                 for (long j = 0; j < i; j++){
                     if (center_ind_list[j] == center_ind_list[i]) pass = 0;

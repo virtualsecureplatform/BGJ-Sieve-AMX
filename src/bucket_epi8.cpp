@@ -226,7 +226,7 @@ int Pool_epi8_t<nb>::_pool_bucketing(bucket_epi8_t<record_dp> **dst3, bucket_epi
         int pass;
         do {
             pass = 1;
-            center_ind_list[i] = rand() % ((long)(0.65 * num_vec));     // it really matters?
+            center_ind_list[i] = Uniform_long((long)(0.65 * num_vec));     // it really matters?
             if (num_try_find_center < 2000) {
                 for (long j = 0; j < i; j++){
                     if (center_ind_list[j] == center_ind_list[i]) pass = 0;
@@ -891,7 +891,7 @@ int Pool_epi8_t<nb>::_sub_bucketing(bucket_epi8_t<0> *main_bucket, bucket_epi8_t
         do {
             pass = 1;
             num_try_find_center++;
-            center_ind_list[i] = rand() % ((long)(0.65 * main_bucket->num_pvec));     // it really matters?
+            center_ind_list[i] = Uniform_long((long)(0.65 * main_bucket->num_pvec));     // it really matters?
             for (long j = 0; j < i; j++) {
                 if (center_ind_list[j] == center_ind_list[i] && num_try_find_center < 2000) pass = 0;
             }
