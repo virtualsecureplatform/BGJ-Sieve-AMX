@@ -1,6 +1,7 @@
 #include "bgj_cuda.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <iostream>
 #include <limits>
@@ -424,6 +425,14 @@ int main()
     ok = run_case("mixed-96", 6, 5, 96, true, 8, ThresholdMode::Selective) && ok;
     ok = run_case("tensor-np-160", 48, 52, 160, true, 9, ThresholdMode::Selective) && ok;
     ok = run_case("tensor-np-224", 33, 35, 224, true, 10, ThresholdMode::Selective) && ok;
+    setenv("BGJ_CUDA_TENSOR_NP_MIN_TILES", "1", 1);
+    setenv("BGJ_CUDA_TENSOR_NP_SHARED_A", "1", 1);
+    ok = run_case("tensor-np-shared-a-160", 64, 64, 160, true, 12, ThresholdMode::Selective) && ok;
+    unsetenv("BGJ_CUDA_TENSOR_NP_SHARED_A");
+    setenv("BGJ_CUDA_TENSOR_NP_WIDE", "1", 1);
+    ok = run_case("tensor-np-wide-160", 64, 64, 160, true, 12, ThresholdMode::Selective) && ok;
+    unsetenv("BGJ_CUDA_TENSOR_NP_WIDE");
+    unsetenv("BGJ_CUDA_TENSOR_NP_MIN_TILES");
     ok = run_case("tensor-same-32", 512, 0, 32, true, 11, ThresholdMode::Selective) && ok;
     ok = run_pool_case() && ok;
     ok = run_overflow_case() && ok;

@@ -105,7 +105,7 @@ static int bgj_cuda_pool_cache_requested()
 {
     const char *env = getenv("BGJ_CUDA_POOL_CACHE");
     if (env && env[0]) return env[0] != '0';
-    return 0;
+    return 1;
 }
 
 static int bgj_cuda_rank_of(const std::vector<int32_t> &rank,

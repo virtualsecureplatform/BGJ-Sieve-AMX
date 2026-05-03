@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 #include <mma.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,9 +15,9 @@ static char bgj_cuda_error[512] = "no CUDA error";
 #define BGJ_CUDA_WARP_SIZE 32u
 #define BGJ_CUDA_TENSOR_WARPS_PER_BLOCK 4u
 #define BGJ_CUDA_TENSOR_THREADS_PER_BLOCK (BGJ_CUDA_WARP_SIZE * BGJ_CUDA_TENSOR_WARPS_PER_BLOCK)
+#define BGJ_CUDA_TENSOR_NP_WIDE_TILES 4u
 
 struct bgj_cuda_raw_scratch_t {
-    int8_t *pool_vecs;
     int8_t *p_vecs;
     int8_t *n_vecs;
     uint32_t *p_ids;
@@ -30,7 +31,6 @@ struct bgj_cuda_raw_scratch_t {
     int *overflow;
     cudaStream_t stream;
 
-    size_t pool_vec_capacity;
     size_t p_vec_capacity;
     size_t n_vec_capacity;
     size_t p_id_capacity;
@@ -42,15 +42,10 @@ struct bgj_cuda_raw_scratch_t {
     size_t result_capacity;
     size_t result_count_capacity;
     size_t overflow_capacity;
-    const int8_t *pool_host_key;
-    uint64_t pool_epoch;
-    uint32_t pool_size;
-    uint32_t pool_vec_length;
     int stream_ready;
 
     bgj_cuda_raw_scratch_t()
-        : pool_vecs(NULL),
-          p_vecs(NULL),
+        : p_vecs(NULL),
           n_vecs(NULL),
           p_ids(NULL),
           n_ids(NULL),
@@ -62,7 +57,6 @@ struct bgj_cuda_raw_scratch_t {
           result_count(NULL),
           overflow(NULL),
           stream(NULL),
-          pool_vec_capacity(0),
           p_vec_capacity(0),
           n_vec_capacity(0),
           p_id_capacity(0),
@@ -74,10 +68,6 @@ struct bgj_cuda_raw_scratch_t {
           result_capacity(0),
           result_count_capacity(0),
           overflow_capacity(0),
-          pool_host_key(NULL),
-          pool_epoch(0),
-          pool_size(0),
-          pool_vec_length(0),
           stream_ready(0)
     {
     }
@@ -85,7 +75,6 @@ struct bgj_cuda_raw_scratch_t {
     ~bgj_cuda_raw_scratch_t()
     {
         if (stream_ready) cudaStreamSynchronize(stream);
-        cudaFree(pool_vecs);
         cudaFree(p_vecs);
         cudaFree(n_vecs);
         cudaFree(p_ids);
@@ -234,6 +223,143 @@ void bgj_cuda_search_np_tensor_kernel(const int8_t *p_vecs,
         wmma::load_matrix_sync(a_frag, (const signed char *)(p_vecs + (uint64_t)tile_p * vec_length + k), vec_length);
         wmma::load_matrix_sync(b_frag, (const signed char *)(n_vecs + (uint64_t)tile_n * vec_length + k), vec_length);
         wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+    }
+
+    wmma::store_matrix_sync(dp_tile, c_frag, 16, wmma::mem_row_major);
+    __syncwarp();
+
+    for (uint32_t idx = lane_id; idx < 16u * 16u; idx += BGJ_CUDA_WARP_SIZE) {
+        const uint32_t p = tile_p + idx / 16u;
+        const uint32_t n = tile_n + idx % 16u;
+        const int32_t dp = dp_tile[idx];
+
+        if (p_norm[p] + n_norm[n] + dp < goal_norm) {
+            bgj_cuda_push_result(results, result_count, overflow, result_capacity,
+                                 BGJ_CUDA_SOL_A, p_ids[p], n_ids[n]);
+        }
+        if (record_dp && p_dot[p] + n_dot[n] - dp < center_goal_norm) {
+            bgj_cuda_push_result(results, result_count, overflow, result_capacity,
+                                 BGJ_CUDA_SOL_SA, p_ids[p], n_ids[n]);
+        }
+    }
+}
+
+__global__ __launch_bounds__(BGJ_CUDA_TENSOR_THREADS_PER_BLOCK, 2)
+void bgj_cuda_search_np_tensor_wide_kernel(const int8_t *p_vecs,
+                                           const int8_t *n_vecs,
+                                           const uint32_t *p_ids,
+                                           const uint32_t *n_ids,
+                                           const int32_t *p_norm,
+                                           const int32_t *n_norm,
+                                           const int32_t *p_dot,
+                                           const int32_t *n_dot,
+                                           uint32_t group_blocks_n,
+                                           uint32_t vec_length,
+                                           int32_t goal_norm,
+                                           int32_t center_goal_norm,
+                                           int record_dp,
+                                           bgj_cuda_result_t *results,
+                                           uint32_t result_capacity,
+                                           uint32_t *result_count,
+                                           int *overflow)
+{
+    const uint32_t warp_id = threadIdx.x / BGJ_CUDA_WARP_SIZE;
+    const uint32_t lane_id = threadIdx.x % BGJ_CUDA_WARP_SIZE;
+    const uint32_t group_p = blockIdx.x / group_blocks_n;
+    const uint32_t group_n = blockIdx.x - group_p * group_blocks_n;
+    const uint32_t tile_p = (group_p * BGJ_CUDA_TENSOR_NP_WIDE_TILES + warp_id) * 16u;
+    const uint32_t tile_n = group_n * BGJ_CUDA_TENSOR_NP_WIDE_TILES * 16u;
+
+    __shared__ int32_t dp_tiles[BGJ_CUDA_TENSOR_WARPS_PER_BLOCK][BGJ_CUDA_TENSOR_NP_WIDE_TILES][16 * 16];
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, signed char, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, signed char, wmma::col_major> b_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, int> c_frag[BGJ_CUDA_TENSOR_NP_WIDE_TILES];
+
+    for (uint32_t col = 0; col < BGJ_CUDA_TENSOR_NP_WIDE_TILES; col++) {
+        wmma::fill_fragment(c_frag[col], 0);
+    }
+
+    for (uint32_t k = 0; k < vec_length; k += 16) {
+        wmma::load_matrix_sync(a_frag, (const signed char *)(p_vecs + (uint64_t)tile_p * vec_length + k), vec_length);
+        for (uint32_t col = 0; col < BGJ_CUDA_TENSOR_NP_WIDE_TILES; col++) {
+            const uint32_t col_tile_n = tile_n + col * 16u;
+            wmma::load_matrix_sync(b_frag, (const signed char *)(n_vecs + (uint64_t)col_tile_n * vec_length + k), vec_length);
+            wmma::mma_sync(c_frag[col], a_frag, b_frag, c_frag[col]);
+        }
+    }
+
+    for (uint32_t col = 0; col < BGJ_CUDA_TENSOR_NP_WIDE_TILES; col++) {
+        wmma::store_matrix_sync(&dp_tiles[warp_id][col][0], c_frag[col], 16, wmma::mem_row_major);
+    }
+    __syncwarp();
+
+    for (uint32_t col = 0; col < BGJ_CUDA_TENSOR_NP_WIDE_TILES; col++) {
+        int32_t *dp_tile = &dp_tiles[warp_id][col][0];
+        const uint32_t col_tile_n = tile_n + col * 16u;
+        for (uint32_t idx = lane_id; idx < 16u * 16u; idx += BGJ_CUDA_WARP_SIZE) {
+            const uint32_t p = tile_p + idx / 16u;
+            const uint32_t n = col_tile_n + idx % 16u;
+            const int32_t dp = dp_tile[idx];
+
+            if (p_norm[p] + n_norm[n] + dp < goal_norm) {
+                bgj_cuda_push_result(results, result_count, overflow, result_capacity,
+                                     BGJ_CUDA_SOL_A, p_ids[p], n_ids[n]);
+            }
+            if (record_dp && p_dot[p] + n_dot[n] - dp < center_goal_norm) {
+                bgj_cuda_push_result(results, result_count, overflow, result_capacity,
+                                     BGJ_CUDA_SOL_SA, p_ids[p], n_ids[n]);
+            }
+        }
+    }
+}
+
+__global__ __launch_bounds__(BGJ_CUDA_TENSOR_THREADS_PER_BLOCK, 2)
+void bgj_cuda_search_np_tensor_shared_a_kernel(const int8_t *p_vecs,
+                                               const int8_t *n_vecs,
+                                               const uint32_t *p_ids,
+                                               const uint32_t *n_ids,
+                                               const int32_t *p_norm,
+                                               const int32_t *n_norm,
+                                               const int32_t *p_dot,
+                                               const int32_t *n_dot,
+                                               uint32_t group_blocks_n,
+                                               uint32_t vec_length,
+                                               int32_t goal_norm,
+                                               int32_t center_goal_norm,
+                                               int record_dp,
+                                               bgj_cuda_result_t *results,
+                                               uint32_t result_capacity,
+                                               uint32_t *result_count,
+                                               int *overflow)
+{
+    const uint32_t warp_id = threadIdx.x / BGJ_CUDA_WARP_SIZE;
+    const uint32_t lane_id = threadIdx.x % BGJ_CUDA_WARP_SIZE;
+    const uint32_t group_p = blockIdx.x / group_blocks_n;
+    const uint32_t group_n = blockIdx.x - group_p * group_blocks_n;
+    const uint32_t tile_p = group_p * 16u;
+    const uint32_t tile_n = (group_n * BGJ_CUDA_TENSOR_WARPS_PER_BLOCK + warp_id) * 16u;
+
+    __shared__ int8_t a_tile[16 * 16];
+    __shared__ int32_t dp_tiles[BGJ_CUDA_TENSOR_WARPS_PER_BLOCK][16 * 16];
+    int32_t *dp_tile = dp_tiles[warp_id];
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, signed char, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, signed char, wmma::col_major> b_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, int> c_frag;
+    wmma::fill_fragment(c_frag, 0);
+
+    for (uint32_t k = 0; k < vec_length; k += 16) {
+        for (uint32_t idx = threadIdx.x; idx < 16u * 16u; idx += BGJ_CUDA_TENSOR_THREADS_PER_BLOCK) {
+            const uint32_t row = idx / 16u;
+            const uint32_t col = idx % 16u;
+            a_tile[idx] = p_vecs[(uint64_t)(tile_p + row) * vec_length + k + col];
+        }
+        __syncthreads();
+
+        wmma::load_matrix_sync(a_frag, (const signed char *)a_tile, 16);
+        wmma::load_matrix_sync(b_frag, (const signed char *)(n_vecs + (uint64_t)tile_n * vec_length + k), vec_length);
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        __syncthreads();
     }
 
     wmma::store_matrix_sync(dp_tile, c_frag, 16, wmma::mem_row_major);
@@ -519,6 +645,83 @@ static int ensure_cuda_capacity(void **ptr, size_t *capacity, size_t requested)
     return 1;
 }
 
+struct bgj_cuda_shared_pool_cache_t {
+    int8_t *vecs;
+    size_t capacity;
+    const int8_t *host_key;
+    uint64_t epoch;
+    uint32_t pool_size;
+    uint32_t vec_length;
+    pthread_mutex_t lock;
+
+    bgj_cuda_shared_pool_cache_t()
+        : vecs(NULL),
+          capacity(0),
+          host_key(NULL),
+          epoch(0),
+          pool_size(0),
+          vec_length(0)
+    {
+        pthread_mutex_init(&lock, NULL);
+    }
+
+    ~bgj_cuda_shared_pool_cache_t()
+    {
+        cudaFree(vecs);
+        pthread_mutex_destroy(&lock);
+    }
+};
+
+static bgj_cuda_shared_pool_cache_t bgj_cuda_shared_pool_cache;
+
+static int bgj_cuda_prepare_shared_pool_cache(const int8_t *pool_vecs_host,
+                                              uint64_t pool_epoch,
+                                              uint32_t pool_size,
+                                              uint32_t vec_length,
+                                              size_t pool_vec_bytes,
+                                              cudaStream_t stream,
+                                              int8_t **pool_vecs_device)
+{
+    bgj_cuda_shared_pool_cache_t *cache = &bgj_cuda_shared_pool_cache;
+    pthread_mutex_lock(&cache->lock);
+
+    if (cache->host_key != pool_vecs_host ||
+        cache->epoch != pool_epoch ||
+        cache->pool_size != pool_size ||
+        cache->vec_length != vec_length) {
+        if (!ensure_cuda_capacity((void **)&cache->vecs, &cache->capacity, pool_vec_bytes)) {
+            pthread_mutex_unlock(&cache->lock);
+            return 0;
+        }
+        if (pool_vec_bytes) {
+            cudaError_t err = cudaMemcpyAsync(cache->vecs,
+                                              pool_vecs_host,
+                                              pool_vec_bytes,
+                                              cudaMemcpyHostToDevice,
+                                              stream);
+            if (err != cudaSuccess) {
+                set_cuda_error("cudaMemcpyAsync shared pool", err);
+                pthread_mutex_unlock(&cache->lock);
+                return 0;
+            }
+            err = cudaStreamSynchronize(stream);
+            if (err != cudaSuccess) {
+                set_cuda_error("cudaStreamSynchronize shared pool", err);
+                pthread_mutex_unlock(&cache->lock);
+                return 0;
+            }
+        }
+        cache->host_key = pool_vecs_host;
+        cache->epoch = pool_epoch;
+        cache->pool_size = pool_size;
+        cache->vec_length = vec_length;
+    }
+
+    *pool_vecs_device = cache->vecs;
+    pthread_mutex_unlock(&cache->lock);
+    return 1;
+}
+
 static int bgj_cuda_prepare_stream(bgj_cuda_raw_scratch_t *scratch)
 {
     if (scratch->stream_ready) return 1;
@@ -548,6 +751,30 @@ static int bgj_cuda_tensor_same_requested()
     const char *env = getenv("BGJ_CUDA_TENSOR_SAME");
     if (env && env[0]) return env[0] != '0';
     return 1;
+}
+
+static int bgj_cuda_tensor_np_wide_requested()
+{
+    const char *env = getenv("BGJ_CUDA_TENSOR_NP_WIDE");
+    if (env && env[0]) return env[0] != '0';
+    return 0;
+}
+
+static int bgj_cuda_tensor_np_shared_a_requested()
+{
+    const char *env = getenv("BGJ_CUDA_TENSOR_NP_SHARED_A");
+    if (env && env[0]) return env[0] != '0';
+    return 0;
+}
+
+static uint32_t bgj_cuda_tensor_np_min_tiles()
+{
+    const char *env = getenv("BGJ_CUDA_TENSOR_NP_MIN_TILES");
+    if (env && env[0]) {
+        unsigned long value = strtoul(env, NULL, 10);
+        if (value > 0 && value <= 0xffffffffUL) return (uint32_t)value;
+    }
+    return 512u;
 }
 
 static uint32_t bgj_cuda_tensor_same_min_tiles()
@@ -610,8 +837,10 @@ static int bgj_cuda_search_bucket_raw_impl(const int8_t *p_vecs,
     uint32_t tensor_np_num_n = 0;
     uint32_t tensor_same_num_p = 0;
     uint32_t tensor_same_num_n = 0;
+    uint32_t tensor_np_min_tiles = 0;
     uint32_t tensor_same_min_tiles = 0;
     const int use_pool = pool_vecs_host != NULL;
+    int8_t *pool_vecs_device = NULL;
 
     if (result_capacity == 0) {
         set_plain_error("result capacity is zero");
@@ -633,21 +862,13 @@ static int bgj_cuda_search_bucket_raw_impl(const int8_t *p_vecs,
 
     if (use_pool) {
         const size_t pool_vec_bytes = (size_t)pool_size * (size_t)vec_length * sizeof(int8_t);
-        if (scratch->pool_host_key != pool_vecs_host ||
-            scratch->pool_epoch != pool_epoch ||
-            scratch->pool_size != pool_size ||
-            scratch->pool_vec_length != vec_length) {
-            CUDA_ENSURE(scratch->pool_vecs, scratch->pool_vec_capacity, pool_vec_bytes);
-            CUDA_TRY(cudaMemcpyAsync(scratch->pool_vecs,
-                                     pool_vecs_host,
-                                     pool_vec_bytes,
-                                     cudaMemcpyHostToDevice,
-                                     stream));
-            scratch->pool_host_key = pool_vecs_host;
-            scratch->pool_epoch = pool_epoch;
-            scratch->pool_size = pool_size;
-            scratch->pool_vec_length = vec_length;
-        }
+        if (!bgj_cuda_prepare_shared_pool_cache(pool_vecs_host,
+                                                pool_epoch,
+                                                pool_size,
+                                                vec_length,
+                                                pool_vec_bytes,
+                                                stream,
+                                                &pool_vecs_device)) goto fail;
     }
 
     if (num_p) {
@@ -661,7 +882,7 @@ static int bgj_cuda_search_bucket_raw_impl(const int8_t *p_vecs,
             uint32_t blocks = (uint32_t)((p_vec_bytes + threads - 1) / threads);
             if (blocks == 0) blocks = 1;
             if (blocks > 65535) blocks = 65535;
-            bgj_cuda_pack_pool_vecs_kernel<<<blocks, threads, 0, stream>>>(scratch->pool_vecs,
+            bgj_cuda_pack_pool_vecs_kernel<<<blocks, threads, 0, stream>>>(pool_vecs_device,
                                                                            scratch->p_ids,
                                                                            num_p,
                                                                            vec_length,
@@ -687,7 +908,7 @@ static int bgj_cuda_search_bucket_raw_impl(const int8_t *p_vecs,
             uint32_t blocks = (uint32_t)((n_vec_bytes + threads - 1) / threads);
             if (blocks == 0) blocks = 1;
             if (blocks > 65535) blocks = 65535;
-            bgj_cuda_pack_pool_vecs_kernel<<<blocks, threads, 0, stream>>>(scratch->pool_vecs,
+            bgj_cuda_pack_pool_vecs_kernel<<<blocks, threads, 0, stream>>>(pool_vecs_device,
                                                                            scratch->n_ids,
                                                                            num_n,
                                                                            vec_length,
@@ -711,6 +932,7 @@ static int bgj_cuda_search_bucket_raw_impl(const int8_t *p_vecs,
     if (bgj_cuda_tensor_requested() &&
         bgj_cuda_tensor_capable() &&
         vec_length % 16 == 0) {
+        tensor_np_min_tiles = bgj_cuda_tensor_np_min_tiles();
         tensor_same_min_tiles = bgj_cuda_tensor_same_min_tiles();
         if (num_p >= 16 && num_n >= 16) {
             tensor_np_num_p = (num_p / 16u) * 16u;
@@ -718,31 +940,114 @@ static int bgj_cuda_search_bucket_raw_impl(const int8_t *p_vecs,
             const uint32_t tensor_blocks_p = tensor_np_num_p / 16u;
             const uint32_t tensor_blocks_n = tensor_np_num_n / 16u;
             const uint64_t tensor_tiles = (uint64_t)tensor_blocks_p * (uint64_t)tensor_blocks_n;
-            const uint64_t tensor_grid = (tensor_tiles + BGJ_CUDA_TENSOR_WARPS_PER_BLOCK - 1u) /
-                                         BGJ_CUDA_TENSOR_WARPS_PER_BLOCK;
-            if (tensor_tiles <= 0xffffffffULL && tensor_grid <= 0x7fffffffu) {
-                bgj_cuda_search_np_tensor_kernel<<<(uint32_t)tensor_grid,
-                                                    BGJ_CUDA_TENSOR_THREADS_PER_BLOCK,
-                                                    0,
-                                                    stream>>>(scratch->p_vecs,
-                                                              scratch->n_vecs,
-                                                              scratch->p_ids,
-                                                              scratch->n_ids,
-                                                              scratch->p_norm,
-                                                              scratch->n_norm,
-                                                              scratch->p_dot,
-                                                              scratch->n_dot,
-                                                              tensor_blocks_n,
-                                                              (uint32_t)tensor_tiles,
-                                                              vec_length,
-                                                              goal_norm,
-                                                              goal_norm - center_norm,
-                                                              record_dp,
-                                                              scratch->results,
-                                                              result_capacity,
-                                                              scratch->result_count,
-                                                              scratch->overflow);
-                CUDA_TRY(cudaGetLastError());
+            if (tensor_tiles >= tensor_np_min_tiles &&
+                bgj_cuda_tensor_np_wide_requested() &&
+                tensor_blocks_p >= BGJ_CUDA_TENSOR_NP_WIDE_TILES &&
+                tensor_blocks_n >= BGJ_CUDA_TENSOR_NP_WIDE_TILES) {
+                const uint32_t wide_blocks_p =
+                    (tensor_blocks_p / BGJ_CUDA_TENSOR_NP_WIDE_TILES) *
+                    BGJ_CUDA_TENSOR_NP_WIDE_TILES;
+                const uint32_t wide_blocks_n =
+                    (tensor_blocks_n / BGJ_CUDA_TENSOR_NP_WIDE_TILES) *
+                    BGJ_CUDA_TENSOR_NP_WIDE_TILES;
+                const uint32_t wide_group_blocks_n = wide_blocks_n / BGJ_CUDA_TENSOR_NP_WIDE_TILES;
+                const uint64_t wide_groups =
+                    (uint64_t)(wide_blocks_p / BGJ_CUDA_TENSOR_NP_WIDE_TILES) *
+                    (uint64_t)wide_group_blocks_n;
+                if (wide_groups <= 0x7fffffffu) {
+                    bgj_cuda_search_np_tensor_wide_kernel<<<(uint32_t)wide_groups,
+                                                            BGJ_CUDA_TENSOR_THREADS_PER_BLOCK,
+                                                            0,
+                                                            stream>>>(scratch->p_vecs,
+                                                                      scratch->n_vecs,
+                                                                      scratch->p_ids,
+                                                                      scratch->n_ids,
+                                                                      scratch->p_norm,
+                                                                      scratch->n_norm,
+                                                                      scratch->p_dot,
+                                                                      scratch->n_dot,
+                                                                      wide_group_blocks_n,
+                                                                      vec_length,
+                                                                      goal_norm,
+                                                                      goal_norm - center_norm,
+                                                                      record_dp,
+                                                                      scratch->results,
+                                                                      result_capacity,
+                                                                      scratch->result_count,
+                                                                      scratch->overflow);
+                    CUDA_TRY(cudaGetLastError());
+                    tensor_np_num_p = wide_blocks_p * 16u;
+                    tensor_np_num_n = wide_blocks_n * 16u;
+                } else {
+                    tensor_np_num_p = 0;
+                    tensor_np_num_n = 0;
+                }
+            } else if (tensor_tiles >= tensor_np_min_tiles &&
+                       bgj_cuda_tensor_np_shared_a_requested() &&
+                       tensor_blocks_n >= BGJ_CUDA_TENSOR_WARPS_PER_BLOCK) {
+                const uint32_t shared_blocks_n =
+                    (tensor_blocks_n / BGJ_CUDA_TENSOR_WARPS_PER_BLOCK) *
+                    BGJ_CUDA_TENSOR_WARPS_PER_BLOCK;
+                const uint32_t shared_group_blocks_n = shared_blocks_n / BGJ_CUDA_TENSOR_WARPS_PER_BLOCK;
+                const uint64_t shared_groups = (uint64_t)tensor_blocks_p * (uint64_t)shared_group_blocks_n;
+                if (shared_groups <= 0x7fffffffu) {
+                    bgj_cuda_search_np_tensor_shared_a_kernel<<<(uint32_t)shared_groups,
+                                                                BGJ_CUDA_TENSOR_THREADS_PER_BLOCK,
+                                                                0,
+                                                                stream>>>(scratch->p_vecs,
+                                                                          scratch->n_vecs,
+                                                                          scratch->p_ids,
+                                                                          scratch->n_ids,
+                                                                          scratch->p_norm,
+                                                                          scratch->n_norm,
+                                                                          scratch->p_dot,
+                                                                          scratch->n_dot,
+                                                                          shared_group_blocks_n,
+                                                                          vec_length,
+                                                                          goal_norm,
+                                                                          goal_norm - center_norm,
+                                                                          record_dp,
+                                                                          scratch->results,
+                                                                          result_capacity,
+                                                                          scratch->result_count,
+                                                                          scratch->overflow);
+                    CUDA_TRY(cudaGetLastError());
+                    tensor_np_num_p = tensor_blocks_p * 16u;
+                    tensor_np_num_n = shared_blocks_n * 16u;
+                } else {
+                    tensor_np_num_p = 0;
+                    tensor_np_num_n = 0;
+                }
+            } else if (tensor_tiles >= tensor_np_min_tiles) {
+                const uint64_t tensor_grid = (tensor_tiles + BGJ_CUDA_TENSOR_WARPS_PER_BLOCK - 1u) /
+                                             BGJ_CUDA_TENSOR_WARPS_PER_BLOCK;
+                if (tensor_tiles <= 0xffffffffULL && tensor_grid <= 0x7fffffffu) {
+                    bgj_cuda_search_np_tensor_kernel<<<(uint32_t)tensor_grid,
+                                                        BGJ_CUDA_TENSOR_THREADS_PER_BLOCK,
+                                                        0,
+                                                        stream>>>(scratch->p_vecs,
+                                                                  scratch->n_vecs,
+                                                                  scratch->p_ids,
+                                                                  scratch->n_ids,
+                                                                  scratch->p_norm,
+                                                                  scratch->n_norm,
+                                                                  scratch->p_dot,
+                                                                  scratch->n_dot,
+                                                                  tensor_blocks_n,
+                                                                  (uint32_t)tensor_tiles,
+                                                                  vec_length,
+                                                                  goal_norm,
+                                                                  goal_norm - center_norm,
+                                                                  record_dp,
+                                                                  scratch->results,
+                                                                  result_capacity,
+                                                                  scratch->result_count,
+                                                                  scratch->overflow);
+                    CUDA_TRY(cudaGetLastError());
+                } else {
+                    tensor_np_num_p = 0;
+                    tensor_np_num_n = 0;
+                }
             } else {
                 tensor_np_num_p = 0;
                 tensor_np_num_n = 0;

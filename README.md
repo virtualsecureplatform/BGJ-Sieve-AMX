@@ -52,18 +52,40 @@ with `BGJ_CUDA_MAX_RESULTS`.
 On A100-class GPUs, CUDA search uses experimental INT8 Tensor Core paths for
 full 16x16 bucket tiles by default. Tensor kernels process four independent
 tiles per CTA to keep more warps resident on A100. The positive/negative tile
-path runs whenever full tiles are available; same-side positive/positive and
-negative/negative Tensor tiles run only for larger bucket sides. Fringe pairs
-still use the CUDA `dp4a` kernel. Set `BGJ_CUDA_TENSOR=0` to disable Tensor
-Cores, `BGJ_CUDA_TENSOR_SAME=0` to disable only same-side Tensor tiles, or
-`BGJ_CUDA_TENSOR_SAME_MIN_TILES=<n>` to tune the same-side threshold.
-CUDA bucket search uses a nonblocking per-thread CUDA stream. An experimental
-pool-cache path can keep current pool vectors on the GPU and pack bucket rows
-on-device; set `BGJ_CUDA_POOL_CACHE=1` to enable it.
+path defaults to Tensor only after at least 512 full tiles are available;
+same-side positive/positive and negative/negative Tensor tiles run only for
+larger bucket sides. Fringe pairs and smaller buckets still use the CUDA
+`dp4a` kernel. Set `BGJ_CUDA_TENSOR=0` to disable Tensor Cores,
+`BGJ_CUDA_TENSOR_NP_MIN_TILES=<n>` to tune the positive/negative Tensor
+threshold, `BGJ_CUDA_TENSOR_SAME=0` to disable only same-side Tensor tiles, or
+`BGJ_CUDA_TENSOR_SAME_MIN_TILES=<n>` to tune the same-side threshold. A
+shared-A positive/negative Tensor kernel and a wider 64x64 positive/negative
+Tensor kernel are available for profiling with
+`BGJ_CUDA_TENSOR_NP_SHARED_A=1` and `BGJ_CUDA_TENSOR_NP_WIDE=1`; both are off
+by default on A100 because the lighter four-warp 16x16-tile path benchmarks
+faster.
+CUDA bucket search uses a nonblocking per-thread CUDA stream. By default, CUDA
+search keeps the current pool vectors in a shared on-device cache and packs
+bucket rows on-device; set `BGJ_CUDA_POOL_CACHE=0` to disable this and copy
+each bucket from the host instead.
 The default CUDA/BGJ build now instantiates `Pool_epi8_t<6>` and
 `Pool_epi8_t<7>`, allowing non-LSH BGJ/CUDA paths to use 192- and
 224-dimensional int8 pool vectors. The LSH and AMX paths remain capped by their
 own template coverage.
+
+A raw CUDA benchmark for small bucket-size sweeps lives in
+`tests/bgj_cuda_raw_bench.cpp`. Build it against the CUDA library, then run it
+directly or with Tensor disabled:
+
+```bash
+$ clang++ -O2 -g -std=c++11 -DHAVE_CUDA tests/bgj_cuda_raw_bench.cpp src/libllib.a \
+    -Iinclude -Idep/ntl/include -Ldep/ntl/lib -lntl -Ldep/gmp/lib -lgmp -lm \
+    -L/usr/local/cuda/lib64 -Wl,-rpath=/usr/local/cuda/lib64 -lcudart \
+    -fopenmp=libomp -stdlib=libc++ -pthread -o /tmp/bgj_cuda_raw_bench
+$ /tmp/bgj_cuda_raw_bench
+$ BGJ_CUDA_TENSOR=0 /tmp/bgj_cuda_raw_bench
+$ /tmp/bgj_cuda_raw_bench 160 8192 8192 100 1 1 8
+```
 
 For large instances, it's recommended to use [sparsepp](https://github.com/greg7mdp/sparsepp) to replace the default `std::unordered_set` used in the implementation of UidHashTable. This can be done by changing `USE_SPARSEPP` in `include/config.h` to 1 and manually placing the sparsepp headers into `dep/sparsepp/` before running make.
 
