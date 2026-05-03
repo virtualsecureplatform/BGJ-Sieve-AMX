@@ -145,6 +145,12 @@ static int bgj_cuda_overflow_fallback_requested()
     return 0;
 }
 
+static int bgj_cuda_sort_results_requested()
+{
+    const char *env = getenv("BGJ_CUDA_SORT_RESULTS");
+    return env && env[0] && env[0] != '0';
+}
+
 uint32_t bgj_cuda_batch_size(uint32_t host_threads)
 {
     if (!bgj_cuda_pool_cache_requested()) return 1;
@@ -254,7 +260,7 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
     const uint32_t num_p = (uint32_t)bkt->num_pvec;
     const uint32_t num_n = (uint32_t)bkt->num_nvec;
 
-    if (result_count > 1) {
+    if (result_count > 1 && bgj_cuda_sort_results_requested()) {
         static thread_local std::vector<int32_t> p_rank;
         static thread_local std::vector<int32_t> n_rank;
         static thread_local std::vector<uint32_t> p_rank_stamp;

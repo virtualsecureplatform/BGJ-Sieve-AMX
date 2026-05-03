@@ -96,7 +96,11 @@ Dense buckets can produce many CUDA solution records; `BGJ_CUDA_MAX_RESULTS`
 sets the per-bucket result capacity and defaults to `16777216` for the A100
 tuning path. On overflow the CUDA path now consumes the capped result prefix and
 continues, matching G6K-GPU-Tensor's bounded queue behavior; set
-`BGJ_CUDA_OVERFLOW_FALLBACK=1` to restore CPU fallback on overflow.
+`BGJ_CUDA_OVERFLOW_FALLBACK=1` to restore CPU fallback on overflow. CUDA result
+records are consumed in device result order by default, matching G6K's queue
+path and avoiding a full host-side sort of dense result buffers; set
+`BGJ_CUDA_SORT_RESULTS=1` to restore the older CPU-order approximation for
+debugging.
 The default CUDA/BGJ build now instantiates `Pool_epi8_t<6>` and
 `Pool_epi8_t<7>`, allowing non-LSH BGJ/CUDA paths to use 192- and
 224-dimensional int8 pool vectors. The LSH and AMX paths remain capped by their
