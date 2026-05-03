@@ -57,6 +57,7 @@ class UidHashTable {
         inline bool check_uid(UidType uid);
         inline bool safely_check_uid(UidType uid);
         #endif
+        void reserve_total(long total_hint);
         inline void reset_hash_function(long CSD);
         long size();
 

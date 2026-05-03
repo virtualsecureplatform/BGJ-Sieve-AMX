@@ -143,6 +143,9 @@ For large instances, the build uses [sparsepp](https://github.com/greg7mdp/spars
 for `UidHashTable` by default. The UID table is insert-heavy during CUDA sieving;
 using sparsepp avoids the `std::unordered_set` rehash/pointer-chasing bottleneck
 that otherwise dominates larger SVP-challenge inputs.
+The sparsepp UID table also pre-reserves more aggressively by default. Tune this
+with `BGJ_UID_RESERVE_FACTOR` (default `8.0`) and cap it with
+`BGJ_UID_RESERVE_MAX` entries (default `268435456`, `0` means uncapped).
 
 For large instances, you may need to modify the values of `AMX_MAX_NTHREADS` in line 16 of `include/bgj_amx.h` and `MAX_NTHREADS` in line 42 of `include/bgj_epi8.h`, then recompile the code. The default value for both is set to 112.
 

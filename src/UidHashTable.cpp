@@ -33,6 +33,16 @@ long UidHashTable::size(){
     return sum;
 }
 
+void UidHashTable::reserve_total(long total_hint){
+    if (total_hint <= 0) return;
+    long per_table = (total_hint + NUM_UID_LOCK - 1) / NUM_UID_LOCK;
+    if (per_table < 1) per_table = 1;
+    #pragma omp parallel for
+    for (long i = 0; i < NUM_UID_LOCK; i++){
+        uid_table[i].a.reserve(per_table);
+    }
+}
+
 #if !UID_OP_INLINE
 bool UidHashTable::insert_uid(UidType uid){
     normalize_uid(uid);

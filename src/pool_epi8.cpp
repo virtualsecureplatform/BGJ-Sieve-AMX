@@ -4,7 +4,40 @@
 #include "../include/bgj_amx.h"
 #endif
 
+#include <cstdlib>
+
 #define POOL_EPI8_RATIO_ADJ ( CSD < 80 ? pow(1.01, CSD - 80) : 1.0)
+
+static double bgj_uid_reserve_factor() {
+    const char *env = getenv("BGJ_UID_RESERVE_FACTOR");
+    if (env) {
+        const double parsed = atof(env);
+        if (parsed > 0.0) return parsed;
+    }
+#if USE_SPARSEPP
+    return 8.0;
+#else
+    return 1.5;
+#endif
+}
+
+static long bgj_uid_reserve_max() {
+    const char *env = getenv("BGJ_UID_RESERVE_MAX");
+    if (env) return atol(env);
+    return 268435456L;
+}
+
+static long bgj_uid_reserve_total_hint(long pool_size) {
+    const double reserve = (double)pool_size * bgj_uid_reserve_factor();
+    long total_hint = reserve > (double)pool_size ? (long)reserve : pool_size;
+    const long max_hint = bgj_uid_reserve_max();
+    if (max_hint > 0 && total_hint > max_hint) total_hint = max_hint;
+    return total_hint;
+}
+
+static void bgj_reserve_uid_table(UidHashTable *uid, long pool_size) {
+    if (uid) uid->reserve_total(bgj_uid_reserve_total_hint(pool_size));
+}
 
 struct cvec_for_sort_epi8{
     __attribute__ ((packed)) uint16_t _data[3];
@@ -125,10 +158,6 @@ int Pool_epi8_t<nb>::set_sieving_context(long l, long r) {
     if (uid == NULL){
         uid = new UidHashTable();
         if (uid == NULL) return 0;
-        #pragma omp parallel for
-        for (long i = 0; i < uid->NUM_UID_LOCK; i++) {
-            uid->uid_table[i].a.reserve(1.5 * _pool_size / uid->NUM_UID_LOCK);
-        }
     }
     num_vec = 0;
     sorted_index = 0;
@@ -138,6 +167,7 @@ int Pool_epi8_t<nb>::set_sieving_context(long l, long r) {
     mark_pool_dirty();
     _compute_gh2();
     uid->reset_hash_function(CSD);
+    bgj_reserve_uid_table(uid, _pool_size);
     for (long i = 0; i < CSD; i++) uid->insert_uid(uid->uid_coeffs[i]);
     _update_b_local();
     return 1;
@@ -302,6 +332,7 @@ int Pool_epi8_t<nb>::extend_left() {
     _update_b_local();
     _compute_gh2();
     uid->reset_hash_function(CSD);
+    bgj_reserve_uid_table(uid, _pool_size);
     for (long i = 0; i < CSD; i++) uid->insert_uid(uid->uid_coeffs[i]);
 
     // compute new vec from old vec
@@ -468,6 +499,7 @@ int Pool_epi8_t<nb>::shrink_left() {
     _update_b_local();
     _compute_gh2();
     uid->reset_hash_function(CSD);
+    bgj_reserve_uid_table(uid, _pool_size);
     for (long i = 0; i < CSD; i++) uid->insert_uid(uid->uid_coeffs[i]);
 
     // compute new vec from old vec
@@ -877,6 +909,7 @@ int Pool_epi8_t<nb>::insert(long index, double eta) {
     _update_b_local();
     _compute_gh2();
     uid->reset_hash_function(CSD);
+    bgj_reserve_uid_table(uid, _pool_size);
     for (long i = 0; i < CSD; i++) uid->insert_uid(uid->uid_coeffs[i]);
 
     // b_trans and u_trans
@@ -1290,6 +1323,7 @@ int Pool_epi8_t<nb>::tail_LLL(double delta, long n) {
     basis->size_reduce();
     _update_b_local(_ratio);
     uid->reset_hash_function(CSD);
+    bgj_reserve_uid_table(uid, _pool_size);
     for (long i = 0; i < CSD; i++) uid->insert_uid(uid->uid_coeffs[i]);
 
     uint64_t u_normal[vec_length] = {};
@@ -2012,6 +2046,7 @@ int Pool_epi8_t<nb>::__basis_insert(long dst_index, float *v_fp, long FD, float 
     _update_b_local();
     _compute_gh2();
     uid->reset_hash_function(CSD);
+    bgj_reserve_uid_table(uid, _pool_size);
     for (long i = 0; i < CSD; i++) uid->insert_uid(uid->uid_coeffs[i]);
 
     // b_trans and u_trans
