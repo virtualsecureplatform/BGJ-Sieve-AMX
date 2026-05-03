@@ -62,7 +62,9 @@ extern "C" int bgj_cuda_search_bucket_raw(const int8_t *p_vecs,
 
 int bgj_cuda_device_count()
 {
-    return bgj_cuda_raw_device_count();
+    static int count = -1;
+    if (count < 0) count = bgj_cuda_raw_device_count();
+    return count;
 }
 
 const char *bgj_cuda_last_error()
@@ -80,14 +82,20 @@ static uint32_t bgj_cuda_max_results()
     return 1u << 22;
 }
 
-static int bgj_cuda_rank_of(const std::vector<int32_t> &rank, uint32_t id)
+static int bgj_cuda_rank_of(const std::vector<int32_t> &rank,
+                            const std::vector<uint32_t> &stamp,
+                            uint32_t epoch,
+                            uint32_t id)
 {
-    return id < rank.size() ? rank[id] : -1;
+    return id < rank.size() && stamp[id] == epoch ? rank[id] : -1;
 }
 
 static int bgj_cuda_result_phase(const bgj_cuda_result_t &result,
                                  const std::vector<int32_t> &p_rank,
-                                 const std::vector<int32_t> &n_rank)
+                                 const std::vector<uint32_t> &p_stamp,
+                                 const std::vector<int32_t> &n_rank,
+                                 const std::vector<uint32_t> &n_stamp,
+                                 uint32_t epoch)
 {
     switch (result.type) {
     case BGJ_CUDA_SOL_A:
@@ -95,8 +103,14 @@ static int bgj_cuda_result_phase(const bgj_cuda_result_t &result,
     case BGJ_CUDA_SOL_SA:
         return 1;
     case BGJ_CUDA_SOL_S:
-        if (bgj_cuda_rank_of(p_rank, result.x) >= 0 && bgj_cuda_rank_of(p_rank, result.y) >= 0) return 2;
-        if (bgj_cuda_rank_of(n_rank, result.x) >= 0 && bgj_cuda_rank_of(n_rank, result.y) >= 0) return 4;
+        if (bgj_cuda_rank_of(p_rank, p_stamp, epoch, result.x) >= 0 &&
+            bgj_cuda_rank_of(p_rank, p_stamp, epoch, result.y) >= 0) {
+            return 2;
+        }
+        if (bgj_cuda_rank_of(n_rank, n_stamp, epoch, result.x) >= 0 &&
+            bgj_cuda_rank_of(n_rank, n_stamp, epoch, result.y) >= 0) {
+            return 4;
+        }
         return 6;
     case BGJ_CUDA_SOL_SS:
         return 3;
@@ -109,23 +123,28 @@ static int bgj_cuda_result_phase(const bgj_cuda_result_t &result,
 
 static int bgj_cuda_local_rank(const bgj_cuda_result_t &result,
                                const std::vector<int32_t> &p_rank,
+                               const std::vector<uint32_t> &p_stamp,
                                const std::vector<int32_t> &n_rank,
+                               const std::vector<uint32_t> &n_stamp,
+                               uint32_t epoch,
                                int first)
 {
     const uint32_t id = first ? result.x : result.y;
     switch (result.type) {
     case BGJ_CUDA_SOL_A:
     case BGJ_CUDA_SOL_SA:
-        return first ? bgj_cuda_rank_of(p_rank, id) : bgj_cuda_rank_of(n_rank, id);
+        return first ? bgj_cuda_rank_of(p_rank, p_stamp, epoch, id) :
+                       bgj_cuda_rank_of(n_rank, n_stamp, epoch, id);
     case BGJ_CUDA_SOL_SS:
-        return bgj_cuda_rank_of(p_rank, id);
+        return bgj_cuda_rank_of(p_rank, p_stamp, epoch, id);
     case BGJ_CUDA_SOL_AA:
-        return bgj_cuda_rank_of(n_rank, id);
+        return bgj_cuda_rank_of(n_rank, n_stamp, epoch, id);
     case BGJ_CUDA_SOL_S:
-        if (bgj_cuda_rank_of(p_rank, result.x) >= 0 && bgj_cuda_rank_of(p_rank, result.y) >= 0) {
-            return bgj_cuda_rank_of(p_rank, id);
+        if (bgj_cuda_rank_of(p_rank, p_stamp, epoch, result.x) >= 0 &&
+            bgj_cuda_rank_of(p_rank, p_stamp, epoch, result.y) >= 0) {
+            return bgj_cuda_rank_of(p_rank, p_stamp, epoch, id);
         }
-        return bgj_cuda_rank_of(n_rank, id);
+        return bgj_cuda_rank_of(n_rank, n_stamp, epoch, id);
     default:
         return -1;
     }
@@ -148,13 +167,18 @@ int Pool_epi8_t<nb>::_search_bgj1_cuda(bucket_epi8_t<record_dp> *bkt,
 
     const size_t p_bytes = (size_t)num_p * (size_t)vec_length * sizeof(int8_t);
     const size_t n_bytes = (size_t)num_n * (size_t)vec_length * sizeof(int8_t);
-    int8_t *p_vecs = p_bytes ? (int8_t *)malloc(p_bytes) : NULL;
-    int8_t *n_vecs = n_bytes ? (int8_t *)malloc(n_bytes) : NULL;
-    if ((p_bytes && !p_vecs) || (n_bytes && !n_vecs)) {
-        free(p_vecs);
-        free(n_vecs);
+    static thread_local std::vector<int8_t> p_vec_storage;
+    static thread_local std::vector<int8_t> n_vec_storage;
+    static thread_local std::vector<bgj_cuda_result_t> result_storage;
+
+    try {
+        p_vec_storage.resize(p_bytes);
+        n_vec_storage.resize(n_bytes);
+    } catch (...) {
         return 0;
     }
+    int8_t *p_vecs = p_bytes ? p_vec_storage.data() : NULL;
+    int8_t *n_vecs = n_bytes ? n_vec_storage.data() : NULL;
 
     for (uint32_t i = 0; i < num_p; i++) {
         memcpy(p_vecs + (size_t)i * vec_length, vec + (size_t)bkt->pvec[i] * vec_length, vec_length);
@@ -164,12 +188,12 @@ int Pool_epi8_t<nb>::_search_bgj1_cuda(bucket_epi8_t<record_dp> *bkt,
     }
 
     const uint32_t result_capacity = bgj_cuda_max_results();
-    bgj_cuda_result_t *results = (bgj_cuda_result_t *)malloc((size_t)result_capacity * sizeof(bgj_cuda_result_t));
-    if (!results) {
-        free(p_vecs);
-        free(n_vecs);
+    try {
+        result_storage.resize((size_t)result_capacity);
+    } catch (...) {
         return 0;
     }
+    bgj_cuda_result_t *results = result_storage.data();
 
     uint32_t result_count = 0;
     int overflow = 0;
@@ -192,33 +216,57 @@ int Pool_epi8_t<nb>::_search_bgj1_cuda(bucket_epi8_t<record_dp> *bkt,
                                               &result_count,
                                               &overflow);
 
-    free(p_vecs);
-    free(n_vecs);
-
     if (!ok || overflow) {
-        free(results);
         return 0;
     }
 
     if (result_count > 1) {
-        std::vector<int32_t> p_rank((size_t)num_vec, -1);
-        std::vector<int32_t> n_rank((size_t)num_vec, -1);
+        static thread_local std::vector<int32_t> p_rank;
+        static thread_local std::vector<int32_t> n_rank;
+        static thread_local std::vector<uint32_t> p_rank_stamp;
+        static thread_local std::vector<uint32_t> n_rank_stamp;
+        static thread_local uint32_t rank_epoch = 1;
+
+        rank_epoch++;
+        if (rank_epoch == 0) {
+            std::fill(p_rank_stamp.begin(), p_rank_stamp.end(), 0);
+            std::fill(n_rank_stamp.begin(), n_rank_stamp.end(), 0);
+            rank_epoch = 1;
+        }
+        try {
+            if (p_rank.size() < (size_t)num_vec) {
+                p_rank.resize((size_t)num_vec);
+                p_rank_stamp.resize((size_t)num_vec, 0);
+            }
+            if (n_rank.size() < (size_t)num_vec) {
+                n_rank.resize((size_t)num_vec);
+                n_rank_stamp.resize((size_t)num_vec, 0);
+            }
+        } catch (...) {
+            return 0;
+        }
         for (uint32_t i = 0; i < num_p; i++) {
-            if (bkt->pvec[i] < (uint32_t)p_rank.size()) p_rank[bkt->pvec[i]] = (int32_t)i;
+            if (bkt->pvec[i] < (uint32_t)p_rank.size()) {
+                p_rank[bkt->pvec[i]] = (int32_t)i;
+                p_rank_stamp[bkt->pvec[i]] = rank_epoch;
+            }
         }
         for (uint32_t i = 0; i < num_n; i++) {
-            if (bkt->nvec[i] < (uint32_t)n_rank.size()) n_rank[bkt->nvec[i]] = (int32_t)i;
+            if (bkt->nvec[i] < (uint32_t)n_rank.size()) {
+                n_rank[bkt->nvec[i]] = (int32_t)i;
+                n_rank_stamp[bkt->nvec[i]] = rank_epoch;
+            }
         }
         std::sort(results, results + result_count,
-                  [&p_rank, &n_rank](const bgj_cuda_result_t &a, const bgj_cuda_result_t &b) {
-                      const int phase_a = bgj_cuda_result_phase(a, p_rank, n_rank);
-                      const int phase_b = bgj_cuda_result_phase(b, p_rank, n_rank);
+                  [](const bgj_cuda_result_t &a, const bgj_cuda_result_t &b) {
+                      const int phase_a = bgj_cuda_result_phase(a, p_rank, p_rank_stamp, n_rank, n_rank_stamp, rank_epoch);
+                      const int phase_b = bgj_cuda_result_phase(b, p_rank, p_rank_stamp, n_rank, n_rank_stamp, rank_epoch);
                       if (phase_a != phase_b) return phase_a < phase_b;
-                      const int a0 = bgj_cuda_local_rank(a, p_rank, n_rank, 1);
-                      const int b0 = bgj_cuda_local_rank(b, p_rank, n_rank, 1);
+                      const int a0 = bgj_cuda_local_rank(a, p_rank, p_rank_stamp, n_rank, n_rank_stamp, rank_epoch, 1);
+                      const int b0 = bgj_cuda_local_rank(b, p_rank, p_rank_stamp, n_rank, n_rank_stamp, rank_epoch, 1);
                       if (a0 != b0) return a0 < b0;
-                      const int a1 = bgj_cuda_local_rank(a, p_rank, n_rank, 0);
-                      const int b1 = bgj_cuda_local_rank(b, p_rank, n_rank, 0);
+                      const int a1 = bgj_cuda_local_rank(a, p_rank, p_rank_stamp, n_rank, n_rank_stamp, rank_epoch, 0);
+                      const int b1 = bgj_cuda_local_rank(b, p_rank, p_rank_stamp, n_rank, n_rank_stamp, rank_epoch, 0);
                       if (a1 != b1) return a1 < b1;
                       if (a.type != b.type) return a.type < b.type;
                       if (a.x != b.x) return a.x < b.x;
@@ -284,8 +332,6 @@ int Pool_epi8_t<nb>::_search_bgj1_cuda(bucket_epi8_t<record_dp> *bkt,
             break;
         }
     }
-
-    free(results);
 
     if (profiling && prof) {
         pthread_spin_lock(&prof->profile_lock);

@@ -7,6 +7,75 @@
 
 static char bgj_cuda_error[512] = "no CUDA error";
 
+struct bgj_cuda_raw_scratch_t {
+    int8_t *p_vecs;
+    int8_t *n_vecs;
+    uint32_t *p_ids;
+    uint32_t *n_ids;
+    int32_t *p_norm;
+    int32_t *n_norm;
+    int32_t *p_dot;
+    int32_t *n_dot;
+    bgj_cuda_result_t *results;
+    uint32_t *result_count;
+    int *overflow;
+
+    size_t p_vec_capacity;
+    size_t n_vec_capacity;
+    size_t p_id_capacity;
+    size_t n_id_capacity;
+    size_t p_i32_capacity;
+    size_t n_i32_capacity;
+    size_t p_dot_capacity;
+    size_t n_dot_capacity;
+    size_t result_capacity;
+    size_t result_count_capacity;
+    size_t overflow_capacity;
+
+    bgj_cuda_raw_scratch_t()
+        : p_vecs(NULL),
+          n_vecs(NULL),
+          p_ids(NULL),
+          n_ids(NULL),
+          p_norm(NULL),
+          n_norm(NULL),
+          p_dot(NULL),
+          n_dot(NULL),
+          results(NULL),
+          result_count(NULL),
+          overflow(NULL),
+          p_vec_capacity(0),
+          n_vec_capacity(0),
+          p_id_capacity(0),
+          n_id_capacity(0),
+          p_i32_capacity(0),
+          n_i32_capacity(0),
+          p_dot_capacity(0),
+          n_dot_capacity(0),
+          result_capacity(0),
+          result_count_capacity(0),
+          overflow_capacity(0)
+    {
+    }
+
+    ~bgj_cuda_raw_scratch_t()
+    {
+        cudaFree(p_vecs);
+        cudaFree(n_vecs);
+        cudaFree(p_ids);
+        cudaFree(n_ids);
+        cudaFree(p_norm);
+        cudaFree(n_norm);
+        cudaFree(p_dot);
+        cudaFree(n_dot);
+        cudaFree(results);
+        cudaFree(result_count);
+        cudaFree(overflow);
+    }
+};
+
+static thread_local bgj_cuda_raw_scratch_t bgj_cuda_raw_scratch;
+
 static void set_cuda_error(const char *context, cudaError_t err)
 {
     snprintf(bgj_cuda_error, sizeof(bgj_cuda_error), "%s: %s", context, cudaGetErrorString(err));
@@ -145,6 +214,30 @@ __global__ void bgj_cuda_search_same_kernel(const int8_t *vecs,
         }                                                   \
     } while (0)
 
+static int ensure_cuda_capacity(void **ptr, size_t *capacity, size_t requested)
+{
+    if (requested <= *capacity) return 1;
+    cudaError_t err = cudaFree(*ptr);
+    if (err != cudaSuccess) {
+        set_cuda_error("cudaFree", err);
+        return 0;
+    }
+    *ptr = NULL;
+    *capacity = 0;
+    err = cudaMalloc(ptr, requested);
+    if (err != cudaSuccess) {
+        set_cuda_error("cudaMalloc", err);
+        return 0;
+    }
+    *capacity = requested;
+    return 1;
+}
+
+#define CUDA_ENSURE(ptr, capacity, requested)                         \
+    do {                                                              \
+        if (!ensure_cuda_capacity((void **)&(ptr), &(capacity), requested)) goto fail; \
+    } while (0)
+
 extern "C" int bgj_cuda_search_bucket_raw(const int8_t *p_vecs,
                                            const int8_t *n_vecs,
                                            const uint32_t *p_ids,
@@ -164,17 +257,7 @@ extern "C" int bgj_cuda_search_bucket_raw(const int8_t *p_vecs,
                                            uint32_t *result_count,
                                            int *overflow)
 {
-    int8_t *d_p_vecs = NULL;
-    int8_t *d_n_vecs = NULL;
-    uint32_t *d_p_ids = NULL;
-    uint32_t *d_n_ids = NULL;
-    int32_t *d_p_norm = NULL;
-    int32_t *d_n_norm = NULL;
-    int32_t *d_p_dot = NULL;
-    int32_t *d_n_dot = NULL;
-    bgj_cuda_result_t *d_results = NULL;
-    uint32_t *d_result_count = NULL;
-    int *d_overflow = NULL;
+    bgj_cuda_raw_scratch_t *scratch = &bgj_cuda_raw_scratch;
     uint32_t h_result_count = 0;
     int h_overflow = 0;
 
@@ -191,36 +274,36 @@ extern "C" int bgj_cuda_search_bucket_raw(const int8_t *p_vecs,
     const size_t n_i32_bytes = (size_t)num_n * sizeof(int32_t);
 
     if (num_p) {
-        CUDA_TRY(cudaMalloc((void **)&d_p_vecs, p_vec_bytes));
-        CUDA_TRY(cudaMalloc((void **)&d_p_ids, p_id_bytes));
-        CUDA_TRY(cudaMalloc((void **)&d_p_norm, p_i32_bytes));
-        CUDA_TRY(cudaMemcpy(d_p_vecs, p_vecs, p_vec_bytes, cudaMemcpyHostToDevice));
-        CUDA_TRY(cudaMemcpy(d_p_ids, p_ids, p_id_bytes, cudaMemcpyHostToDevice));
-        CUDA_TRY(cudaMemcpy(d_p_norm, p_norm, p_i32_bytes, cudaMemcpyHostToDevice));
+        CUDA_ENSURE(scratch->p_vecs, scratch->p_vec_capacity, p_vec_bytes);
+        CUDA_ENSURE(scratch->p_ids, scratch->p_id_capacity, p_id_bytes);
+        CUDA_ENSURE(scratch->p_norm, scratch->p_i32_capacity, p_i32_bytes);
+        CUDA_TRY(cudaMemcpy(scratch->p_vecs, p_vecs, p_vec_bytes, cudaMemcpyHostToDevice));
+        CUDA_TRY(cudaMemcpy(scratch->p_ids, p_ids, p_id_bytes, cudaMemcpyHostToDevice));
+        CUDA_TRY(cudaMemcpy(scratch->p_norm, p_norm, p_i32_bytes, cudaMemcpyHostToDevice));
         if (record_dp) {
-            CUDA_TRY(cudaMalloc((void **)&d_p_dot, p_i32_bytes));
-            CUDA_TRY(cudaMemcpy(d_p_dot, p_dot, p_i32_bytes, cudaMemcpyHostToDevice));
+            CUDA_ENSURE(scratch->p_dot, scratch->p_dot_capacity, p_i32_bytes);
+            CUDA_TRY(cudaMemcpy(scratch->p_dot, p_dot, p_i32_bytes, cudaMemcpyHostToDevice));
         }
     }
 
     if (num_n) {
-        CUDA_TRY(cudaMalloc((void **)&d_n_vecs, n_vec_bytes));
-        CUDA_TRY(cudaMalloc((void **)&d_n_ids, n_id_bytes));
-        CUDA_TRY(cudaMalloc((void **)&d_n_norm, n_i32_bytes));
-        CUDA_TRY(cudaMemcpy(d_n_vecs, n_vecs, n_vec_bytes, cudaMemcpyHostToDevice));
-        CUDA_TRY(cudaMemcpy(d_n_ids, n_ids, n_id_bytes, cudaMemcpyHostToDevice));
-        CUDA_TRY(cudaMemcpy(d_n_norm, n_norm, n_i32_bytes, cudaMemcpyHostToDevice));
+        CUDA_ENSURE(scratch->n_vecs, scratch->n_vec_capacity, n_vec_bytes);
+        CUDA_ENSURE(scratch->n_ids, scratch->n_id_capacity, n_id_bytes);
+        CUDA_ENSURE(scratch->n_norm, scratch->n_i32_capacity, n_i32_bytes);
+        CUDA_TRY(cudaMemcpy(scratch->n_vecs, n_vecs, n_vec_bytes, cudaMemcpyHostToDevice));
+        CUDA_TRY(cudaMemcpy(scratch->n_ids, n_ids, n_id_bytes, cudaMemcpyHostToDevice));
+        CUDA_TRY(cudaMemcpy(scratch->n_norm, n_norm, n_i32_bytes, cudaMemcpyHostToDevice));
         if (record_dp) {
-            CUDA_TRY(cudaMalloc((void **)&d_n_dot, n_i32_bytes));
-            CUDA_TRY(cudaMemcpy(d_n_dot, n_dot, n_i32_bytes, cudaMemcpyHostToDevice));
+            CUDA_ENSURE(scratch->n_dot, scratch->n_dot_capacity, n_i32_bytes);
+            CUDA_TRY(cudaMemcpy(scratch->n_dot, n_dot, n_i32_bytes, cudaMemcpyHostToDevice));
         }
     }
 
-    CUDA_TRY(cudaMalloc((void **)&d_results, (size_t)result_capacity * sizeof(bgj_cuda_result_t)));
-    CUDA_TRY(cudaMalloc((void **)&d_result_count, sizeof(uint32_t)));
-    CUDA_TRY(cudaMalloc((void **)&d_overflow, sizeof(int)));
-    CUDA_TRY(cudaMemset(d_result_count, 0, sizeof(uint32_t)));
-    CUDA_TRY(cudaMemset(d_overflow, 0, sizeof(int)));
+    CUDA_ENSURE(scratch->results, scratch->result_capacity, (size_t)result_capacity * sizeof(bgj_cuda_result_t));
+    CUDA_ENSURE(scratch->result_count, scratch->result_count_capacity, sizeof(uint32_t));
+    CUDA_ENSURE(scratch->overflow, scratch->overflow_capacity, sizeof(int));
+    CUDA_TRY(cudaMemset(scratch->result_count, 0, sizeof(uint32_t)));
+    CUDA_TRY(cudaMemset(scratch->overflow, 0, sizeof(int)));
 
     if (num_p && num_n) {
         const uint64_t total = (uint64_t)num_p * (uint64_t)num_n;
@@ -228,24 +311,24 @@ extern "C" int bgj_cuda_search_bucket_raw(const int8_t *p_vecs,
         uint32_t blocks = (uint32_t)((total + threads - 1) / threads);
         if (blocks == 0) blocks = 1;
         if (blocks > 65535) blocks = 65535;
-        bgj_cuda_search_np_kernel<<<blocks, threads>>>(d_p_vecs,
-                                                       d_n_vecs,
-                                                       d_p_ids,
-                                                       d_n_ids,
-                                                       d_p_norm,
-                                                       d_n_norm,
-                                                       d_p_dot,
-                                                       d_n_dot,
+        bgj_cuda_search_np_kernel<<<blocks, threads>>>(scratch->p_vecs,
+                                                       scratch->n_vecs,
+                                                       scratch->p_ids,
+                                                       scratch->n_ids,
+                                                       scratch->p_norm,
+                                                       scratch->n_norm,
+                                                       scratch->p_dot,
+                                                       scratch->n_dot,
                                                        num_p,
                                                        num_n,
                                                        vec_length,
                                                        goal_norm,
                                                        goal_norm - center_norm,
                                                        record_dp,
-                                                       d_results,
+                                                       scratch->results,
                                                        result_capacity,
-                                                       d_result_count,
-                                                       d_overflow);
+                                                       scratch->result_count,
+                                                       scratch->overflow);
         CUDA_TRY(cudaGetLastError());
     }
 
@@ -257,20 +340,20 @@ extern "C" int bgj_cuda_search_bucket_raw(const int8_t *p_vecs,
             set_plain_error("bucket too large for same-side CUDA grid");
             goto fail;
         }
-        bgj_cuda_search_same_kernel<<<blocks, threads>>>(d_p_vecs,
-                                                         d_p_ids,
-                                                         d_p_norm,
-                                                         d_p_dot,
+        bgj_cuda_search_same_kernel<<<blocks, threads>>>(scratch->p_vecs,
+                                                         scratch->p_ids,
+                                                         scratch->p_norm,
+                                                         scratch->p_dot,
                                                          num_p,
                                                          vec_length,
                                                          goal_norm,
                                                          goal_norm - center_norm,
                                                          record_dp,
                                                          0,
-                                                         d_results,
+                                                         scratch->results,
                                                          result_capacity,
-                                                         d_result_count,
-                                                         d_overflow);
+                                                         scratch->result_count,
+                                                         scratch->overflow);
         CUDA_TRY(cudaGetLastError());
     }
 
@@ -282,63 +365,41 @@ extern "C" int bgj_cuda_search_bucket_raw(const int8_t *p_vecs,
             set_plain_error("bucket too large for same-side CUDA grid");
             goto fail;
         }
-        bgj_cuda_search_same_kernel<<<blocks, threads>>>(d_n_vecs,
-                                                         d_n_ids,
-                                                         d_n_norm,
-                                                         d_n_dot,
+        bgj_cuda_search_same_kernel<<<blocks, threads>>>(scratch->n_vecs,
+                                                         scratch->n_ids,
+                                                         scratch->n_norm,
+                                                         scratch->n_dot,
                                                          num_n,
                                                          vec_length,
                                                          goal_norm,
                                                          goal_norm - center_norm,
                                                          record_dp,
                                                          1,
-                                                         d_results,
+                                                         scratch->results,
                                                          result_capacity,
-                                                         d_result_count,
-                                                         d_overflow);
+                                                         scratch->result_count,
+                                                         scratch->overflow);
         CUDA_TRY(cudaGetLastError());
     }
 
-    CUDA_TRY(cudaDeviceSynchronize());
-    CUDA_TRY(cudaMemcpy(&h_result_count, d_result_count, sizeof(uint32_t), cudaMemcpyDeviceToHost));
-    CUDA_TRY(cudaMemcpy(&h_overflow, d_overflow, sizeof(int), cudaMemcpyDeviceToHost));
+    CUDA_TRY(cudaMemcpy(&h_result_count, scratch->result_count, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    CUDA_TRY(cudaMemcpy(&h_overflow, scratch->overflow, sizeof(int), cudaMemcpyDeviceToHost));
 
     *overflow = h_overflow || (h_result_count > result_capacity);
     *result_count = h_result_count > result_capacity ? result_capacity : h_result_count;
     if (!*overflow && *result_count) {
         CUDA_TRY(cudaMemcpy(results,
-                            d_results,
+                            scratch->results,
                             (size_t)(*result_count) * sizeof(bgj_cuda_result_t),
                             cudaMemcpyDeviceToHost));
     }
 
-    cudaFree(d_p_vecs);
-    cudaFree(d_n_vecs);
-    cudaFree(d_p_ids);
-    cudaFree(d_n_ids);
-    cudaFree(d_p_norm);
-    cudaFree(d_n_norm);
-    cudaFree(d_p_dot);
-    cudaFree(d_n_dot);
-    cudaFree(d_results);
-    cudaFree(d_result_count);
-    cudaFree(d_overflow);
     set_plain_error("no CUDA error");
     return 1;
 
 fail:
-    cudaFree(d_p_vecs);
-    cudaFree(d_n_vecs);
-    cudaFree(d_p_ids);
-    cudaFree(d_n_ids);
-    cudaFree(d_p_norm);
-    cudaFree(d_n_norm);
-    cudaFree(d_p_dot);
-    cudaFree(d_n_dot);
-    cudaFree(d_results);
-    cudaFree(d_result_count);
-    cudaFree(d_overflow);
     return 0;
 }
 
+#undef CUDA_ENSURE
 #undef CUDA_TRY
