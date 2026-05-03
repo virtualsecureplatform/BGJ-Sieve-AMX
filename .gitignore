@@ -1,0 +1,14 @@
+# Build outputs
+/app/bgj_epi8
+/app/pump_red
+/app/svp_check
+/app/svp_solver
+/app/svp_tool
+/src/*.o
+/src/libllib.a
+
+# Local dependency installs and extracted archives
+/dep/gmp/
+/dep/ntl/
+/dep/gmp-*
+/dep/ntl-*

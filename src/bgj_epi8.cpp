@@ -1,6 +1,7 @@
 #include "../include/pool_epi8.h"
 #include "../include/bgj_epi8.h"
 #include "../include/bucket_epi8.h"
+#include "../include/bgj_cuda.h"
 
 #include <sys/time.h>
 #include <malloc.h>
@@ -660,10 +661,21 @@ int Pool_epi8_t<nb>::bgj1_Sieve(long log_level, long lps_auto_adj){
                     }
                     pthread_spin_unlock(&bucket_list_lock);
                     if (bkt == NULL) continue;
-                    _search_cred<BGJ1_EPI8_USE_3RED, 1>(bkt, sol_list[thread], goal_norm, &local_profile);
-                    _search_np<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, BGJ1_EPI8_USE_3RED, 1>(bkt, sol_list[thread], goal_norm, &local_profile);
-                    _search_pp<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, BGJ1_EPI8_USE_3RED, 1>(bkt, sol_list[thread], goal_norm, &local_profile);
-                    _search_nn<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, BGJ1_EPI8_USE_3RED, 1>(bkt, sol_list[thread], goal_norm, &local_profile);
+                    bool cred_done = false;
+                    bool cuda_done = false;
+                    #if defined(HAVE_CUDA)
+                    if (bgj_cuda_search_requested()) {
+                        _search_cred<BGJ1_EPI8_USE_3RED, 1>(bkt, sol_list[thread], goal_norm, &local_profile);
+                        cred_done = true;
+                        cuda_done = _search_bgj1_cuda<BGJ1_EPI8_USE_3RED, 1>(bkt, sol_list[thread], goal_norm, &local_profile) > 0;
+                    }
+                    #endif
+                    if (!cuda_done) {
+                        if (!cred_done) _search_cred<BGJ1_EPI8_USE_3RED, 1>(bkt, sol_list[thread], goal_norm, &local_profile);
+                        _search_np<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, BGJ1_EPI8_USE_3RED, 1>(bkt, sol_list[thread], goal_norm, &local_profile);
+                        _search_pp<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, BGJ1_EPI8_USE_3RED, 1>(bkt, sol_list[thread], goal_norm, &local_profile);
+                        _search_nn<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, BGJ1_EPI8_USE_3RED, 1>(bkt, sol_list[thread], goal_norm, &local_profile);
+                    }
                     __search0_ndp += bkt->num_pvec * bkt->num_nvec;
                     __search0_ndp += (bkt->num_pvec - 8) * bkt->num_pvec / 2;
                     __search0_ndp += (bkt->num_nvec - 8) * bkt->num_nvec / 2;

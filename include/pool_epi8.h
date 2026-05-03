@@ -462,6 +462,9 @@ struct Pool_epi8_t {
     // Sieving
         // bgj sieve
         int bgj1_Sieve(long log_level = 0, long lps_auto_adj = 1);
+        #if defined(HAVE_CUDA)
+        int bgj1_Sieve_cuda(long log_level = 0, long lps_auto_adj = 1);
+        #endif
         int bgj2_Sieve(long log_level = 0, long lps_auto_adj = 1);
         int bgj3_Sieve(long log_level = 0, long lps_auto_adj = 1);
         #if defined(__AMX_INT8__)
@@ -475,6 +478,9 @@ struct Pool_epi8_t {
         #endif
         int left_progressive_bgjfsieve(long ind_l, long ind_r, long num_threads, long log_level, long ssd = 45);
         int left_progressive_bgj1sieve(long ind_l, long ind_r, long num_threads, long log_level);
+        #if defined(HAVE_CUDA)
+        int left_progressive_bgj1sieve_cuda(long ind_l, long ind_r, long num_threads, long log_level);
+        #endif
         int left_progressive_bgj2sieve(long ind_l, long ind_r, long num_threads, long log_level);
         int left_progressive_bgj3sieve(long ind_l, long ind_r, long num_threads, long log_level);
         
@@ -1046,7 +1052,11 @@ struct Pool_epi8_t {
         int _search_pp(bucket_epi8_t<record_dp> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<nb> *prof = NULL);
         template <uint32_t l2_block, uint32_t l1_block, bool record_dp, bool profiling>
         int _search_nn(bucket_epi8_t<record_dp> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<nb> *prof = NULL);
-        int _sol_list_to_vec(sol_list_epi8_t **sol_list, long num_sol_list, int8_t *dst_vec, uint64_t *dst_vu, int32_t *dst_vnorm, int32_t *dst_vsum);        
+        #if defined(HAVE_CUDA)
+        template <bool record_dp, bool profiling>
+        int _search_bgj1_cuda(bucket_epi8_t<record_dp> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<nb> *prof = NULL);
+        #endif
+        int _sol_list_to_vec(sol_list_epi8_t **sol_list, long num_sol_list, int8_t *dst_vec, uint64_t *dst_vu, int32_t *dst_vnorm, int32_t *dst_vsum);
         template <bool profiling>
         uint64_t _pool_insert(sol_list_epi8_t **sol_list, long num_sol_list, int32_t goal_norm, int32_t goal_index, bgj_profile_data_t<nb> *prof = NULL);
         

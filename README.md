@@ -24,6 +24,31 @@ $ ./install_ntl.sh
 $ make
 ```
 
+CUDA support can be enabled for the exact pair-search stage of `bgj1`. The
+CPU implementation is still used for bucketing, lifting, insertion, and the
+other sieve variants.
+
+```bash
+$ make clean
+$ make CUDA=1 CUDA_PATH=/usr/local/cuda CUDA_SMS=80
+```
+
+Set `CUDA_SMS` to the architectures you want to build for, for example
+`CUDA_SMS="80 86 90"`. The CUDA build also accepts `NVCC` and `CUDA_CXX`
+overrides when your CUDA toolkit needs a specific host compiler. At runtime,
+`app/bgj_epi8` accepts `cuda` or `bgj1-cuda` as aliases for the CUDA-assisted
+BGJ1 path:
+
+```bash
+$ ./bgj_epi8 L_100 cuda
+```
+
+You can also force CUDA-assisted bucket search for a compiled-in `bgj1` run
+with `BGJ_CUDA_SEARCH=1`. If CUDA is unavailable or an internal result buffer
+overflows, the code falls back to the existing CPU search for that bucket. The
+default result buffer holds `4194304` candidates per bucket and can be changed
+with `BGJ_CUDA_MAX_RESULTS`.
+
 For large instances, it's recommended to use [sparsepp](https://github.com/greg7mdp/sparsepp) to replace the default `std::unordered_set` used in the implementation of UidHashTable. This can be done by changing `USE_SPARSEPP` in `include/config.h` to 1 and manually placing the sparsepp headers into `dep/sparsepp/` before running make.
 
 For large instances, you may need to modify the values of `AMX_MAX_NTHREADS` in line 16 of `include/bgj_amx.h` and `MAX_NTHREADS` in line 42 of `include/bgj_epi8.h`, then recompile the code. The default value for both is set to 112.
