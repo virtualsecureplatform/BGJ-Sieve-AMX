@@ -49,6 +49,26 @@ extern "C" int bgj_cuda_search_bucket_pool_raw(const int8_t *pool_vecs,
                                                 uint32_t result_capacity,
                                                 uint32_t *result_count,
                                                 int *overflow);
+extern "C" int bgj_cuda_search_bucket_pool_batch_raw(const int8_t *pool_vecs,
+                                                      uint64_t pool_epoch,
+                                                      uint32_t pool_size,
+                                                      const uint32_t *const *p_ids,
+                                                      const uint32_t *const *n_ids,
+                                                      const int32_t *const *p_norm,
+                                                      const int32_t *const *n_norm,
+                                                      const int32_t *const *p_dot,
+                                                      const int32_t *const *n_dot,
+                                                      const uint32_t *num_p,
+                                                      const uint32_t *num_n,
+                                                      uint32_t batch_size,
+                                                      uint32_t vec_length,
+                                                      const int32_t *goal_norm,
+                                                      const int32_t *center_norm,
+                                                      int record_dp,
+                                                      bgj_cuda_result_t *const *results,
+                                                      const uint32_t *result_capacity,
+                                                      uint32_t *result_count,
+                                                      int *overflow);
 
 namespace {
 
@@ -138,6 +158,29 @@ Bucket make_compact_bucket(uint32_t num_p, uint32_t num_n, uint32_t vec_length, 
     fill_side(num_n, vec_length, num_p, bucket.n_vecs,
               bucket.n_ids, bucket.n_norm, bucket.n_dot, rng);
     return bucket;
+}
+
+void append_bucket_to_pool(Bucket &bucket, uint32_t vec_length, std::vector<int8_t> &pool)
+{
+    const uint32_t base = (uint32_t)(pool.size() / vec_length);
+    const uint32_t num_p = (uint32_t)bucket.p_ids.size();
+    const uint32_t num_n = (uint32_t)bucket.n_ids.size();
+    pool.resize(pool.size() + (size_t)(num_p + num_n) * vec_length);
+
+    for (uint32_t i = 0; i < num_p; i++) {
+        const uint32_t id = base + i;
+        std::copy(bucket.p_vecs.begin() + (size_t)i * vec_length,
+                  bucket.p_vecs.begin() + (size_t)(i + 1) * vec_length,
+                  pool.begin() + (size_t)id * vec_length);
+        bucket.p_ids[i] = id;
+    }
+    for (uint32_t i = 0; i < num_n; i++) {
+        const uint32_t id = base + num_p + i;
+        std::copy(bucket.n_vecs.begin() + (size_t)i * vec_length,
+                  bucket.n_vecs.begin() + (size_t)(i + 1) * vec_length,
+                  pool.begin() + (size_t)id * vec_length);
+        bucket.n_ids[i] = id;
+    }
 }
 
 void collect_scores(const Bucket &bucket, uint32_t vec_length, Scores &scores)
@@ -403,6 +446,89 @@ bool run_pool_case()
     return matched;
 }
 
+bool run_pool_batch_case()
+{
+    const uint32_t batch_size = 4;
+    const uint32_t vec_length = 32;
+    const uint32_t p_counts[batch_size] = {17, 21, 24, 32};
+    const uint32_t n_counts[batch_size] = {19, 16, 27, 20};
+
+    std::vector<Bucket> buckets;
+    std::vector<std::vector<bgj_cuda_result_t> > oracle(batch_size);
+    std::vector<std::vector<bgj_cuda_result_t> > gpu(batch_size);
+    std::vector<int8_t> pool;
+    std::vector<int32_t> goal_norm(batch_size);
+    std::vector<int32_t> center_norm(batch_size);
+    buckets.reserve(batch_size);
+
+    for (uint32_t i = 0; i < batch_size; i++) {
+        Bucket bucket = make_compact_bucket(p_counts[i], n_counts[i], vec_length, 200 + i);
+        append_bucket_to_pool(bucket, vec_length, pool);
+
+        Scores scores;
+        collect_scores(bucket, vec_length, scores);
+        goal_norm[i] = threshold_for(scores.two_red, ThresholdMode::Selective);
+        const int32_t three_red_goal = threshold_for(scores.three_red, ThresholdMode::Selective);
+        center_norm[i] = goal_norm[i] - three_red_goal;
+        oracle[i] = cpu_oracle(bucket, vec_length, goal_norm[i], center_norm[i], true);
+        gpu[i].resize(std::max<uint32_t>(16u, (uint32_t)oracle[i].size() + 16u));
+        buckets.push_back(bucket);
+    }
+
+    std::vector<const uint32_t *> p_ids(batch_size);
+    std::vector<const uint32_t *> n_ids(batch_size);
+    std::vector<const int32_t *> p_norm(batch_size);
+    std::vector<const int32_t *> n_norm(batch_size);
+    std::vector<const int32_t *> p_dot(batch_size);
+    std::vector<const int32_t *> n_dot(batch_size);
+    std::vector<uint32_t> num_p(batch_size);
+    std::vector<uint32_t> num_n(batch_size);
+    std::vector<bgj_cuda_result_t *> result_ptrs(batch_size);
+    std::vector<uint32_t> result_capacity(batch_size);
+    std::vector<uint32_t> result_count(batch_size);
+    std::vector<int> overflow(batch_size);
+
+    for (uint32_t i = 0; i < batch_size; i++) {
+        p_ids[i] = buckets[i].p_ids.data();
+        n_ids[i] = buckets[i].n_ids.data();
+        p_norm[i] = buckets[i].p_norm.data();
+        n_norm[i] = buckets[i].n_norm.data();
+        p_dot[i] = buckets[i].p_dot.data();
+        n_dot[i] = buckets[i].n_dot.data();
+        num_p[i] = (uint32_t)buckets[i].p_ids.size();
+        num_n[i] = (uint32_t)buckets[i].n_ids.size();
+        result_ptrs[i] = gpu[i].data();
+        result_capacity[i] = (uint32_t)gpu[i].size();
+    }
+
+    const int ok = bgj_cuda_search_bucket_pool_batch_raw(pool.data(), 44, (uint32_t)(pool.size() / vec_length),
+                                                         p_ids.data(), n_ids.data(),
+                                                         p_norm.data(), n_norm.data(),
+                                                         p_dot.data(), n_dot.data(),
+                                                         num_p.data(), num_n.data(),
+                                                         batch_size, vec_length,
+                                                         goal_norm.data(), center_norm.data(),
+                                                         1, result_ptrs.data(), result_capacity.data(),
+                                                         result_count.data(), overflow.data());
+    if (!ok) {
+        std::cerr << "pool-batch: CUDA call failed: " << bgj_cuda_raw_last_error() << "\n";
+        return false;
+    }
+
+    for (uint32_t i = 0; i < batch_size; i++) {
+        if (overflow[i]) {
+            std::cerr << "pool-batch-" << i << ": unexpected overflow\n";
+            return false;
+        }
+        gpu[i].resize(result_count[i]);
+        if (!compare_results("pool-batch-" + std::to_string(i), gpu[i], oracle[i])) {
+            return false;
+        }
+    }
+    std::cout << "pool-batch: ok, buckets=" << batch_size << "\n";
+    return true;
+}
+
 }  // namespace
 
 int main()
@@ -441,6 +567,7 @@ int main()
     unsetenv("BGJ_CUDA_TENSOR_NP_MIN_TILES");
     ok = run_case("tensor-same-32", 512, 0, 32, true, 11, ThresholdMode::Selective) && ok;
     ok = run_pool_case() && ok;
+    ok = run_pool_batch_case() && ok;
     ok = run_overflow_case() && ok;
 
     if (!ok) return 1;

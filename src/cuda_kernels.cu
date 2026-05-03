@@ -3,10 +3,12 @@
 #include <cuda_runtime.h>
 #include <mma.h>
 #include <pthread.h>
+#include <new>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <vector>
 
 using namespace nvcuda;
 
@@ -131,6 +133,34 @@ struct bgj_cuda_raw_scratch_t {
 };
 
 static thread_local bgj_cuda_raw_scratch_t bgj_cuda_raw_scratch;
+
+struct bgj_cuda_raw_batch_scratch_t {
+    std::vector<bgj_cuda_raw_scratch_t *> items;
+
+    ~bgj_cuda_raw_batch_scratch_t()
+    {
+        for (size_t i = 0; i < items.size(); i++) {
+            delete items[i];
+        }
+    }
+
+    bgj_cuda_raw_scratch_t *get(uint32_t index)
+    {
+        while (items.size() <= (size_t)index) {
+            bgj_cuda_raw_scratch_t *scratch = new (std::nothrow) bgj_cuda_raw_scratch_t;
+            if (!scratch) return NULL;
+            try {
+                items.push_back(scratch);
+            } catch (...) {
+                delete scratch;
+                return NULL;
+            }
+        }
+        return items[index];
+    }
+};
+
+static thread_local bgj_cuda_raw_batch_scratch_t bgj_cuda_raw_batch_scratch;
 
 static void set_cuda_error(const char *context, cudaError_t err)
 {
@@ -1263,31 +1293,28 @@ static int bgj_cuda_tensor_capable()
     return capable;
 }
 
-static int bgj_cuda_search_bucket_raw_impl(const int8_t *p_vecs,
-                                           const int8_t *n_vecs,
-                                           const int8_t *pool_vecs_host,
-                                           uint64_t pool_epoch,
-                                           uint32_t pool_size,
-                                           const uint32_t *p_ids,
-                                           const uint32_t *n_ids,
-                                           const int32_t *p_norm,
-                                           const int32_t *n_norm,
-                                           const int32_t *p_dot,
-                                           const int32_t *n_dot,
-                                           uint32_t num_p,
-                                           uint32_t num_n,
-                                           uint32_t vec_length,
-                                           int32_t goal_norm,
-                                           int32_t center_norm,
-                                           int record_dp,
-                                           bgj_cuda_result_t *results,
-                                           uint32_t result_capacity,
-                                           uint32_t *result_count,
-                                           int *overflow)
+static int bgj_cuda_search_bucket_raw_submit(bgj_cuda_raw_scratch_t *scratch,
+                                             const int8_t *p_vecs,
+                                             const int8_t *n_vecs,
+                                             const int8_t *pool_vecs_host,
+                                             uint64_t pool_epoch,
+                                             uint32_t pool_size,
+                                             const uint32_t *p_ids,
+                                             const uint32_t *n_ids,
+                                             const int32_t *p_norm,
+                                             const int32_t *n_norm,
+                                             const int32_t *p_dot,
+                                             const int32_t *n_dot,
+                                             uint32_t num_p,
+                                             uint32_t num_n,
+                                             uint32_t vec_length,
+                                             int32_t goal_norm,
+                                             int32_t center_norm,
+                                             int record_dp,
+                                             uint32_t result_capacity,
+                                             uint32_t *submitted_result_count,
+                                             int *submitted_overflow)
 {
-    bgj_cuda_raw_scratch_t *scratch = &bgj_cuda_raw_scratch;
-    uint32_t h_result_count = 0;
-    int h_overflow = 0;
     uint32_t tensor_np_num_p = 0;
     uint32_t tensor_np_num_n = 0;
     uint32_t tensor_same_num_p = 0;
@@ -1967,20 +1994,104 @@ static int bgj_cuda_search_bucket_raw_impl(const int8_t *p_vecs,
         }
     }
 
-    CUDA_TRY(cudaMemcpyAsync(&h_result_count, scratch->result_count, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
-    CUDA_TRY(cudaMemcpyAsync(&h_overflow, scratch->overflow, sizeof(int), cudaMemcpyDeviceToHost, stream));
-    CUDA_TRY(cudaStreamSynchronize(stream));
+    CUDA_TRY(cudaMemcpyAsync(submitted_result_count, scratch->result_count, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_TRY(cudaMemcpyAsync(submitted_overflow, scratch->overflow, sizeof(int), cudaMemcpyDeviceToHost, stream));
+    set_plain_error("no CUDA error");
+    return 1;
 
-    *overflow = h_overflow || (h_result_count > result_capacity);
-    *result_count = h_result_count > result_capacity ? result_capacity : h_result_count;
+fail:
+    return 0;
+}
+
+static int bgj_cuda_finish_submitted_bucket(bgj_cuda_raw_scratch_t *scratch,
+                                            bgj_cuda_result_t *results,
+                                            uint32_t result_capacity,
+                                            uint32_t submitted_result_count,
+                                            int submitted_overflow,
+                                            uint32_t *result_count,
+                                            int *overflow)
+{
+    cudaStream_t stream = scratch->stream;
+
+    *overflow = submitted_overflow || (submitted_result_count > result_capacity);
+    *result_count = submitted_result_count > result_capacity ? result_capacity : submitted_result_count;
     if (!*overflow && *result_count) {
         CUDA_TRY(cudaMemcpyAsync(results,
                                  scratch->results,
                                  (size_t)(*result_count) * sizeof(bgj_cuda_result_t),
                                  cudaMemcpyDeviceToHost,
                                  stream));
-        CUDA_TRY(cudaStreamSynchronize(stream));
     }
+
+    set_plain_error("no CUDA error");
+    return 1;
+
+fail:
+    return 0;
+}
+
+static int bgj_cuda_search_bucket_raw_impl(const int8_t *p_vecs,
+                                           const int8_t *n_vecs,
+                                           const int8_t *pool_vecs_host,
+                                           uint64_t pool_epoch,
+                                           uint32_t pool_size,
+                                           const uint32_t *p_ids,
+                                           const uint32_t *n_ids,
+                                           const int32_t *p_norm,
+                                           const int32_t *n_norm,
+                                           const int32_t *p_dot,
+                                           const int32_t *n_dot,
+                                           uint32_t num_p,
+                                           uint32_t num_n,
+                                           uint32_t vec_length,
+                                           int32_t goal_norm,
+                                           int32_t center_norm,
+                                           int record_dp,
+                                           bgj_cuda_result_t *results,
+                                           uint32_t result_capacity,
+                                           uint32_t *result_count,
+                                           int *overflow)
+{
+    bgj_cuda_raw_scratch_t *scratch = &bgj_cuda_raw_scratch;
+    uint32_t h_result_count = 0;
+    int h_overflow = 0;
+
+    if (!bgj_cuda_search_bucket_raw_submit(scratch,
+                                           p_vecs,
+                                           n_vecs,
+                                           pool_vecs_host,
+                                           pool_epoch,
+                                           pool_size,
+                                           p_ids,
+                                           n_ids,
+                                           p_norm,
+                                           n_norm,
+                                           p_dot,
+                                           n_dot,
+                                           num_p,
+                                           num_n,
+                                           vec_length,
+                                           goal_norm,
+                                           center_norm,
+                                           record_dp,
+                                           result_capacity,
+                                           &h_result_count,
+                                           &h_overflow)) {
+        return 0;
+    }
+    cudaStream_t stream = scratch->stream;
+    CUDA_TRY(cudaStreamSynchronize(stream));
+
+    if (!bgj_cuda_finish_submitted_bucket(scratch,
+                                          results,
+                                          result_capacity,
+                                          h_result_count,
+                                          h_overflow,
+                                          result_count,
+                                          overflow)) {
+        return 0;
+    }
+    CUDA_TRY(cudaStreamSynchronize(stream));
 
     set_plain_error("no CUDA error");
     return 1;
@@ -2072,6 +2183,121 @@ extern "C" int bgj_cuda_search_bucket_pool_raw(const int8_t *pool_vecs,
                                            result_capacity,
                                            result_count,
                                            overflow);
+}
+
+extern "C" int bgj_cuda_search_bucket_pool_batch_raw(const int8_t *pool_vecs,
+                                                      uint64_t pool_epoch,
+                                                      uint32_t pool_size,
+                                                      const uint32_t *const *p_ids,
+                                                      const uint32_t *const *n_ids,
+                                                      const int32_t *const *p_norm,
+                                                      const int32_t *const *n_norm,
+                                                      const int32_t *const *p_dot,
+                                                      const int32_t *const *n_dot,
+                                                      const uint32_t *num_p,
+                                                      const uint32_t *num_n,
+                                                      uint32_t batch_size,
+                                                      uint32_t vec_length,
+                                                      const int32_t *goal_norm,
+                                                      const int32_t *center_norm,
+                                                      int record_dp,
+                                                      bgj_cuda_result_t *const *results,
+                                                      const uint32_t *result_capacity,
+                                                      uint32_t *result_count,
+                                                      int *overflow)
+{
+    if (batch_size == 0) {
+        set_plain_error("no CUDA error");
+        return 1;
+    }
+    if (!pool_vecs || !p_ids || !n_ids || !p_norm || !n_norm ||
+        !num_p || !num_n || !goal_norm || !center_norm ||
+        !results || !result_capacity || !result_count || !overflow) {
+        set_plain_error("invalid batch pointer");
+        return 0;
+    }
+    if (record_dp && (!p_dot || !n_dot)) {
+        set_plain_error("invalid batch dot pointer");
+        return 0;
+    }
+
+    uint32_t submitted = 0;
+    for (uint32_t i = 0; i < batch_size; i++) {
+        result_count[i] = 0;
+        overflow[i] = 0;
+        bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get(i);
+        if (!scratch) {
+            set_plain_error("out of host memory");
+            goto fail_sync;
+        }
+        if (!bgj_cuda_search_bucket_raw_submit(scratch,
+                                               NULL,
+                                               NULL,
+                                               pool_vecs,
+                                               pool_epoch,
+                                               pool_size,
+                                               p_ids[i],
+                                               n_ids[i],
+                                               p_norm[i],
+                                               n_norm[i],
+                                               record_dp ? p_dot[i] : NULL,
+                                               record_dp ? n_dot[i] : NULL,
+                                               num_p[i],
+                                               num_n[i],
+                                               vec_length,
+                                               goal_norm[i],
+                                               center_norm[i],
+                                               record_dp,
+                                               result_capacity[i],
+                                               &result_count[i],
+                                               &overflow[i])) {
+            goto fail_sync;
+        }
+        submitted++;
+    }
+
+    for (uint32_t i = 0; i < submitted; i++) {
+        bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get(i);
+        cudaError_t err = cudaStreamSynchronize(scratch->stream);
+        if (err != cudaSuccess) {
+            set_cuda_error("cudaStreamSynchronize batch counts", err);
+            goto fail_sync;
+        }
+    }
+
+    for (uint32_t i = 0; i < submitted; i++) {
+        bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get(i);
+        const uint32_t submitted_count = result_count[i];
+        const int submitted_overflow = overflow[i];
+        if (!bgj_cuda_finish_submitted_bucket(scratch,
+                                              results[i],
+                                              result_capacity[i],
+                                              submitted_count,
+                                              submitted_overflow,
+                                              &result_count[i],
+                                              &overflow[i])) {
+            goto fail_sync;
+        }
+    }
+
+    for (uint32_t i = 0; i < submitted; i++) {
+        bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get(i);
+        cudaError_t err = cudaStreamSynchronize(scratch->stream);
+        if (err != cudaSuccess) {
+            set_cuda_error("cudaStreamSynchronize batch results", err);
+            goto fail_sync;
+        }
+    }
+
+    set_plain_error("no CUDA error");
+    return 1;
+
+fail_sync:
+    for (uint32_t i = 0; i < submitted; i++) {
+        bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get(i);
+        if (scratch && scratch->stream_ready) cudaStreamSynchronize(scratch->stream);
+    }
+    return 0;
 }
 
 #undef CUDA_ENSURE

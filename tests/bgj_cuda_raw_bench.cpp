@@ -51,6 +51,26 @@ extern "C" int bgj_cuda_search_bucket_pool_raw(const int8_t *pool_vecs,
                                                 uint32_t result_capacity,
                                                 uint32_t *result_count,
                                                 int *overflow);
+extern "C" int bgj_cuda_search_bucket_pool_batch_raw(const int8_t *pool_vecs,
+                                                      uint64_t pool_epoch,
+                                                      uint32_t pool_size,
+                                                      const uint32_t *const *p_ids,
+                                                      const uint32_t *const *n_ids,
+                                                      const int32_t *const *p_norm,
+                                                      const int32_t *const *n_norm,
+                                                      const int32_t *const *p_dot,
+                                                      const int32_t *const *n_dot,
+                                                      const uint32_t *num_p,
+                                                      const uint32_t *num_n,
+                                                      uint32_t batch_size,
+                                                      uint32_t vec_length,
+                                                      const int32_t *goal_norm,
+                                                      const int32_t *center_norm,
+                                                      int record_dp,
+                                                      bgj_cuda_result_t *const *results,
+                                                      const uint32_t *result_capacity,
+                                                      uint32_t *result_count,
+                                                      int *overflow);
 
 namespace {
 
@@ -125,6 +145,29 @@ Bucket make_bucket(uint32_t num_p, uint32_t num_n, uint32_t vec_length, uint32_t
                   bucket.pool_vecs.begin() + (size_t)num_p * vec_length);
     }
     return bucket;
+}
+
+void append_bucket_to_pool(Bucket &bucket, uint32_t vec_length, std::vector<int8_t> &pool)
+{
+    const uint32_t base = (uint32_t)(pool.size() / vec_length);
+    const uint32_t num_p = (uint32_t)bucket.p_ids.size();
+    const uint32_t num_n = (uint32_t)bucket.n_ids.size();
+    pool.resize(pool.size() + (size_t)(num_p + num_n) * vec_length);
+
+    for (uint32_t i = 0; i < num_p; i++) {
+        const uint32_t id = base + i;
+        std::copy(bucket.p_vecs.begin() + (size_t)i * vec_length,
+                  bucket.p_vecs.begin() + (size_t)(i + 1) * vec_length,
+                  pool.begin() + (size_t)id * vec_length);
+        bucket.p_ids[i] = id;
+    }
+    for (uint32_t i = 0; i < num_n; i++) {
+        const uint32_t id = base + num_p + i;
+        std::copy(bucket.n_vecs.begin() + (size_t)i * vec_length,
+                  bucket.n_vecs.begin() + (size_t)(i + 1) * vec_length,
+                  pool.begin() + (size_t)id * vec_length);
+        bucket.n_ids[i] = id;
+    }
 }
 
 uint64_t pair_dots(uint32_t num_p, uint32_t num_n)
@@ -285,6 +328,146 @@ bool bench_case(uint32_t vec_length,
     return true;
 }
 
+bool bench_batch_case(uint32_t vec_length,
+                      uint32_t num_p,
+                      uint32_t num_n,
+                      uint32_t repeats,
+                      int record_dp,
+                      uint32_t threads,
+                      uint32_t batch_size)
+{
+    if (threads == 0) threads = 1;
+    if (batch_size == 0) batch_size = 1;
+
+    std::vector<Bucket> buckets;
+    std::vector<int8_t> pool;
+    buckets.reserve(batch_size);
+    for (uint32_t i = 0; i < batch_size; i++) {
+        Bucket bucket = make_bucket(num_p, num_n, vec_length,
+                                    0xBADC0DEu ^ vec_length ^ (num_p << 8) ^
+                                    (num_n << 16) ^ (i * 7919u));
+        append_bucket_to_pool(bucket, vec_length, pool);
+        buckets.push_back(bucket);
+    }
+
+    std::vector<const uint32_t *> p_ids(batch_size);
+    std::vector<const uint32_t *> n_ids(batch_size);
+    std::vector<const int32_t *> p_norm(batch_size);
+    std::vector<const int32_t *> n_norm(batch_size);
+    std::vector<const int32_t *> p_dot(batch_size);
+    std::vector<const int32_t *> n_dot(batch_size);
+    std::vector<uint32_t> p_counts(batch_size, num_p);
+    std::vector<uint32_t> n_counts(batch_size, num_n);
+    std::vector<int32_t> goal_norm(batch_size, std::numeric_limits<int32_t>::min() / 4);
+    std::vector<int32_t> center_norm(batch_size, 0);
+    std::vector<uint32_t> result_capacity(batch_size, 16);
+
+    for (uint32_t i = 0; i < batch_size; i++) {
+        p_ids[i] = buckets[i].p_ids.data();
+        n_ids[i] = buckets[i].n_ids.data();
+        p_norm[i] = buckets[i].p_norm.data();
+        n_norm[i] = buckets[i].n_norm.data();
+        p_dot[i] = buckets[i].p_dot.data();
+        n_dot[i] = buckets[i].n_dot.data();
+    }
+
+    auto run_worker = [&](uint32_t calls, int &ok) {
+        std::vector<std::vector<bgj_cuda_result_t> > result_storage(batch_size);
+        std::vector<bgj_cuda_result_t *> result_ptrs(batch_size);
+        std::vector<uint32_t> result_count(batch_size);
+        std::vector<int> overflow(batch_size);
+        for (uint32_t i = 0; i < batch_size; i++) {
+            result_storage[i].resize(result_capacity[i]);
+            result_ptrs[i] = result_storage[i].data();
+        }
+
+        for (uint32_t call = 0; call < calls; call++) {
+            if (!bgj_cuda_search_bucket_pool_batch_raw(pool.data(),
+                                                       1,
+                                                       (uint32_t)(pool.size() / vec_length),
+                                                       p_ids.data(),
+                                                       n_ids.data(),
+                                                       p_norm.data(),
+                                                       n_norm.data(),
+                                                       p_dot.data(),
+                                                       n_dot.data(),
+                                                       p_counts.data(),
+                                                       n_counts.data(),
+                                                       batch_size,
+                                                       vec_length,
+                                                       goal_norm.data(),
+                                                       center_norm.data(),
+                                                       record_dp,
+                                                       result_ptrs.data(),
+                                                       result_capacity.data(),
+                                                       result_count.data(),
+                                                       overflow.data())) {
+                ok = 0;
+                return;
+            }
+            for (uint32_t i = 0; i < batch_size; i++) {
+                if (overflow[i] || result_count[i] != 0) {
+                    ok = 0;
+                    return;
+                }
+            }
+        }
+    };
+
+    bool warmup_ok = true;
+    for (uint32_t i = 0; i < 3 && warmup_ok; i++) {
+        std::vector<std::thread> workers;
+        std::vector<int> ok(threads, 1);
+        for (uint32_t t = 0; t < threads; t++) {
+            workers.push_back(std::thread([&, t]() {
+                run_worker(1, ok[t]);
+            }));
+        }
+        for (uint32_t t = 0; t < workers.size(); t++) workers[t].join();
+        for (uint32_t t = 0; t < ok.size(); t++) warmup_ok = warmup_ok && ok[t] != 0;
+    }
+    if (!warmup_ok) {
+        std::cerr << "CUDA batch warmup failed: " << bgj_cuda_raw_last_error() << "\n";
+        return false;
+    }
+
+    const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    std::vector<std::thread> workers;
+    std::vector<int> ok(threads, 1);
+    for (uint32_t t = 0; t < threads; t++) {
+        workers.push_back(std::thread([&, t]() {
+            run_worker(repeats, ok[t]);
+        }));
+    }
+    for (uint32_t t = 0; t < workers.size(); t++) workers[t].join();
+    const std::chrono::steady_clock::time_point stop = std::chrono::steady_clock::now();
+    for (uint32_t t = 0; t < ok.size(); t++) {
+        if (!ok[t]) {
+            std::cerr << "CUDA batch benchmark failed: " << bgj_cuda_raw_last_error() << "\n";
+            return false;
+        }
+    }
+
+    const double seconds = std::chrono::duration<double>(stop - start).count();
+    const double bucket_calls = (double)repeats * (double)threads * (double)batch_size;
+    const double ms_per_call = seconds * 1000.0 / bucket_calls;
+    const double dots = (double)pair_dots(num_p, num_n) * bucket_calls;
+    const double gdot_per_second = dots / seconds / 1.0e9;
+    const double gint8_mac_per_second = dots * (double)vec_length / seconds / 1.0e9;
+
+    std::cout << "pool-batch" << batch_size << ','
+              << vec_length << ','
+              << num_p << ','
+              << num_n << ','
+              << repeats << ','
+              << record_dp << ','
+              << threads << ','
+              << std::fixed << std::setprecision(4) << ms_per_call << ','
+              << std::setprecision(6) << gdot_per_second << ','
+              << std::setprecision(3) << gint8_mac_per_second << "\n";
+    return true;
+}
+
 void print_header()
 {
     std::cout << "mode,vec_length,num_p,num_n,repeats,record_dp,threads,ms_per_call,gdot_per_s,gint8_mac_per_s\n";
@@ -310,7 +493,7 @@ bool run_sweep()
 
 void usage(const char *argv0)
 {
-    std::cerr << "usage: " << argv0 << " [vec_length num_p num_n [repeats [pool [record_dp [threads]]]]]\n"
+    std::cerr << "usage: " << argv0 << " [vec_length num_p num_n [repeats [pool [record_dp [threads [batch]]]]]]\n"
               << "       no arguments runs a bounded default sweep\n";
 }
 
@@ -327,7 +510,7 @@ int main(int argc, char **argv)
     if (argc == 1) {
         return run_sweep() ? 0 : 1;
     }
-    if (argc < 4 || argc > 8) {
+    if (argc < 4 || argc > 9) {
         usage(argv[0]);
         return 2;
     }
@@ -340,7 +523,15 @@ int main(int argc, char **argv)
     const bool use_pool = argc >= 6 ? parse_u32(argv[5], "pool") != 0 : false;
     const int record_dp = argc >= 7 ? (parse_u32(argv[6], "record_dp") != 0 ? 1 : 0) : 1;
     const uint32_t threads = argc >= 8 ? parse_u32(argv[7], "threads") : 1;
+    const uint32_t batch = argc >= 9 ? parse_u32(argv[8], "batch") : 1;
 
     print_header();
+    if (batch > 1) {
+        if (!use_pool) {
+            std::cerr << "batch benchmark currently uses the pool-cache raw API; pass pool=1\n";
+            return 2;
+        }
+        return bench_batch_case(vec_length, num_p, num_n, repeats, record_dp, threads, batch) ? 0 : 1;
+    }
     return bench_case(vec_length, num_p, num_n, repeats, use_pool, record_dp, threads) ? 0 : 1;
 }

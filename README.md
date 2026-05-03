@@ -70,7 +70,11 @@ by default on A100 because their wins depend on dimension and bucket shape.
 CUDA bucket search uses a nonblocking per-thread CUDA stream. By default, CUDA
 search keeps the current pool vectors in a shared on-device cache and packs
 bucket rows on-device; set `BGJ_CUDA_POOL_CACHE=0` to disable this and copy
-each bucket from the host instead.
+each bucket from the host instead. The raw pool interface also has an
+experimental batched entry point, `bgj_cuda_search_bucket_pool_batch_raw`,
+which submits several buckets on separate CUDA scratch streams and synchronizes
+once for counts before copying only the valid result ranges. It is currently
+used by the raw tests and benchmark harness rather than the full sieve loop.
 The default CUDA/BGJ build now instantiates `Pool_epi8_t<6>` and
 `Pool_epi8_t<7>`, allowing non-LSH BGJ/CUDA paths to use 192- and
 224-dimensional int8 pool vectors. The LSH and AMX paths remain capped by their
@@ -88,6 +92,7 @@ $ clang++ -O2 -g -std=c++11 -DHAVE_CUDA tests/bgj_cuda_raw_bench.cpp src/libllib
 $ /tmp/bgj_cuda_raw_bench
 $ BGJ_CUDA_TENSOR=0 /tmp/bgj_cuda_raw_bench
 $ /tmp/bgj_cuda_raw_bench 160 8192 8192 100 1 1 8
+$ /tmp/bgj_cuda_raw_bench 224 8192 8192 50 1 1 1 8
 ```
 
 For large instances, it's recommended to use [sparsepp](https://github.com/greg7mdp/sparsepp) to replace the default `std::unordered_set` used in the implementation of UidHashTable. This can be done by changing `USE_SPARSEPP` in `include/config.h` to 1 and manually placing the sparsepp headers into `dep/sparsepp/` before running make.
