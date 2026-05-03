@@ -169,6 +169,16 @@ $ clang++ -O3 -g -std=c++11 -DHAVE_CUDA tests/bgj_cuda_materialize_bench.cpp src
 $ /tmp/bgj_cuda_materialize_bench 128 16384 3 8192 1
 ```
 
+To compare 256-bit VNNI against an experimental 512-bit VNNI/FMA CPU
+materializer kernel on the local CPU, use:
+
+```bash
+$ clang++ -O3 -g -std=c++11 tests/bgj_cpu_materialize_avx512_bench.cpp \
+    -Iinclude -fopenmp=libomp -stdlib=libc++ -pthread -march=native \
+    -o /tmp/bgj_cpu_materialize_avx512_bench
+$ /tmp/bgj_cpu_materialize_avx512_bench 224 16384 5 8192
+```
+
 For end-to-end A100 tuning on seed-42 SVP-challenge ladders, use:
 
 ```bash
