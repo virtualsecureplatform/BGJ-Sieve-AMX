@@ -422,6 +422,9 @@ int main()
     ok = run_case("np-no-dp-len1", 9, 7, 1, false, 6, ThresholdMode::Selective) && ok;
     ok = run_case("mixed-32", 17, 19, 32, true, 7, ThresholdMode::Selective) && ok;
     ok = run_case("mixed-96", 6, 5, 96, true, 8, ThresholdMode::Selective) && ok;
+    ok = run_case("tensor-np-160", 48, 52, 160, true, 9, ThresholdMode::Selective) && ok;
+    ok = run_case("tensor-np-224", 33, 35, 224, true, 10, ThresholdMode::Selective) && ok;
+    ok = run_case("tensor-same-32", 512, 0, 32, true, 11, ThresholdMode::Selective) && ok;
     ok = run_pool_case() && ok;
     ok = run_overflow_case() && ok;
 

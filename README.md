@@ -50,8 +50,9 @@ default result buffer holds `4194304` candidates per bucket and can be changed
 with `BGJ_CUDA_MAX_RESULTS`.
 
 On A100-class GPUs, CUDA search uses experimental INT8 Tensor Core paths for
-full 16x16 bucket tiles by default. The positive/negative tile path runs
-whenever full tiles are available; same-side positive/positive and
+full 16x16 bucket tiles by default. Tensor kernels process four independent
+tiles per CTA to keep more warps resident on A100. The positive/negative tile
+path runs whenever full tiles are available; same-side positive/positive and
 negative/negative Tensor tiles run only for larger bucket sides. Fringe pairs
 still use the CUDA `dp4a` kernel. Set `BGJ_CUDA_TENSOR=0` to disable Tensor
 Cores, `BGJ_CUDA_TENSOR_SAME=0` to disable only same-side Tensor tiles, or
