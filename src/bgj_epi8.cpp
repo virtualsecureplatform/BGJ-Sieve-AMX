@@ -61,6 +61,31 @@ static int bgj_epi8_parse_env_double(const char *name, double *value)
     return 1;
 }
 
+static double bgj1_epi8_default_cuda_bucket_target(long csd)
+{
+    (void)csd;
+    return 12288.0;
+}
+
+static long bgj1_epi8_search_threads_runtime(long threads)
+{
+#if defined(HAVE_CUDA)
+    if (bgj_cuda_search_requested()) {
+        const char *env = getenv("BGJ_CUDA_SEARCH_THREADS");
+        if (env && env[0]) {
+            char *end = NULL;
+            long parsed = strtol(env, &end, 10);
+            if (end != env && parsed > 0) {
+                if (parsed > threads) return threads;
+                return parsed;
+            }
+        }
+        return threads;
+    }
+#endif
+    return threads;
+}
+
 static double bgj1_epi8_bucket_alpha_runtime(long csd, long num_vec)
 {
     double alpha = BGJ1_EPI8_BUCKET_ALPHA;
@@ -72,7 +97,8 @@ static double bgj1_epi8_bucket_alpha_runtime(long csd, long num_vec)
     } else if (bgj_epi8_parse_env_double("BGJ1_EPI8_BUCKET_TARGET_SIZE", &value) ||
                bgj_epi8_parse_env_double("BGJ_EPI8_BUCKET_TARGET_SIZE", &value)
 #if defined(HAVE_CUDA)
-               || (bgj_cuda_search_requested() && csd >= 40 && (value = 8192.0) > 0.0)
+               || (bgj_cuda_search_requested() && csd >= 40 &&
+                   (value = bgj1_epi8_default_cuda_bucket_target(csd)) > 0.0)
 #endif
     ) {
         if (value > 0.0 && csd > 0 && num_vec > 0) {
@@ -746,9 +772,10 @@ int Pool_epi8_t<nb>::bgj1_Sieve(long log_level, long lps_auto_adj){
             const uint32_t cuda_min_batch = cuda_batch_capacity < 4 ? cuda_batch_capacity : 4;
             const uint64_t cuda_batch_min_dots = bgj_cuda_batch_min_dots();
             #endif
+            const long search_threads = bgj1_epi8_search_threads_runtime(num_threads);
             TIMER_START;
             #pragma omp parallel for
-            for (long thread = 0; thread < num_threads; thread++){
+            for (long thread = 0; thread < search_threads; thread++){
                 long __search0_ndp = 0;
                 double __cuda_cred_time0 = 0.0;
                 double __cuda_single_time0 = 0.0;

@@ -2121,11 +2121,32 @@ static int bgj_cuda_tensor_same_requested()
     return 1;
 }
 
+static int bgj_cuda_sm80_device()
+{
+    static int is_sm80 = -1;
+    if (is_sm80 >= 0) return is_sm80;
+
+    int device = 0;
+    cudaDeviceProp prop;
+    cudaError_t err = cudaGetDevice(&device);
+    if (err != cudaSuccess) {
+        is_sm80 = 0;
+        return is_sm80;
+    }
+    err = cudaGetDeviceProperties(&prop, device);
+    if (err != cudaSuccess) {
+        is_sm80 = 0;
+        return is_sm80;
+    }
+    is_sm80 = (prop.major == 8 && prop.minor == 0) ? 1 : 0;
+    return is_sm80;
+}
+
 static int bgj_cuda_tensor_np_wide_requested()
 {
     const char *env = getenv("BGJ_CUDA_TENSOR_NP_WIDE");
     if (env && env[0]) return env[0] != '0';
-    return 0;
+    return bgj_cuda_sm80_device();
 }
 
 static int bgj_cuda_tensor_np_shared_a_requested()

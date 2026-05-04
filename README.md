@@ -72,23 +72,28 @@ repeated tile loads use the A100 read-only cache. Set
 `BGJ_CUDA_TENSOR_REORDER=0` to disable the fragment prepack path,
 `BGJ_CUDA_TENSOR_NP_MIN_TILES=<n>` to tune the positive/negative Tensor
 threshold, `BGJ_CUDA_TENSOR_SAME=0` to disable only same-side Tensor tiles, or
-`BGJ_CUDA_TENSOR_SAME_MIN_TILES=<n>` to tune the same-side threshold. A
-shared-A positive/negative Tensor kernel, a wider 64x64 positive/negative
-Tensor kernel, and a 32x256 positive/negative multi-fragment Tensor kernel are
-available for profiling with `BGJ_CUDA_TENSOR_NP_SHARED_A=1`,
-`BGJ_CUDA_TENSOR_NP_WIDE=1`, and `BGJ_CUDA_TENSOR_NP_MULTI=1`; these are off
-by default on A100 because their wins depend on dimension and bucket shape.
+`BGJ_CUDA_TENSOR_SAME_MIN_TILES=<n>` to tune the same-side threshold. A wider
+64x64 positive/negative Tensor kernel is the default on sm80/A100; set
+`BGJ_CUDA_TENSOR_NP_WIDE=0` to use the single-tile path. Shared-A and 32x256
+multi-fragment positive/negative Tensor kernels are available for profiling
+with `BGJ_CUDA_TENSOR_NP_SHARED_A=1` and `BGJ_CUDA_TENSOR_NP_MULTI=1`.
 CUDA bucket search uses a nonblocking per-thread CUDA stream. By default, CUDA
 search keeps the current pool vectors in a shared on-device cache and packs
 bucket rows on-device; set `BGJ_CUDA_POOL_CACHE=0` to disable this and copy
-each bucket from the host instead. The raw pool interface also has an
+each bucket from the host instead. CUDA BGJ1 uses two host worker threads by
+default at dimension 80 and above so bucketing and materialization can use more
+CPU parallelism; smaller dimensions keep the single-thread path. Set
+`BGJ_CUDA_HOST_THREADS=<n>` to force a different count. CUDA bucket search uses
+the same host count by default so independent bucket streams can overlap; set
+`BGJ_CUDA_SEARCH_THREADS=1` to keep result consumption single-threaded when
+debugging scheduling-sensitive runs. The raw pool interface also has an
 experimental batched entry point, `bgj_cuda_search_bucket_pool_batch_raw`,
 which submits several buckets on separate CUDA scratch streams and synchronizes
 once for counts before copying only the valid result ranges. The BGJ1 CUDA
-sieve loop uses this batch path by default for one host thread when the first
-bucket in the group has at least `131072` pair checks; set
-`BGJ_CUDA_BATCH=0` to disable it, `BGJ_CUDA_BATCH=1` to force it with multiple
-host threads, `BGJ_CUDA_BATCH_SIZE=<n>` to tune the group size, or
+sieve loop leaves batching off by default on A100 because single-bucket
+submission lets the BGJ1 early-stop logic react sooner on the tuned SVP
+challenge runs. Set `BGJ_CUDA_BATCH=1` to enable batching,
+`BGJ_CUDA_BATCH_SIZE=<n>` to tune the group size, or
 `BGJ_CUDA_BATCH_MIN_DOTS=<n>` to tune the size threshold. With BGJ log level
 `2` or higher, the BGJ1 profile prints CUDA single-bucket, batched, cred, and
 fallback bucket counts, dot counts, and timings.
@@ -97,11 +102,11 @@ For A100 tuning, BGJ1 bucket density can be changed without rebuilding:
 `BGJ1_EPI8_BUCKET_TARGET_SIZE=<n>` derives an alpha for the current pool size
 and sieving dimension. Lower alpha means larger buckets, which can feed the
 Tensor Core path better but may also increase solution materialization and
-insertion cost. CUDA BGJ1 runs at dimension 40 or larger use target `8192` by
-default unless an alpha or target is explicitly set. Benchmark modes such as
-`cuda-target8192-batch8` set this target through `bench/bgj_cuda_seed42.py`;
-on the current A100 dim70/dim80 seed-42 challenge runs, targets around `8192`
-were the best of the tested `2048/4096/8192/16384` range.
+insertion cost. CUDA BGJ1 runs at dimension 40 or larger default to target
+`12288` unless an alpha or target is explicitly set. Benchmark modes such as
+`cuda-target12288` set this target through `bench/bgj_cuda_seed42.py`; on the
+current A100 dim70/dim80 seed-42 challenge runs, this higher-density setting is
+best for dim80 and still leaves dim70 well ahead of the G6K comparison.
 Dense buckets can produce many CUDA solution records; `BGJ_CUDA_MAX_RESULTS`
 sets the per-bucket result capacity and defaults to `16777216` for the A100
 tuning path. On overflow the CUDA path now consumes the capped result prefix and
@@ -127,11 +132,11 @@ cached cuBLAS is usually faster in the current microbenchmarks. Set
 `BGJ_CUDA_MATERIALIZE_HYBRID=1` to split a materialization batch between GPU
 and CPU; tune the GPU share with `BGJ_CUDA_MATERIALIZE_GPU_PERCENT=<0..100>` or
 an exact `BGJ_CUDA_MATERIALIZE_GPU_COUNT=<n>`. In CUDA builds,
-`BGJ_CPU_MATERIALIZE_THREADS=<n>` enables the shared descriptor materializer on
-the CPU and can temporarily use more CPU cores for this step, including when
-CUDA materialization is disabled. The materializer remains off by default
-because current end-to-end SVP-60/70 A100 timings are still slower than the
-optimized AVX2 CPU materializer.
+the shared descriptor materializer uses 8 CPU threads by default for CUDA BGJ1
+runs. Set `BGJ_CPU_MATERIALIZE_THREADS=<n>` to tune it, or `0` to use the old
+single-thread materialization path. This remains CPU-side candidate
+materialization only; CUDA search and bucketing timings are reported
+separately.
 The default CUDA/BGJ build now instantiates `Pool_epi8_t<6>` and
 `Pool_epi8_t<7>`, allowing non-LSH BGJ/CUDA paths to use 192- and
 224-dimensional int8 pool vectors. The LSH and AMX paths remain capped by their

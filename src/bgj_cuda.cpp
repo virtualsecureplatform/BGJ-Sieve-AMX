@@ -171,7 +171,7 @@ uint32_t bgj_cuda_batch_size(uint32_t host_threads)
     if (enabled && enabled[0] && enabled[0] == '0') return 1;
 
     const char *size_env = getenv("BGJ_CUDA_BATCH_SIZE");
-    if (!enabled && !size_env && host_threads > 1) return 1;
+    if (!enabled && !size_env) return 1;
 
     uint32_t value = 8;
     if (size_env && size_env[0]) {
@@ -635,6 +635,22 @@ int Pool_epi8_t<nb>::bgj1_Sieve_cuda(long log_level, long lps_auto_adj)
     return ret;
 }
 
+static long bgj_cuda_host_threads(long requested, long sieving_dim)
+{
+    const char *env = getenv("BGJ_CUDA_HOST_THREADS");
+    if (env && env[0]) {
+        char *end = NULL;
+        long parsed = strtol(env, &end, 10);
+        if (end != env && parsed > 0) {
+            return parsed > MAX_NTHREADS ? MAX_NTHREADS : parsed;
+        }
+    }
+
+    if (requested < 1) requested = 1;
+    if (requested < 2 && sieving_dim >= 80) return 2;
+    return requested > MAX_NTHREADS ? MAX_NTHREADS : requested;
+}
+
 template <uint32_t nb>
 int Pool_epi8_t<nb>::left_progressive_bgj1sieve_cuda(long ind_l, long ind_r, long num_threads, long log_level)
 {
@@ -654,7 +670,7 @@ int Pool_epi8_t<nb>::left_progressive_bgj1sieve_cuda(long ind_l, long ind_r, lon
     }
 
     clear_pool();
-    set_num_threads(num_threads);
+    set_num_threads(bgj_cuda_host_threads(num_threads, ind_r - ind_l));
     set_max_pool_size((long)(pow(4. / 3., (ind_r - ind_l) * 0.5) * 3.2) + 1);
     set_sieving_context(ind_r - 40, ind_r);
     sampling(2071);

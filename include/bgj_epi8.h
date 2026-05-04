@@ -9,7 +9,7 @@
 #define BGJ1_EPI8_BUCKET_ALPHA 0.325
 #define BGJ1_EPI8_USE_FARAWAY_CENTER 1
 #define BGJ1_EPI8_USE_3RED 1
-#define BGJ1_EPI8_BUCKET_BATCHSIZE 96
+#define BGJ1_EPI8_BUCKET_BATCHSIZE 32
 #if BGJ1_EPI8_BUCKET_BATCHSIZE % 8
 #error pool bucketing batchsize should always divided by 8
 #endif

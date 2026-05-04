@@ -2426,7 +2426,7 @@ int Pool_epi8_t<nb>::_search_nn(bucket_epi8_t<record_dp> *bkt, sol_list_epi8_t *
 static int bgj_cpu_materialize_threads_env_present()
 {
     const char *env = getenv("BGJ_CPU_MATERIALIZE_THREADS");
-    if (!env || !env[0]) return 0;
+    if (!env || !env[0]) return bgj_cuda_search_requested();
     char *end = NULL;
     long parsed = strtol(env, &end, 10);
     return end != env && parsed > 0;
@@ -2435,7 +2435,7 @@ static int bgj_cpu_materialize_threads_env_present()
 static long bgj_cpu_materialize_threads(long fallback)
 {
     const char *env = getenv("BGJ_CPU_MATERIALIZE_THREADS");
-    long value = fallback > 0 ? fallback : 1;
+    long value = bgj_cuda_search_requested() ? 8 : (fallback > 0 ? fallback : 1);
     if (env && env[0]) {
         char *end = NULL;
         long parsed = strtol(env, &end, 10);
