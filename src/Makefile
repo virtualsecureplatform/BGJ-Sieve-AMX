@@ -7,6 +7,8 @@ CFLAGS = -O3 -g -fopenmp=libomp -march=native -pthread -stdlib=libc++ -Wno-depre
 LIBS = -L../dep/ntl/lib -lntl -L../dep/gmp/lib -lgmp -lm
 LIBDIR = 
 INC_DIR = -I../include/ -I../dep/ntl/include
+UID_BACKEND ?= gtl
+CXXSTD ?=
 ON_CYGWIN = false
 CUDA ?= 0
 CUDA_PATH ?= /usr/local/cuda
@@ -16,6 +18,16 @@ CUDA_SMS ?= 80
 ifeq ($(ON_CYGWIN), true)
 	CFLAGS += -D__ON_CYGWIN
 endif
+
+ifeq ($(UID_BACKEND),gtl)
+	ifeq ($(strip $(CXXSTD)),)
+		CXXSTD = -std=c++17
+	endif
+	CFLAGS += -DUSE_GTL_UID_TABLE=1 -DUSE_SPARSEPP=0
+	INC_DIR += -I../dep/gtl/include
+endif
+
+CFLAGS += $(CXXSTD)
 
 ifeq ($(CUDA), 1)
 	OBJ += cuda_kernels.o

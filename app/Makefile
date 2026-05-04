@@ -4,6 +4,8 @@ CFLAGS = -O3 -g -funroll-loops -ftree-vectorize -fopenmp=libomp -march=native -s
 LIBS = -L../src -lllib -L../dep/ntl/lib -lntl -L../dep/gmp/lib -lgmp -lm
 LIBDIR =
 INC_DIR = -I../include/ -I../dep/ntl/include
+UID_BACKEND ?= gtl
+CXXSTD ?=
 CUDA ?= 0
 CUDA_PATH ?= /usr/local/cuda
 
@@ -12,6 +14,16 @@ ON_CYGWIN = false
 ifeq ($(ON_CYGWIN), true)
 	CFLAGS += -D__ON_CYGWIN
 endif
+
+ifeq ($(UID_BACKEND),gtl)
+	ifeq ($(strip $(CXXSTD)),)
+		CXXSTD = -std=c++17
+	endif
+	CFLAGS += -DUSE_GTL_UID_TABLE=1 -DUSE_SPARSEPP=0
+	INC_DIR += -I../dep/gtl/include
+endif
+
+CFLAGS += $(CXXSTD)
 
 ifeq ($(CUDA), 1)
 	CFLAGS += -DHAVE_CUDA

@@ -28,7 +28,18 @@
 #define REJ_ENTRY128 1
 
 // sparsepp is vendored in dep/sparsepp and used for the insert-heavy UID table.
-#define USE_SPARSEPP 1
+// Build with UID_BACKEND=gtl to try gtl::flat_hash_set instead.
+#ifndef USE_GTL_UID_TABLE
+#define USE_GTL_UID_TABLE 0
+#endif
+
+#ifndef USE_SPARSEPP
+#define USE_SPARSEPP (!USE_GTL_UID_TABLE)
+#endif
+
+#if USE_GTL_UID_TABLE && USE_SPARSEPP
+#error "USE_GTL_UID_TABLE and USE_SPARSEPP are mutually exclusive"
+#endif
 // ....do not enable it if USE_SPARSEPP is 1
 #define UID_OP_INLINE 0
 

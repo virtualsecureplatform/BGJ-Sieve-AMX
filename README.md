@@ -21,6 +21,7 @@ To compile the code, a recent version of `clang++` (e.g., `17.0.6`) with `libomp
 # otherwise, change the include path in Makefile manually
 $ ./install_gmp.sh
 $ ./install_ntl.sh
+$ git submodule update --init --recursive
 $ make
 ```
 
@@ -240,13 +241,16 @@ Use `--validate-svpchallenge-generator` to compare the online generator against
 the downloadable seed-0 dim-140 example, and `--prepare-only` to fetch and
 preprocess lattices without launching sieving jobs.
 
-For large instances, the build uses [sparsepp](https://github.com/greg7mdp/sparsepp)
-for `UidHashTable` by default. The UID table is insert-heavy during CUDA sieving;
-using sparsepp avoids the `std::unordered_set` rehash/pointer-chasing bottleneck
-that otherwise dominates larger SVP-challenge inputs.
-The sparsepp UID table also pre-reserves more aggressively by default. Tune this
-with `BGJ_UID_RESERVE_FACTOR` (default `8.0`) and cap it with
-`BGJ_UID_RESERVE_MAX` entries (default `268435456`, `0` means uncapped).
+For large instances, the default Makefile build uses
+[gtl](https://github.com/greg7mdp/gtl) `gtl::flat_hash_set` for
+`UidHashTable`. The UID table is insert-heavy during CUDA sieving, and the gtl
+backend avoids the `std::unordered_set` rehash/pointer-chasing bottleneck while
+also improving larger SVP-challenge CUDA runs in current A100 tests. Build with
+`UID_BACKEND=sparsepp` to use the older vendored
+[sparsepp](https://github.com/greg7mdp/sparsepp) backend instead. The UID table
+pre-reserves aggressively by default; tune this with `BGJ_UID_RESERVE_FACTOR`
+(default `8.0`) and cap it with `BGJ_UID_RESERVE_MAX` entries (default
+`268435456`, `0` means uncapped).
 
 For large instances, you may need to modify the values of `AMX_MAX_NTHREADS` in line 16 of `include/bgj_amx.h` and `MAX_NTHREADS` in line 42 of `include/bgj_epi8.h`, then recompile the code. The default value for both is set to 112.
 

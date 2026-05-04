@@ -31,7 +31,10 @@
 
 
 using UidType = uint64_t;
-#if USE_SPARSEPP
+#if USE_GTL_UID_TABLE
+#include "../dep/gtl/include/gtl/phmap.hpp"
+struct padded_unordered_set { __attribute__ ((aligned(128))) gtl::flat_hash_set<UidType> a; };
+#elif USE_SPARSEPP
 #include "../dep/sparsepp/spp.h"
 struct padded_unordered_set { __attribute__ ((aligned(128))) spp::sparse_hash_set<UidType> a; };
 #else

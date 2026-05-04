@@ -1,0 +1,3 @@
+[submodule "dep/gtl"]
+	path = dep/gtl
+	url = https://github.com/greg7mdp/gtl.git
