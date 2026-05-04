@@ -69,6 +69,9 @@ or cap it with `BGJ_CUDA_BUCKET_MAX_ENTRIES=<n>`. An A100 INT8 Tensor Core
 bucketing kernel for full 16x16 center/vector tiles is available for profiling
 with `BGJ_CUDA_BUCKET_TENSOR=1`, but the scalar `dp4a` bucketing kernel is the
 default because it is faster in the current SVP70/SVP80 timing runs.
+On A100, scalar bucketing uses block-local compaction by default to reduce
+global append atomics; set `BGJ_CUDA_BUCKET_BLOCK_APPEND=0` to force the older
+per-entry append path.
 
 On A100-class GPUs, CUDA search uses experimental INT8 Tensor Core paths for
 full 16x16 bucket tiles by default. Tensor kernels process four independent

@@ -1254,6 +1254,77 @@ __global__ void bgj_cuda_bucket_bgj1_kernel(const int8_t *pool_vecs,
     }
 }
 
+__global__ void bgj_cuda_bucket_bgj1_block_append_kernel(const int8_t *pool_vecs,
+                                                         const uint32_t *center_ids,
+                                                         uint32_t num_centers,
+                                                         const int32_t *vnorm,
+                                                         uint32_t pool_size,
+                                                         uint32_t start_id,
+                                                         uint32_t candidate_count,
+                                                         uint32_t vec_length,
+                                                         uint32_t alpha_x2_u16,
+                                                         bgj_cuda_bucket_entry_t *entries,
+                                                         uint32_t entry_capacity,
+                                                         uint32_t *entry_count,
+                                                         int *overflow)
+{
+    const uint64_t total = (uint64_t)candidate_count * num_centers;
+    const uint64_t stride = (uint64_t)blockDim.x * (uint64_t)gridDim.x;
+
+    for (uint64_t block_work = (uint64_t)blockIdx.x * blockDim.x;
+         block_work < total;
+         block_work += stride) {
+        const uint64_t pos = block_work + threadIdx.x;
+        uint32_t bucket = 0;
+        uint32_t id = 0;
+        int32_t dot = 0;
+        int pass = 0;
+
+        if (pos < total) {
+            bucket = (uint32_t)(pos / candidate_count);
+            id = start_id + (uint32_t)(pos - (uint64_t)bucket * candidate_count);
+            const uint32_t center_id = center_ids[bucket];
+            if (center_id < pool_size) {
+                dot = bgj_cuda_dot_i8(pool_vecs + (uint64_t)center_id * vec_length,
+                                      pool_vecs + (uint64_t)id * vec_length,
+                                      vec_length);
+                const int32_t norm = vnorm[id];
+                const int32_t bound = (int32_t)(((int64_t)norm * (int64_t)alpha_x2_u16) >> 16);
+                const int32_t abs_dot = dot < 0 ? -dot : dot;
+                pass = abs_dot > bound;
+            }
+        }
+
+        __shared__ uint32_t block_write;
+        __shared__ uint32_t block_base;
+        if (threadIdx.x == 0) block_write = 0;
+        __syncthreads();
+
+        uint32_t local = 0;
+        if (pass) {
+            local = atomicAdd(&block_write, 1u);
+        }
+        __syncthreads();
+
+        if (threadIdx.x == 0) {
+            block_base = block_write ? atomicAdd(entry_count, block_write) : 0;
+        }
+        __syncthreads();
+
+        if (pass) {
+            const uint32_t out = block_base + local;
+            if (out < entry_capacity) {
+                entries[out].bucket = bucket;
+                entries[out].id = id;
+                entries[out].dot = dot;
+            } else {
+                *overflow = 1;
+            }
+        }
+        __syncthreads();
+    }
+}
+
 __global__ __launch_bounds__(BGJ_CUDA_TENSOR_THREADS_PER_BLOCK, 2)
 void bgj_cuda_bucket_bgj1_tensor_kernel(const int8_t *center_vecs,
                                         const int8_t *pool_vecs,
@@ -2402,6 +2473,13 @@ static int bgj_cuda_bucket_tensor_requested()
     return 0;
 }
 
+static int bgj_cuda_bucket_block_append_requested()
+{
+    const char *env = getenv("BGJ_CUDA_BUCKET_BLOCK_APPEND");
+    if (env && env[0]) return env[0] != '0';
+    return bgj_cuda_sm80_device();
+}
+
 extern "C" int bgj_cuda_bucket_bgj1_raw(const int8_t *pool_vecs,
                                          uint64_t pool_epoch,
                                          uint32_t pool_size,
@@ -2474,7 +2552,10 @@ extern "C" int bgj_cuda_bucket_bgj1_raw(const int8_t *pool_vecs,
     CUDA_TRY(cudaMemsetAsync(scratch->overflow, 0, sizeof(int), stream));
 
     {
-        const int use_tensor = bgj_cuda_bucket_tensor_requested() &&
+        const int tensor_requested = bgj_cuda_bucket_tensor_requested();
+        const int use_block_append = !tensor_requested &&
+                                     bgj_cuda_bucket_block_append_requested();
+        const int use_tensor = tensor_requested &&
                                bgj_cuda_tensor_capable() &&
                                (vec_length % 16u) == 0 &&
                                num_centers >= 16u &&
@@ -2534,19 +2615,38 @@ extern "C" int bgj_cuda_bucket_bgj1_raw(const int8_t *pool_vecs,
             uint32_t blocks = (uint32_t)((total_pairs + threads - 1u) / threads);
             if (blocks == 0) blocks = 1;
             if (blocks > 65535u) blocks = 65535u;
-            bgj_cuda_bucket_bgj1_kernel<<<blocks, threads, 0, stream>>>(device_pool_vecs,
-                                                                        scratch->center_ids,
-                                                                        num_centers,
-                                                                        scratch->vnorm,
-                                                                        pool_size,
-                                                                        scalar_start,
-                                                                        scalar_count,
-                                                                        vec_length,
-                                                                        alpha_x2_u16,
-                                                                        scratch->entries,
-                                                                        entry_capacity,
-                                                                        scratch->entry_count,
-                                                                        scratch->overflow);
+            if (use_block_append) {
+                bgj_cuda_bucket_bgj1_block_append_kernel<<<blocks,
+                                                           threads,
+                                                           0,
+                                                           stream>>>(device_pool_vecs,
+                                                                     scratch->center_ids,
+                                                                     num_centers,
+                                                                     scratch->vnorm,
+                                                                     pool_size,
+                                                                     scalar_start,
+                                                                     scalar_count,
+                                                                     vec_length,
+                                                                     alpha_x2_u16,
+                                                                     scratch->entries,
+                                                                     entry_capacity,
+                                                                     scratch->entry_count,
+                                                                     scratch->overflow);
+            } else {
+                bgj_cuda_bucket_bgj1_kernel<<<blocks, threads, 0, stream>>>(device_pool_vecs,
+                                                                            scratch->center_ids,
+                                                                            num_centers,
+                                                                            scratch->vnorm,
+                                                                            pool_size,
+                                                                            scalar_start,
+                                                                            scalar_count,
+                                                                            vec_length,
+                                                                            alpha_x2_u16,
+                                                                            scratch->entries,
+                                                                            entry_capacity,
+                                                                            scratch->entry_count,
+                                                                            scratch->overflow);
+            }
             CUDA_TRY(cudaGetLastError());
         }
     }

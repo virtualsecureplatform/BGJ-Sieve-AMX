@@ -109,6 +109,37 @@ bool run_case(uint32_t dim, uint32_t pool_size)
                   << " got=" << got.size() << "\n";
         return false;
     }
+
+    setenv("BGJ_CUDA_BUCKET_BLOCK_APPEND", "1", 1);
+    got.assign(expected.size() + 16, bgj_cuda_bucket_entry_t());
+    count = 0;
+    overflow = 0;
+    const int block_append_ok = bgj_cuda_bucket_bgj1_raw(pool.data(),
+                                                         101,
+                                                         pool_size,
+                                                         center_ids,
+                                                         num_centers,
+                                                         vnorm.data(),
+                                                         dim,
+                                                         alpha_x2_u16,
+                                                         got.data(),
+                                                         (uint32_t)got.size(),
+                                                         &count,
+                                                         &overflow);
+    unsetenv("BGJ_CUDA_BUCKET_BLOCK_APPEND");
+    if (!block_append_ok || overflow) {
+        std::cerr << "CUDA block-append bucket raw failed: " << bgj_cuda_last_error()
+                  << " overflow=" << overflow << "\n";
+        return false;
+    }
+    got.resize(count);
+    if (!same_entries(expected, got)) {
+        std::cerr << "CUDA block-append bucket mismatch for dim=" << dim
+                  << " pool_size=" << pool_size
+                  << " expected=" << expected.size()
+                  << " got=" << got.size() << "\n";
+        return false;
+    }
     return true;
 }
 
