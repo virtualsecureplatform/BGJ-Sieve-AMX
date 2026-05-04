@@ -276,6 +276,74 @@ std::vector<bgj_cuda_result_t> cpu_oracle(const Bucket &bucket,
     return out;
 }
 
+std::vector<bgj_cuda_result_t> deterministic_oracle(const Bucket &bucket,
+                                                    uint32_t vec_length,
+                                                    int32_t goal_norm,
+                                                    int32_t center_norm,
+                                                    bool record_dp)
+{
+    const uint32_t num_p = (uint32_t)bucket.p_ids.size();
+    const uint32_t num_n = (uint32_t)bucket.n_ids.size();
+    const int32_t center_goal_norm = goal_norm - center_norm;
+    std::vector<bgj_cuda_result_t> out;
+
+    for (uint32_t p = 0; p < num_p; p++) {
+        for (uint32_t n = 0; n < num_n; n++) {
+            const int32_t dp = row_dot(bucket.p_vecs, p, bucket.n_vecs, n, vec_length);
+            if (bucket.p_norm[p] + bucket.n_norm[n] + dp < goal_norm) {
+                push(out, BGJ_CUDA_SOL_A, bucket.p_ids[p], bucket.n_ids[n]);
+            }
+        }
+    }
+    if (record_dp) {
+        for (uint32_t p = 0; p < num_p; p++) {
+            for (uint32_t n = 0; n < num_n; n++) {
+                const int32_t dp = row_dot(bucket.p_vecs, p, bucket.n_vecs, n, vec_length);
+                if (bucket.p_dot[p] + bucket.n_dot[n] - dp < center_goal_norm) {
+                    push(out, BGJ_CUDA_SOL_SA, bucket.p_ids[p], bucket.n_ids[n]);
+                }
+            }
+        }
+    }
+    for (uint32_t i = 0; i < num_p; i++) {
+        for (uint32_t j = i + 1; j < num_p; j++) {
+            const int32_t dp = row_dot(bucket.p_vecs, i, bucket.p_vecs, j, vec_length);
+            if (bucket.p_norm[i] + bucket.p_norm[j] - dp < goal_norm) {
+                push(out, BGJ_CUDA_SOL_S, bucket.p_ids[i], bucket.p_ids[j]);
+            }
+        }
+    }
+    if (record_dp) {
+        for (uint32_t i = 0; i < num_p; i++) {
+            for (uint32_t j = i + 1; j < num_p; j++) {
+                const int32_t dp = row_dot(bucket.p_vecs, i, bucket.p_vecs, j, vec_length);
+                if (bucket.p_dot[i] + bucket.p_dot[j] + dp < center_goal_norm) {
+                    push(out, BGJ_CUDA_SOL_SS, bucket.p_ids[i], bucket.p_ids[j]);
+                }
+            }
+        }
+    }
+    for (uint32_t i = 0; i < num_n; i++) {
+        for (uint32_t j = i + 1; j < num_n; j++) {
+            const int32_t dp = row_dot(bucket.n_vecs, i, bucket.n_vecs, j, vec_length);
+            if (bucket.n_norm[i] + bucket.n_norm[j] - dp < goal_norm) {
+                push(out, BGJ_CUDA_SOL_S, bucket.n_ids[i], bucket.n_ids[j]);
+            }
+        }
+    }
+    if (record_dp) {
+        for (uint32_t i = 0; i < num_n; i++) {
+            for (uint32_t j = i + 1; j < num_n; j++) {
+                const int32_t dp = row_dot(bucket.n_vecs, i, bucket.n_vecs, j, vec_length);
+                if (bucket.n_dot[i] + bucket.n_dot[j] + dp < center_goal_norm) {
+                    push(out, BGJ_CUDA_SOL_AA, bucket.n_ids[i], bucket.n_ids[j]);
+                }
+            }
+        }
+    }
+    return out;
+}
+
 bool result_less(const bgj_cuda_result_t &a, const bgj_cuda_result_t &b)
 {
     return std::make_tuple(a.type, a.x, a.y) < std::make_tuple(b.type, b.x, b.y);
@@ -356,6 +424,71 @@ bool run_case(const std::string &name,
         std::cout << name << ": ok, results=" << result_count << "\n";
     }
     return matched;
+}
+
+bool run_deterministic_case()
+{
+    const uint32_t num_p = 29;
+    const uint32_t num_n = 31;
+    const uint32_t vec_length = 64;
+    Bucket bucket = make_bucket(num_p, num_n, vec_length, 42);
+    Scores scores;
+    collect_scores(bucket, vec_length, scores);
+    const int32_t goal_norm = threshold_for(scores.two_red, ThresholdMode::Selective);
+    const int32_t three_red_goal = threshold_for(scores.three_red, ThresholdMode::Selective);
+    const int32_t center_norm = goal_norm - three_red_goal;
+    const std::vector<bgj_cuda_result_t> oracle =
+        deterministic_oracle(bucket, vec_length, goal_norm, center_norm, true);
+
+    std::vector<bgj_cuda_result_t> gpu(std::max<uint32_t>(16u, (uint32_t)oracle.size() + 16u));
+    uint32_t result_count = 0;
+    int overflow = 0;
+    setenv("BGJ_CUDA_DETERMINISTIC_RESULTS", "1", 1);
+    const int ok = bgj_cuda_search_bucket_raw(bucket.p_vecs.data(), bucket.n_vecs.data(),
+                                              bucket.p_ids.data(), bucket.n_ids.data(),
+                                              bucket.p_norm.data(), bucket.n_norm.data(),
+                                              bucket.p_dot.data(), bucket.n_dot.data(),
+                                              num_p, num_n, vec_length, goal_norm, center_norm,
+                                              1, gpu.data(), (uint32_t)gpu.size(),
+                                              &result_count, &overflow);
+    unsetenv("BGJ_CUDA_DETERMINISTIC_RESULTS");
+    if (!ok) {
+        std::cerr << "deterministic-order: CUDA call failed: " << bgj_cuda_raw_last_error() << "\n";
+        return false;
+    }
+    if (overflow || result_count != oracle.size()) {
+        std::cerr << "deterministic-order: count mismatch, overflow=" << overflow
+                  << " gpu=" << result_count << " oracle=" << oracle.size() << "\n";
+        return false;
+    }
+    const uint32_t ordered_count = result_count;
+    gpu.resize(result_count);
+    for (size_t i = 0; i < oracle.size(); i++) {
+        if (!result_equal(gpu[i], oracle[i])) {
+            std::cerr << "deterministic-order: first mismatch at " << i
+                      << " gpu=(" << gpu[i].type << "," << gpu[i].x << "," << gpu[i].y << ")"
+                      << " oracle=(" << oracle[i].type << "," << oracle[i].x << "," << oracle[i].y << ")\n";
+            return false;
+        }
+    }
+    bgj_cuda_result_t retained;
+    result_count = 0;
+    overflow = 0;
+    setenv("BGJ_CUDA_DETERMINISTIC_RESULTS", "1", 1);
+    const int overflow_ok = bgj_cuda_search_bucket_raw(bucket.p_vecs.data(), bucket.n_vecs.data(),
+                                                       bucket.p_ids.data(), bucket.n_ids.data(),
+                                                       bucket.p_norm.data(), bucket.n_norm.data(),
+                                                       bucket.p_dot.data(), bucket.n_dot.data(),
+                                                       num_p, num_n, vec_length, goal_norm, center_norm,
+                                                       1, &retained, 1, &result_count, &overflow);
+    unsetenv("BGJ_CUDA_DETERMINISTIC_RESULTS");
+    if (!overflow_ok || !overflow || result_count != 1) {
+        std::cerr << "deterministic-order: overflow check failed, ok=" << overflow_ok
+                  << " overflow=" << overflow << " count=" << result_count << "\n";
+        return false;
+    }
+    std::cout << "deterministic-order: ok, results=" << ordered_count << "\n";
+    return true;
 }
 
 bool run_overflow_case()
@@ -549,6 +682,7 @@ int main()
     ok = run_case("np-no-dp-len1", 9, 7, 1, false, 6, ThresholdMode::Selective) && ok;
     ok = run_case("mixed-32", 17, 19, 32, true, 7, ThresholdMode::Selective) && ok;
     ok = run_case("mixed-96", 6, 5, 96, true, 8, ThresholdMode::Selective) && ok;
+    ok = run_deterministic_case() && ok;
     ok = run_case("tensor-np-160", 48, 52, 160, true, 9, ThresholdMode::Selective) && ok;
     ok = run_case("tensor-np-224", 33, 35, 224, true, 10, ThresholdMode::Selective) && ok;
     setenv("BGJ_CUDA_TENSOR_NP_MIN_TILES", "1", 1);

@@ -132,7 +132,11 @@ continues, matching G6K-GPU-Tensor's bounded queue behavior; set
 records are consumed in device result order by default, matching G6K's queue
 path and avoiding a full host-side sort of dense result buffers; set
 `BGJ_CUDA_SORT_RESULTS=1` to restore the older CPU-order approximation for
-debugging.
+debugging. `BGJ_CUDA_DETERMINISTIC_RESULTS=1` enables an experimental two-pass
+GPU result emitter that writes records in deterministic phase/rank order
+without a host sort. It is currently a profiling path rather than a default:
+the scalar A100 implementation avoids the CPU sort but also skips the Tensor
+Core search kernels.
 An experimental CUDA candidate materializer is available with
 `BGJ_CUDA_MATERIALIZE=1`. It chunks solution records, uses signed INT8 cuBLAS
 GEMM for coefficient reconstruction, and defaults to the exact CUDA

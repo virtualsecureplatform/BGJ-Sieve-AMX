@@ -22,6 +22,7 @@ static char bgj_cuda_error[512] = "no CUDA error";
 #define BGJ_CUDA_TENSOR_NP_MULTI_N_TILES_PER_WARP 4u
 #define BGJ_CUDA_TENSOR_NP_MULTI_N_TILES (BGJ_CUDA_TENSOR_WARPS_PER_BLOCK * BGJ_CUDA_TENSOR_NP_MULTI_N_TILES_PER_WARP)
 #define BGJ_CUDA_BUCKET_DET_THREADS 256u
+#define BGJ_CUDA_SEARCH_DET_THREADS 256u
 
 typedef wmma::fragment<wmma::matrix_a, 16, 16, 16, signed char, wmma::row_major> bgj_cuda_i8_a_frag_t;
 typedef wmma::fragment<wmma::matrix_b, 16, 16, 16, signed char, wmma::col_major> bgj_cuda_i8_b_frag_t;
@@ -55,6 +56,8 @@ struct bgj_cuda_raw_scratch_t {
     int32_t *n_dot;
     bgj_cuda_result_t *results;
     uint32_t *result_count;
+    uint32_t *det_counts;
+    uint32_t *det_offsets;
     int *overflow;
     cudaStream_t stream;
 
@@ -72,6 +75,8 @@ struct bgj_cuda_raw_scratch_t {
     size_t n_dot_capacity;
     size_t result_capacity;
     size_t result_count_capacity;
+    size_t det_count_capacity;
+    size_t det_offset_capacity;
     size_t overflow_capacity;
     int stream_ready;
 
@@ -90,6 +95,8 @@ struct bgj_cuda_raw_scratch_t {
           n_dot(NULL),
           results(NULL),
           result_count(NULL),
+          det_counts(NULL),
+          det_offsets(NULL),
           overflow(NULL),
           stream(NULL),
           p_vec_capacity(0),
@@ -106,6 +113,8 @@ struct bgj_cuda_raw_scratch_t {
           n_dot_capacity(0),
           result_capacity(0),
           result_count_capacity(0),
+          det_count_capacity(0),
+          det_offset_capacity(0),
           overflow_capacity(0),
           stream_ready(0)
     {
@@ -128,6 +137,8 @@ struct bgj_cuda_raw_scratch_t {
         cudaFree(n_dot);
         cudaFree(results);
         cudaFree(result_count);
+        cudaFree(det_counts);
+        cudaFree(det_offsets);
         cudaFree(overflow);
         if (stream_ready) cudaStreamDestroy(stream);
     }
@@ -1185,6 +1196,529 @@ __global__ void bgj_cuda_search_bucket_kernel(const int8_t *p_vecs,
                                      BGJ_CUDA_SOL_AA, n_ids[i], n_ids[j]);
             }
         }
+    }
+}
+
+__device__ __forceinline__ uint32_t bgj_cuda_search_det_phase(const uint64_t slot,
+                                                              const uint64_t phase1_base,
+                                                              const uint64_t phase2_base,
+                                                              const uint64_t phase3_base,
+                                                              const uint64_t phase4_base,
+                                                              const uint64_t phase5_base,
+                                                              const uint64_t phase6_base,
+                                                              uint64_t *segment)
+{
+    if (slot < phase1_base) {
+        *segment = slot;
+        return 0u;
+    }
+    if (slot < phase2_base) {
+        *segment = slot - phase1_base;
+        return 1u;
+    }
+    if (slot < phase3_base) {
+        *segment = slot - phase2_base;
+        return 2u;
+    }
+    if (slot < phase4_base) {
+        *segment = slot - phase3_base;
+        return 3u;
+    }
+    if (slot < phase5_base) {
+        *segment = slot - phase4_base;
+        return 4u;
+    }
+    if (slot < phase6_base) {
+        *segment = slot - phase5_base;
+        return 5u;
+    }
+    *segment = 0;
+    return 6u;
+}
+
+__device__ __forceinline__ int bgj_cuda_search_det_candidate(const int8_t *p_vecs,
+                                                             const int8_t *n_vecs,
+                                                             const uint32_t *p_ids,
+                                                             const uint32_t *n_ids,
+                                                             const int32_t *p_norm,
+                                                             const int32_t *n_norm,
+                                                             const int32_t *p_dot,
+                                                             const int32_t *n_dot,
+                                                             uint32_t num_p,
+                                                             uint32_t num_n,
+                                                             uint32_t vec_length,
+                                                             int32_t goal_norm,
+                                                             int32_t center_goal_norm,
+                                                             uint32_t phase,
+                                                             uint64_t work,
+                                                             bgj_cuda_result_t *result)
+{
+    if (phase == 0u || phase == 1u) {
+        if (num_n == 0) return 0;
+        const uint32_t p = (uint32_t)(work / num_n);
+        const uint32_t n = (uint32_t)(work - (uint64_t)p * num_n);
+        if (p >= num_p || n >= num_n) return 0;
+        const int32_t dp = bgj_cuda_dot_i8(p_vecs + (uint64_t)p * vec_length,
+                                           n_vecs + (uint64_t)n * vec_length,
+                                           vec_length);
+        if (phase == 0u) {
+            if (p_norm[p] + n_norm[n] + dp >= goal_norm) return 0;
+            result->type = BGJ_CUDA_SOL_A;
+        } else {
+            if (p_dot[p] + n_dot[n] - dp >= center_goal_norm) return 0;
+            result->type = BGJ_CUDA_SOL_SA;
+        }
+        result->x = p_ids[p];
+        result->y = n_ids[n];
+        return 1;
+    }
+
+    if (phase == 2u || phase == 3u) {
+        if (num_p == 0) return 0;
+        const uint32_t i = (uint32_t)(work / num_p);
+        const uint32_t j = (uint32_t)(work - (uint64_t)i * num_p);
+        if (i >= num_p || j >= num_p || j <= i) return 0;
+        const int32_t dp = bgj_cuda_dot_i8(p_vecs + (uint64_t)i * vec_length,
+                                           p_vecs + (uint64_t)j * vec_length,
+                                           vec_length);
+        if (phase == 2u) {
+            if (p_norm[i] + p_norm[j] - dp >= goal_norm) return 0;
+            result->type = BGJ_CUDA_SOL_S;
+        } else {
+            if (p_dot[i] + p_dot[j] + dp >= center_goal_norm) return 0;
+            result->type = BGJ_CUDA_SOL_SS;
+        }
+        result->x = p_ids[i];
+        result->y = p_ids[j];
+        return 1;
+    }
+
+    if (phase == 4u || phase == 5u) {
+        if (num_n == 0) return 0;
+        const uint32_t i = (uint32_t)(work / num_n);
+        const uint32_t j = (uint32_t)(work - (uint64_t)i * num_n);
+        if (i >= num_n || j >= num_n || j <= i) return 0;
+        const int32_t dp = bgj_cuda_dot_i8(n_vecs + (uint64_t)i * vec_length,
+                                           n_vecs + (uint64_t)j * vec_length,
+                                           vec_length);
+        if (phase == 4u) {
+            if (n_norm[i] + n_norm[j] - dp >= goal_norm) return 0;
+            result->type = BGJ_CUDA_SOL_S;
+        } else {
+            if (n_dot[i] + n_dot[j] + dp >= center_goal_norm) return 0;
+            result->type = BGJ_CUDA_SOL_AA;
+        }
+        result->x = n_ids[i];
+        result->y = n_ids[j];
+        return 1;
+    }
+
+    return 0;
+}
+
+__global__ void bgj_cuda_search_det_count_kernel(const int8_t *p_vecs,
+                                                 const int8_t *n_vecs,
+                                                 const uint32_t *p_ids,
+                                                 const uint32_t *n_ids,
+                                                 const int32_t *p_norm,
+                                                 const int32_t *n_norm,
+                                                 const int32_t *p_dot,
+                                                 const int32_t *n_dot,
+                                                 uint32_t num_p,
+                                                 uint32_t num_n,
+                                                 uint32_t vec_length,
+                                                 int32_t goal_norm,
+                                                 int32_t center_goal_norm,
+                                                 uint64_t phase1_base,
+                                                 uint64_t phase2_base,
+                                                 uint64_t phase3_base,
+                                                 uint64_t phase4_base,
+                                                 uint64_t phase5_base,
+                                                 uint64_t phase6_base,
+                                                 uint64_t count_slots,
+                                                 uint32_t *counts)
+{
+    for (uint64_t slot = blockIdx.x; slot < count_slots; slot += gridDim.x) {
+        uint64_t segment;
+        const uint32_t phase =
+            bgj_cuda_search_det_phase(slot,
+                                      phase1_base,
+                                      phase2_base,
+                                      phase3_base,
+                                      phase4_base,
+                                      phase5_base,
+                                      phase6_base,
+                                      &segment);
+        const uint64_t work = segment * BGJ_CUDA_SEARCH_DET_THREADS + threadIdx.x;
+        bgj_cuda_result_t result;
+        const uint32_t pass =
+            bgj_cuda_search_det_candidate(p_vecs,
+                                          n_vecs,
+                                          p_ids,
+                                          n_ids,
+                                          p_norm,
+                                          n_norm,
+                                          p_dot,
+                                          n_dot,
+                                          num_p,
+                                          num_n,
+                                          vec_length,
+                                          goal_norm,
+                                          center_goal_norm,
+                                          phase,
+                                          work,
+                                          &result) ? 1u : 0u;
+
+        __shared__ uint32_t scan[BGJ_CUDA_SEARCH_DET_THREADS];
+        scan[threadIdx.x] = pass;
+        __syncthreads();
+
+        for (uint32_t step = 1u; step < BGJ_CUDA_SEARCH_DET_THREADS; step <<= 1u) {
+            const uint32_t add = threadIdx.x >= step ? scan[threadIdx.x - step] : 0u;
+            __syncthreads();
+            scan[threadIdx.x] += add;
+            __syncthreads();
+        }
+
+        if (threadIdx.x == BGJ_CUDA_SEARCH_DET_THREADS - 1u) {
+            counts[slot] = scan[threadIdx.x];
+        }
+        __syncthreads();
+    }
+}
+
+__global__ void bgj_cuda_search_det_fill_kernel(const int8_t *p_vecs,
+                                                const int8_t *n_vecs,
+                                                const uint32_t *p_ids,
+                                                const uint32_t *n_ids,
+                                                const int32_t *p_norm,
+                                                const int32_t *n_norm,
+                                                const int32_t *p_dot,
+                                                const int32_t *n_dot,
+                                                uint32_t num_p,
+                                                uint32_t num_n,
+                                                uint32_t vec_length,
+                                                int32_t goal_norm,
+                                                int32_t center_goal_norm,
+                                                uint64_t phase1_base,
+                                                uint64_t phase2_base,
+                                                uint64_t phase3_base,
+                                                uint64_t phase4_base,
+                                                uint64_t phase5_base,
+                                                uint64_t phase6_base,
+                                                uint64_t count_slots,
+                                                const uint32_t *offsets,
+                                                bgj_cuda_result_t *results,
+                                                uint32_t result_capacity,
+                                                int *overflow)
+{
+    for (uint64_t slot = blockIdx.x; slot < count_slots; slot += gridDim.x) {
+        uint64_t segment;
+        const uint32_t phase =
+            bgj_cuda_search_det_phase(slot,
+                                      phase1_base,
+                                      phase2_base,
+                                      phase3_base,
+                                      phase4_base,
+                                      phase5_base,
+                                      phase6_base,
+                                      &segment);
+        const uint64_t work = segment * BGJ_CUDA_SEARCH_DET_THREADS + threadIdx.x;
+        bgj_cuda_result_t result;
+        const uint32_t pass =
+            bgj_cuda_search_det_candidate(p_vecs,
+                                          n_vecs,
+                                          p_ids,
+                                          n_ids,
+                                          p_norm,
+                                          n_norm,
+                                          p_dot,
+                                          n_dot,
+                                          num_p,
+                                          num_n,
+                                          vec_length,
+                                          goal_norm,
+                                          center_goal_norm,
+                                          phase,
+                                          work,
+                                          &result) ? 1u : 0u;
+
+        __shared__ uint32_t scan[BGJ_CUDA_SEARCH_DET_THREADS];
+        scan[threadIdx.x] = pass;
+        __syncthreads();
+
+        for (uint32_t step = 1u; step < BGJ_CUDA_SEARCH_DET_THREADS; step <<= 1u) {
+            const uint32_t add = threadIdx.x >= step ? scan[threadIdx.x - step] : 0u;
+            __syncthreads();
+            scan[threadIdx.x] += add;
+            __syncthreads();
+        }
+
+        if (pass) {
+            const uint32_t out = offsets[slot] + scan[threadIdx.x] - 1u;
+            if (out < result_capacity) {
+                results[out] = result;
+            } else {
+                *overflow = 1;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+__device__ __forceinline__ uint32_t bgj_cuda_search_det_pair_space(uint64_t slot,
+                                                                   uint64_t np_segments,
+                                                                   uint64_t pp_segments,
+                                                                   uint64_t *segment)
+{
+    if (slot < np_segments) {
+        *segment = slot;
+        return 0u;
+    }
+    slot -= np_segments;
+    if (slot < pp_segments) {
+        *segment = slot;
+        return 1u;
+    }
+    *segment = slot - pp_segments;
+    return 2u;
+}
+
+__global__ void bgj_cuda_search_det_pair_count_kernel(const int8_t *p_vecs,
+                                                      const int8_t *n_vecs,
+                                                      const int32_t *p_norm,
+                                                      const int32_t *n_norm,
+                                                      const int32_t *p_dot,
+                                                      const int32_t *n_dot,
+                                                      uint32_t num_p,
+                                                      uint32_t num_n,
+                                                      uint32_t vec_length,
+                                                      int32_t goal_norm,
+                                                      int32_t center_goal_norm,
+                                                      int record_dp,
+                                                      uint64_t np_segments,
+                                                      uint64_t pp_segments,
+                                                      uint64_t pair_slots,
+                                                      uint64_t phase1_base,
+                                                      uint64_t phase2_base,
+                                                      uint64_t phase3_base,
+                                                      uint64_t phase4_base,
+                                                      uint64_t phase5_base,
+                                                      uint32_t *counts)
+{
+    for (uint64_t slot = blockIdx.x; slot < pair_slots; slot += gridDim.x) {
+        uint64_t segment;
+        const uint32_t space = bgj_cuda_search_det_pair_space(slot, np_segments, pp_segments, &segment);
+        const uint64_t work = segment * BGJ_CUDA_SEARCH_DET_THREADS + threadIdx.x;
+        uint32_t pass0 = 0;
+        uint32_t pass1 = 0;
+
+        if (space == 0u) {
+            if (num_n) {
+                const uint32_t p = (uint32_t)(work / num_n);
+                const uint32_t n = (uint32_t)(work - (uint64_t)p * num_n);
+                if (p < num_p && n < num_n) {
+                    const int32_t dp = bgj_cuda_dot_i8(p_vecs + (uint64_t)p * vec_length,
+                                                       n_vecs + (uint64_t)n * vec_length,
+                                                       vec_length);
+                    pass0 = p_norm[p] + n_norm[n] + dp < goal_norm ? 1u : 0u;
+                    pass1 = record_dp && p_dot[p] + n_dot[n] - dp < center_goal_norm ? 1u : 0u;
+                }
+            }
+        } else if (space == 1u) {
+            if (num_p) {
+                const uint32_t i = (uint32_t)(work / num_p);
+                const uint32_t j = (uint32_t)(work - (uint64_t)i * num_p);
+                if (i < num_p && j < num_p && j > i) {
+                    const int32_t dp = bgj_cuda_dot_i8(p_vecs + (uint64_t)i * vec_length,
+                                                       p_vecs + (uint64_t)j * vec_length,
+                                                       vec_length);
+                    pass0 = p_norm[i] + p_norm[j] - dp < goal_norm ? 1u : 0u;
+                    pass1 = record_dp && p_dot[i] + p_dot[j] + dp < center_goal_norm ? 1u : 0u;
+                }
+            }
+        } else {
+            if (num_n) {
+                const uint32_t i = (uint32_t)(work / num_n);
+                const uint32_t j = (uint32_t)(work - (uint64_t)i * num_n);
+                if (i < num_n && j < num_n && j > i) {
+                    const int32_t dp = bgj_cuda_dot_i8(n_vecs + (uint64_t)i * vec_length,
+                                                       n_vecs + (uint64_t)j * vec_length,
+                                                       vec_length);
+                    pass0 = n_norm[i] + n_norm[j] - dp < goal_norm ? 1u : 0u;
+                    pass1 = record_dp && n_dot[i] + n_dot[j] + dp < center_goal_norm ? 1u : 0u;
+                }
+            }
+        }
+
+        __shared__ uint32_t scan0[BGJ_CUDA_SEARCH_DET_THREADS];
+        __shared__ uint32_t scan1[BGJ_CUDA_SEARCH_DET_THREADS];
+        scan0[threadIdx.x] = pass0;
+        scan1[threadIdx.x] = pass1;
+        __syncthreads();
+
+        for (uint32_t step = 1u; step < BGJ_CUDA_SEARCH_DET_THREADS; step <<= 1u) {
+            const uint32_t add0 = threadIdx.x >= step ? scan0[threadIdx.x - step] : 0u;
+            const uint32_t add1 = threadIdx.x >= step ? scan1[threadIdx.x - step] : 0u;
+            __syncthreads();
+            scan0[threadIdx.x] += add0;
+            scan1[threadIdx.x] += add1;
+            __syncthreads();
+        }
+
+        if (threadIdx.x == BGJ_CUDA_SEARCH_DET_THREADS - 1u) {
+            if (space == 0u) {
+                counts[segment] = scan0[threadIdx.x];
+                if (record_dp) counts[phase1_base + segment] = scan1[threadIdx.x];
+            } else if (space == 1u) {
+                counts[phase2_base + segment] = scan0[threadIdx.x];
+                if (record_dp) counts[phase3_base + segment] = scan1[threadIdx.x];
+            } else {
+                counts[phase4_base + segment] = scan0[threadIdx.x];
+                if (record_dp) counts[phase5_base + segment] = scan1[threadIdx.x];
+            }
+        }
+        __syncthreads();
+    }
+}
+
+__global__ void bgj_cuda_search_det_pair_fill_kernel(const int8_t *p_vecs,
+                                                     const int8_t *n_vecs,
+                                                     const uint32_t *p_ids,
+                                                     const uint32_t *n_ids,
+                                                     const int32_t *p_norm,
+                                                     const int32_t *n_norm,
+                                                     const int32_t *p_dot,
+                                                     const int32_t *n_dot,
+                                                     uint32_t num_p,
+                                                     uint32_t num_n,
+                                                     uint32_t vec_length,
+                                                     int32_t goal_norm,
+                                                     int32_t center_goal_norm,
+                                                     int record_dp,
+                                                     uint64_t np_segments,
+                                                     uint64_t pp_segments,
+                                                     uint64_t pair_slots,
+                                                     uint64_t phase1_base,
+                                                     uint64_t phase2_base,
+                                                     uint64_t phase3_base,
+                                                     uint64_t phase4_base,
+                                                     uint64_t phase5_base,
+                                                     const uint32_t *offsets,
+                                                     bgj_cuda_result_t *results,
+                                                     uint32_t result_capacity,
+                                                     int *overflow)
+{
+    for (uint64_t slot = blockIdx.x; slot < pair_slots; slot += gridDim.x) {
+        uint64_t segment;
+        const uint32_t space = bgj_cuda_search_det_pair_space(slot, np_segments, pp_segments, &segment);
+        const uint64_t work = segment * BGJ_CUDA_SEARCH_DET_THREADS + threadIdx.x;
+        uint32_t pass0 = 0;
+        uint32_t pass1 = 0;
+        bgj_cuda_result_t result0;
+        bgj_cuda_result_t result1;
+
+        if (space == 0u) {
+            if (num_n) {
+                const uint32_t p = (uint32_t)(work / num_n);
+                const uint32_t n = (uint32_t)(work - (uint64_t)p * num_n);
+                if (p < num_p && n < num_n) {
+                    const int32_t dp = bgj_cuda_dot_i8(p_vecs + (uint64_t)p * vec_length,
+                                                       n_vecs + (uint64_t)n * vec_length,
+                                                       vec_length);
+                    pass0 = p_norm[p] + n_norm[n] + dp < goal_norm ? 1u : 0u;
+                    pass1 = record_dp && p_dot[p] + n_dot[n] - dp < center_goal_norm ? 1u : 0u;
+                    result0.type = BGJ_CUDA_SOL_A;
+                    result0.x = p_ids[p];
+                    result0.y = n_ids[n];
+                    result1.type = BGJ_CUDA_SOL_SA;
+                    result1.x = p_ids[p];
+                    result1.y = n_ids[n];
+                }
+            }
+        } else if (space == 1u) {
+            if (num_p) {
+                const uint32_t i = (uint32_t)(work / num_p);
+                const uint32_t j = (uint32_t)(work - (uint64_t)i * num_p);
+                if (i < num_p && j < num_p && j > i) {
+                    const int32_t dp = bgj_cuda_dot_i8(p_vecs + (uint64_t)i * vec_length,
+                                                       p_vecs + (uint64_t)j * vec_length,
+                                                       vec_length);
+                    pass0 = p_norm[i] + p_norm[j] - dp < goal_norm ? 1u : 0u;
+                    pass1 = record_dp && p_dot[i] + p_dot[j] + dp < center_goal_norm ? 1u : 0u;
+                    result0.type = BGJ_CUDA_SOL_S;
+                    result0.x = p_ids[i];
+                    result0.y = p_ids[j];
+                    result1.type = BGJ_CUDA_SOL_SS;
+                    result1.x = p_ids[i];
+                    result1.y = p_ids[j];
+                }
+            }
+        } else {
+            if (num_n) {
+                const uint32_t i = (uint32_t)(work / num_n);
+                const uint32_t j = (uint32_t)(work - (uint64_t)i * num_n);
+                if (i < num_n && j < num_n && j > i) {
+                    const int32_t dp = bgj_cuda_dot_i8(n_vecs + (uint64_t)i * vec_length,
+                                                       n_vecs + (uint64_t)j * vec_length,
+                                                       vec_length);
+                    pass0 = n_norm[i] + n_norm[j] - dp < goal_norm ? 1u : 0u;
+                    pass1 = record_dp && n_dot[i] + n_dot[j] + dp < center_goal_norm ? 1u : 0u;
+                    result0.type = BGJ_CUDA_SOL_S;
+                    result0.x = n_ids[i];
+                    result0.y = n_ids[j];
+                    result1.type = BGJ_CUDA_SOL_AA;
+                    result1.x = n_ids[i];
+                    result1.y = n_ids[j];
+                }
+            }
+        }
+
+        __shared__ uint32_t scan0[BGJ_CUDA_SEARCH_DET_THREADS];
+        __shared__ uint32_t scan1[BGJ_CUDA_SEARCH_DET_THREADS];
+        scan0[threadIdx.x] = pass0;
+        scan1[threadIdx.x] = pass1;
+        __syncthreads();
+
+        for (uint32_t step = 1u; step < BGJ_CUDA_SEARCH_DET_THREADS; step <<= 1u) {
+            const uint32_t add0 = threadIdx.x >= step ? scan0[threadIdx.x - step] : 0u;
+            const uint32_t add1 = threadIdx.x >= step ? scan1[threadIdx.x - step] : 0u;
+            __syncthreads();
+            scan0[threadIdx.x] += add0;
+            scan1[threadIdx.x] += add1;
+            __syncthreads();
+        }
+
+        uint64_t offset0;
+        uint64_t offset1;
+        if (space == 0u) {
+            offset0 = segment;
+            offset1 = phase1_base + segment;
+        } else if (space == 1u) {
+            offset0 = phase2_base + segment;
+            offset1 = phase3_base + segment;
+        } else {
+            offset0 = phase4_base + segment;
+            offset1 = phase5_base + segment;
+        }
+
+        if (pass0) {
+            const uint64_t out = (uint64_t)offsets[offset0] + (uint64_t)scan0[threadIdx.x] - 1ull;
+            if (out < (uint64_t)result_capacity) {
+                results[(uint32_t)out] = result0;
+            } else {
+                *overflow = 1;
+            }
+        }
+        if (pass1) {
+            const uint64_t out = (uint64_t)offsets[offset1] + (uint64_t)scan1[threadIdx.x] - 1ull;
+            if (out < (uint64_t)result_capacity) {
+                results[(uint32_t)out] = result1;
+            } else {
+                *overflow = 1;
+            }
+        }
+        __syncthreads();
     }
 }
 
@@ -3173,6 +3707,12 @@ static int bgj_cuda_tensor_requested()
     return 1;
 }
 
+static int bgj_cuda_deterministic_results_requested()
+{
+    const char *env = getenv("BGJ_CUDA_DETERMINISTIC_RESULTS");
+    return env && env[0] && env[0] != '0';
+}
+
 static int bgj_cuda_tensor_same_requested()
 {
     const char *env = getenv("BGJ_CUDA_TENSOR_SAME");
@@ -3659,6 +4199,8 @@ static int bgj_cuda_search_bucket_raw_submit(bgj_cuda_raw_scratch_t *scratch,
     uint32_t tensor_same_min_tiles = 0;
     const int use_pool = pool_vecs_host != NULL;
     int8_t *pool_vecs_device = NULL;
+    uint32_t *h_det_counts = NULL;
+    uint32_t *h_det_offsets = NULL;
 
     if (result_capacity == 0) {
         set_plain_error("result capacity is zero");
@@ -3746,6 +4288,155 @@ static int bgj_cuda_search_bucket_raw_submit(bgj_cuda_raw_scratch_t *scratch,
     CUDA_ENSURE(scratch->overflow, scratch->overflow_capacity, sizeof(int));
     CUDA_TRY(cudaMemsetAsync(scratch->result_count, 0, sizeof(uint32_t), stream));
     CUDA_TRY(cudaMemsetAsync(scratch->overflow, 0, sizeof(int), stream));
+
+    if (bgj_cuda_deterministic_results_requested()) {
+        const uint64_t np_pairs = (uint64_t)num_p * (uint64_t)num_n;
+        const uint64_t pp_pairs = num_p > 1 ? (uint64_t)num_p * (uint64_t)num_p : 0ull;
+        const uint64_t nn_pairs = num_n > 1 ? (uint64_t)num_n * (uint64_t)num_n : 0ull;
+        const uint64_t np_segments =
+            (np_pairs + BGJ_CUDA_SEARCH_DET_THREADS - 1u) / BGJ_CUDA_SEARCH_DET_THREADS;
+        const uint64_t pp_segments =
+            (pp_pairs + BGJ_CUDA_SEARCH_DET_THREADS - 1u) / BGJ_CUDA_SEARCH_DET_THREADS;
+        const uint64_t nn_segments =
+            (nn_pairs + BGJ_CUDA_SEARCH_DET_THREADS - 1u) / BGJ_CUDA_SEARCH_DET_THREADS;
+        const uint64_t phase1_base = np_segments;
+        const uint64_t phase2_base = phase1_base + (record_dp ? np_segments : 0ull);
+        const uint64_t phase3_base = phase2_base + pp_segments;
+        const uint64_t phase4_base = phase3_base + (record_dp ? pp_segments : 0ull);
+        const uint64_t phase5_base = phase4_base + nn_segments;
+        const uint64_t phase6_base = phase5_base + (record_dp ? nn_segments : 0ull);
+        const uint64_t count_slots = phase6_base;
+        const uint64_t pair_slots = np_segments + pp_segments + nn_segments;
+        const int32_t center_goal_norm = goal_norm - center_norm;
+
+        if (count_slots == 0) {
+            *submitted_result_count = 0;
+            *submitted_overflow = 0;
+            set_plain_error("no CUDA error");
+            return 1;
+        }
+        if (count_slots > (uint64_t)((size_t)-1 / sizeof(uint32_t))) {
+            set_plain_error("deterministic result count buffer is too large");
+            goto fail;
+        }
+
+        const size_t count_bytes = (size_t)count_slots * sizeof(uint32_t);
+        CUDA_ENSURE(scratch->det_counts, scratch->det_count_capacity, count_bytes);
+        CUDA_ENSURE(scratch->det_offsets, scratch->det_offset_capacity, count_bytes);
+
+        {
+            uint32_t grid = pair_slots > 65535ull ? 65535u : (uint32_t)pair_slots;
+            if (grid == 0) grid = 1;
+            bgj_cuda_search_det_pair_count_kernel<<<grid,
+                                                     BGJ_CUDA_SEARCH_DET_THREADS,
+                                                     0,
+                                                     stream>>>(scratch->p_vecs,
+                                                               scratch->n_vecs,
+                                                               scratch->p_norm,
+                                                               scratch->n_norm,
+                                                               scratch->p_dot,
+                                                               scratch->n_dot,
+                                                               num_p,
+                                                               num_n,
+                                                               vec_length,
+                                                               goal_norm,
+                                                               center_goal_norm,
+                                                               record_dp,
+                                                               np_segments,
+                                                               pp_segments,
+                                                               pair_slots,
+                                                               phase1_base,
+                                                               phase2_base,
+                                                               phase3_base,
+                                                               phase4_base,
+                                                               phase5_base,
+                                                               scratch->det_counts);
+            CUDA_TRY(cudaGetLastError());
+        }
+
+        h_det_counts = (uint32_t *)malloc(count_bytes);
+        h_det_offsets = (uint32_t *)malloc(count_bytes);
+        if (!h_det_counts || !h_det_offsets) {
+            set_plain_error("deterministic result host count allocation failed");
+            goto fail;
+        }
+
+        CUDA_TRY(cudaMemcpyAsync(h_det_counts,
+                                 scratch->det_counts,
+                                 count_bytes,
+                                 cudaMemcpyDeviceToHost,
+                                 stream));
+        CUDA_TRY(cudaStreamSynchronize(stream));
+
+        uint64_t total_results = 0;
+        for (size_t i = 0; i < (size_t)count_slots; i++) {
+            h_det_offsets[i] = total_results > 0xffffffffull ? 0xffffffffu : (uint32_t)total_results;
+            total_results += (uint64_t)h_det_counts[i];
+        }
+
+        CUDA_TRY(cudaMemcpyAsync(scratch->det_offsets,
+                                 h_det_offsets,
+                                 count_bytes,
+                                 cudaMemcpyHostToDevice,
+                                 stream));
+        CUDA_TRY(cudaMemsetAsync(scratch->overflow, 0, sizeof(int), stream));
+
+        if (total_results) {
+            uint32_t grid = pair_slots > 65535ull ? 65535u : (uint32_t)pair_slots;
+            if (grid == 0) grid = 1;
+            bgj_cuda_search_det_pair_fill_kernel<<<grid,
+                                                    BGJ_CUDA_SEARCH_DET_THREADS,
+                                                    0,
+                                                    stream>>>(scratch->p_vecs,
+                                                              scratch->n_vecs,
+                                                              scratch->p_ids,
+                                                              scratch->n_ids,
+                                                              scratch->p_norm,
+                                                              scratch->n_norm,
+                                                              scratch->p_dot,
+                                                              scratch->n_dot,
+                                                              num_p,
+                                                              num_n,
+                                                              vec_length,
+                                                              goal_norm,
+                                                              center_goal_norm,
+                                                              record_dp,
+                                                              np_segments,
+                                                              pp_segments,
+                                                              pair_slots,
+                                                              phase1_base,
+                                                              phase2_base,
+                                                              phase3_base,
+                                                              phase4_base,
+                                                              phase5_base,
+                                                              scratch->det_offsets,
+                                                              scratch->results,
+                                                              result_capacity,
+                                                              scratch->overflow);
+            CUDA_TRY(cudaGetLastError());
+        }
+
+        {
+            int device_overflow = 0;
+            CUDA_TRY(cudaMemcpyAsync(&device_overflow,
+                                     scratch->overflow,
+                                     sizeof(int),
+                                     cudaMemcpyDeviceToHost,
+                                     stream));
+            CUDA_TRY(cudaStreamSynchronize(stream));
+            *submitted_result_count = total_results > 0xffffffffull ? 0xffffffffu : (uint32_t)total_results;
+            *submitted_overflow =
+                device_overflow || total_results > (uint64_t)result_capacity ||
+                total_results > 0xffffffffull;
+        }
+
+        free(h_det_counts);
+        free(h_det_offsets);
+        h_det_counts = NULL;
+        h_det_offsets = NULL;
+        set_plain_error("no CUDA error");
+        return 1;
+    }
 
     if (bgj_cuda_tensor_requested() &&
         bgj_cuda_tensor_capable() &&
@@ -4336,6 +5027,8 @@ static int bgj_cuda_search_bucket_raw_submit(bgj_cuda_raw_scratch_t *scratch,
     return 1;
 
 fail:
+    free(h_det_counts);
+    free(h_det_offsets);
     return 0;
 }
 
