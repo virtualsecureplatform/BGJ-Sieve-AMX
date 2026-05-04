@@ -80,6 +80,24 @@ extern "C" int bgj_cuda_materialize_sol_list_raw(const int8_t *pool_vecs,
                                                   int8_t *dst_vec,
                                                   int32_t *dst_vnorm,
                                                   int32_t *dst_vsum);
+extern "C" int bgj_cuda_materialize_sol_list_staged_raw(const int8_t *pool_vecs,
+                                                         uint64_t pool_epoch,
+                                                         uint32_t pool_size,
+                                                         uint32_t vec_length,
+                                                         const bgj_cuda_materialize_desc_t *desc,
+                                                         uint32_t count,
+                                                         const uint8_t *b_dual,
+                                                         const float *b_local,
+                                                         uint32_t csd,
+                                                         int32_t dhalf,
+                                                         int32_t dshift,
+                                                         int32_t *dst_vnorm,
+                                                         int32_t *dst_vsum);
+extern "C" int bgj_cuda_materialize_copy_staged_vectors_raw(const uint32_t *indices,
+                                                             uint32_t count,
+                                                             uint32_t vec_length,
+                                                             int8_t *dst_vec);
+extern "C" void bgj_cuda_materialize_finish_staged_raw();
 extern "C" void bgj_cuda_materialize_last_profile(bgj_cuda_materialize_phase_profile_t *profile);
 
 #endif

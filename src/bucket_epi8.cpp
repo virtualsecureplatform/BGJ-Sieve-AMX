@@ -2574,6 +2574,13 @@ static int bgj_cuda_materialize_hybrid_requested()
     return env && env[0] && env[0] != '0';
 }
 
+static int bgj_cuda_materialize_staged_for_dim(long vec_length)
+{
+    const char *env = getenv("BGJ_CUDA_MATERIALIZE_STAGED");
+    if (env && env[0]) return env[0] != '0';
+    return vec_length >= 96;
+}
+
 static long bgj_cuda_materialize_hybrid_gpu_count(long total)
 {
     const char *count_env = getenv("BGJ_CUDA_MATERIALIZE_GPU_COUNT");
@@ -3169,6 +3176,163 @@ int Pool_epi8_t<nb>::_sol_list_to_vec_cuda(sol_list_epi8_t **sol_list, long num_
     }
     return 1;
 }
+
+template <uint32_t nb>
+int Pool_epi8_t<nb>::_sol_list_to_vec_cuda_staged(sol_list_epi8_t **sol_list, long num_sol_list, uint64_t *dst_vu, int32_t *dst_vnorm, int32_t *dst_vsum) {
+    if (!bgj_cuda_materialize_requested() || bgj_cuda_device_count() <= 0) {
+        return 0;
+    }
+    if (num_sol_list <= 0) return 1;
+
+    long num_total_sol = 0;
+    for (long thread = 0; thread < num_sol_list; thread++) {
+        num_total_sol += sol_list[thread]->num_sol();
+    }
+    if (num_total_sol == 0) return 1;
+    if (num_total_sol > 0xffffffffL ||
+        num_vec < 0 || num_vec > 0xffffffffL ||
+        vec_length <= 0 || vec_length > 0xffffffffL ||
+        CSD <= 0 || CSD > 0xffffffffL) {
+        return 0;
+    }
+
+    bgj_cuda_materialize_desc_t *desc =
+        (bgj_cuda_materialize_desc_t *) NEW_VEC(num_total_sol, sizeof(bgj_cuda_materialize_desc_t));
+    if (!desc) return 0;
+
+    const long flattened = _sol_list_to_desc(sol_list, num_sol_list, desc, dst_vu);
+    if (flattened != num_total_sol) {
+        FREE_VEC(desc);
+        return 0;
+    }
+
+    int ok = bgj_cuda_materialize_sol_list_staged_raw(vec,
+                                                       pool_epoch,
+                                                       (uint32_t)num_vec,
+                                                       (uint32_t)vec_length,
+                                                       desc,
+                                                       (uint32_t)num_total_sol,
+                                                       _b_dual,
+                                                       _b_local ? _b_local[0] : NULL,
+                                                       (uint32_t)CSD,
+                                                       _dhalf,
+                                                       _dshift,
+                                                       dst_vnorm,
+                                                       dst_vsum);
+    if (ok) {
+        const long verify_limit = bgj_cuda_materialize_verify_limit(num_total_sol);
+        if (verify_limit > 0) {
+            long windows[3][2] = {};
+            const int num_windows =
+                bgj_cuda_materialize_verify_windows(num_total_sol, verify_limit, windows);
+            const long cpu_threads = bgj_cpu_materialize_threads(num_sol_list);
+            const long norm_tolerance = bgj_cuda_materialize_verify_norm_tolerance();
+            for (int w = 0; w < num_windows && ok; w++) {
+                const long begin = windows[w][0];
+                const long end = windows[w][1];
+                const long count = end - begin;
+                if (count <= 0) continue;
+
+                uint32_t *indices = (uint32_t *)NEW_VEC(count, sizeof(uint32_t));
+                int8_t *gpu_vec = (int8_t *)NEW_VEC(count * vec_length, sizeof(int8_t));
+                int8_t *cpu_vec = (int8_t *)NEW_VEC(count * vec_length, sizeof(int8_t));
+                int32_t *cpu_vnorm = (int32_t *)NEW_VEC(count, sizeof(int32_t));
+                int32_t *cpu_vsum = (int32_t *)NEW_VEC(count, sizeof(int32_t));
+                if (!indices || !gpu_vec || !cpu_vec || !cpu_vnorm || !cpu_vsum) {
+                    ok = 0;
+                } else {
+                    for (long i = 0; i < count; i++) indices[i] = (uint32_t)(begin + i);
+                    if (!bgj_cuda_materialize_copy_staged_vectors_raw(indices,
+                                                                       (uint32_t)count,
+                                                                       (uint32_t)vec_length,
+                                                                       gpu_vec)) {
+                        ok = 0;
+                    } else if (!_desc_to_vec_cpu(desc + begin,
+                                                 count,
+                                                 cpu_threads,
+                                                 cpu_vec,
+                                                 cpu_vnorm,
+                                                 cpu_vsum)) {
+                        ok = 0;
+                    } else {
+                        for (long local = 0; local < count; local++) {
+                            const long global = begin + local;
+                            const int8_t *gpu_v = gpu_vec + local * vec_length;
+                            const int8_t *cpu_v = cpu_vec + local * vec_length;
+                            int first_diff = -1;
+                            if (memcmp(gpu_v, cpu_v, vec_length) != 0) {
+                                for (long j = 0; j < vec_length; j++) {
+                                    if (gpu_v[j] != cpu_v[j]) {
+                                        first_diff = (int)j;
+                                        break;
+                                    }
+                                }
+                            }
+                            const long norm_diff =
+                                labs((long)dst_vnorm[global] - (long)cpu_vnorm[local]);
+                            if (first_diff >= 0 ||
+                                norm_diff > norm_tolerance ||
+                                dst_vsum[global] != cpu_vsum[local]) {
+                                const bgj_cuda_materialize_desc_t d = desc[global];
+                                fprintf(stderr,
+                                        "[Error] CUDA staged materialization verifier mismatch: "
+                                        "total=%ld checked_limit=%ld window=[%ld,%ld) "
+                                        "index=%ld type=%u x=%u y=%u z=%u "
+                                        "pool_epoch=%llu num_vec=%ld vec_length=%ld CSD=%ld "
+                                        "gpu_norm=%d cpu_norm=%d gpu_sum=%d cpu_sum=%d",
+                                        num_total_sol,
+                                        verify_limit,
+                                        begin,
+                                        end,
+                                        global,
+                                        d.type,
+                                        d.x,
+                                        d.y,
+                                        d.z,
+                                        (unsigned long long)pool_epoch,
+                                        num_vec,
+                                        vec_length,
+                                        CSD,
+                                        dst_vnorm[global],
+                                        cpu_vnorm[local],
+                                        dst_vsum[global],
+                                        cpu_vsum[local]);
+                                if (first_diff >= 0) {
+                                    fprintf(stderr,
+                                            " first_vec_diff=%d gpu=%d cpu=%d",
+                                            first_diff,
+                                            (int)gpu_v[first_diff],
+                                            (int)cpu_v[first_diff]);
+                                }
+                                fprintf(stderr, "\n");
+                                ok = 0;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (indices) FREE_VEC((void *)indices);
+                if (gpu_vec) FREE_VEC((void *)gpu_vec);
+                if (cpu_vec) FREE_VEC((void *)cpu_vec);
+                if (cpu_vnorm) FREE_VEC((void *)cpu_vnorm);
+                if (cpu_vsum) FREE_VEC((void *)cpu_vsum);
+            }
+        }
+    }
+
+    FREE_VEC(desc);
+    if (!ok) {
+        bgj_cuda_materialize_finish_staged_raw();
+        static int warned = 0;
+        if (!warned) {
+            fprintf(stderr, "[Warning] CUDA staged materialization failed: %s. Falling back to CPU materialization.\n",
+                    bgj_cuda_last_error());
+            warned = 1;
+        }
+        return 0;
+    }
+    return 1;
+}
 #endif
 
 template <uint32_t nb>
@@ -3471,10 +3635,16 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
         nonempty_begin[i] = nonempty_end[i] - num_nonemptyy[i];
     }
 
-    int8_t *vec_to_insert = (int8_t *) NEW_VEC(num_total_sol * vec_length, sizeof(int8_t));
+    int8_t *vec_to_insert = NULL;
     uint64_t *vu_to_insert = (uint64_t *) NEW_VEC(num_total_sol, sizeof(uint64_t));
     int32_t *vnorm_to_insert = (int32_t *) NEW_VEC(num_total_sol, sizeof(int32_t));
     int32_t *vsum_to_insert = (int32_t *) NEW_VEC(num_total_sol, sizeof(int32_t));
+    uint32_t *staged_selected_indices = NULL;
+    uint32_t *staged_selected_pos = NULL;
+    int8_t *staged_selected_vec = NULL;
+    long staged_selected_count = 0;
+    int staged_materialized = 0;
+    double staged_cuda_time = 0.0;
     int materialized = 0;
     double materialize_total_time = 0.0;
     double materialize_gpu_time = 0.0;
@@ -3494,41 +3664,89 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
     uint64_t materialize_scalar_call = 0;
     uint64_t materialize_cuda_failed_call = 0;
     uint64_t materialize_cuda_phase_chunk = 0;
+    auto ensure_vec_to_insert = [&]() -> int {
+        if (vec_to_insert) return 1;
+        vec_to_insert = (int8_t *) NEW_VEC(num_total_sol * vec_length, sizeof(int8_t));
+        return vec_to_insert != NULL;
+    };
     const double materialize_start = bgj_bucket_wall_time();
     #if defined(HAVE_CUDA)
     if (bgj_cuda_search_requested()) {
         const int try_cuda_materialize = bgj_cuda_materialize_requested();
-        const double t0 = bgj_bucket_wall_time();
-        const int cuda_ok =
-            _sol_list_to_vec_cuda(sol_list,
-                                  num_sol_list,
-                                  vec_to_insert,
-                                  vu_to_insert,
-                                  vnorm_to_insert,
-                                  vsum_to_insert);
-        const double cuda_time = bgj_bucket_wall_time() - t0;
-        bgj_cuda_materialize_phase_profile_t cuda_phase = {};
-        bgj_cuda_materialize_last_profile(&cuda_phase);
-        if (cuda_ok) {
-            materialized = 1;
-            materialize_gpu_time += cuda_time;
-            materialize_gpu_call++;
-            materialize_cuda_pool_time += cuda_phase.pool_sec;
-            materialize_cuda_basis_time += cuda_phase.basis_sec;
-            materialize_cuda_desc_time += cuda_phase.desc_sec;
-            materialize_cuda_build_time += cuda_phase.build_sec;
-            materialize_cuda_gemm_time += cuda_phase.gemm_sec;
-            materialize_cuda_coeff_time += cuda_phase.coeff_sec;
-            materialize_cuda_reconstruct_time += cuda_phase.reconstruct_sec;
-            materialize_cuda_copy_time += cuda_phase.copy_sec;
-            materialize_cuda_phase_chunk += cuda_phase.chunks;
-        } else {
-            if (try_cuda_materialize) {
-                materialize_cuda_failed_time += cuda_time;
-                materialize_cuda_failed_call++;
+        if (try_cuda_materialize &&
+            bgj_cuda_materialize_staged_for_dim(vec_length) &&
+            !bgj_cuda_materialize_hybrid_requested()) {
+            const long staged_capacity = num_total_empty + num_total_nonempty;
+            int staged_arrays_ok = 1;
+            if (staged_capacity > 0) {
+                staged_selected_indices =
+                    (uint32_t *)NEW_VEC(staged_capacity, sizeof(uint32_t));
             }
+            staged_selected_pos =
+                (uint32_t *)NEW_VEC(num_total_sol, sizeof(uint32_t));
+            if ((staged_capacity > 0 && !staged_selected_indices) ||
+                !staged_selected_pos) {
+                staged_arrays_ok = 0;
+            } else {
+                memset(staged_selected_pos, 0xff, (size_t)num_total_sol * sizeof(uint32_t));
+            }
+            if (staged_arrays_ok) {
+                const double t0 = bgj_bucket_wall_time();
+                const int cuda_ok =
+                    _sol_list_to_vec_cuda_staged(sol_list,
+                                                 num_sol_list,
+                                                 vu_to_insert,
+                                                 vnorm_to_insert,
+                                                 vsum_to_insert);
+                staged_cuda_time = bgj_bucket_wall_time() - t0;
+                if (cuda_ok) {
+                    materialized = 1;
+                    staged_materialized = 1;
+                } else {
+                    if (try_cuda_materialize) {
+                        materialize_cuda_failed_time += staged_cuda_time;
+                        materialize_cuda_failed_call++;
+                    }
+                }
+            }
+        }
+        if (!materialized) {
+            const double t0 = bgj_bucket_wall_time();
+            const int cuda_ok =
+                ensure_vec_to_insert() &&
+                _sol_list_to_vec_cuda(sol_list,
+                                      num_sol_list,
+                                      vec_to_insert,
+                                      vu_to_insert,
+                                      vnorm_to_insert,
+                                      vsum_to_insert);
+            const double cuda_time = bgj_bucket_wall_time() - t0;
+            bgj_cuda_materialize_phase_profile_t cuda_phase = {};
+            bgj_cuda_materialize_last_profile(&cuda_phase);
+            if (cuda_ok) {
+                materialized = 1;
+                materialize_gpu_time += cuda_time;
+                materialize_gpu_call++;
+                materialize_cuda_pool_time += cuda_phase.pool_sec;
+                materialize_cuda_basis_time += cuda_phase.basis_sec;
+                materialize_cuda_desc_time += cuda_phase.desc_sec;
+                materialize_cuda_build_time += cuda_phase.build_sec;
+                materialize_cuda_gemm_time += cuda_phase.gemm_sec;
+                materialize_cuda_coeff_time += cuda_phase.coeff_sec;
+                materialize_cuda_reconstruct_time += cuda_phase.reconstruct_sec;
+                materialize_cuda_copy_time += cuda_phase.copy_sec;
+                materialize_cuda_phase_chunk += cuda_phase.chunks;
+            } else {
+                if (try_cuda_materialize) {
+                    materialize_cuda_failed_time += cuda_time;
+                    materialize_cuda_failed_call++;
+                }
+            }
+        }
+        if (!materialized) {
             const double cpu_t0 = bgj_bucket_wall_time();
-            if (_sol_list_to_vec_cpu_parallel(sol_list,
+            if (ensure_vec_to_insert() &&
+                _sol_list_to_vec_cpu_parallel(sol_list,
                                               num_sol_list,
                                               vec_to_insert,
                                               vu_to_insert,
@@ -3543,42 +3761,152 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
     #endif
     if (!materialized) {
         const double scalar_t0 = bgj_bucket_wall_time();
-        _sol_list_to_vec(sol_list, num_sol_list, vec_to_insert, vu_to_insert, vnorm_to_insert, vsum_to_insert);
+        if (ensure_vec_to_insert()) {
+            _sol_list_to_vec(sol_list, num_sol_list, vec_to_insert, vu_to_insert, vnorm_to_insert, vsum_to_insert);
+        }
         materialize_scalar_time += bgj_bucket_wall_time() - scalar_t0;
         materialize_scalar_call++;
     }
     materialize_total_time = bgj_bucket_wall_time() - materialize_start;
-    if (prof) {
-        pthread_spin_lock(&prof->profile_lock);
-        prof->materialize_time += materialize_total_time;
-        prof->materialize_call++;
-        prof->materialize_candidate += (uint64_t)num_total_sol;
-        prof->materialize_gpu_time += materialize_gpu_time;
-        prof->materialize_gpu_call += materialize_gpu_call;
-        prof->materialize_gpu_candidate += materialize_gpu_call ? (uint64_t)num_total_sol : 0;
-        prof->materialize_cpu_time += materialize_cpu_time;
-        prof->materialize_cpu_call += materialize_cpu_call;
-        prof->materialize_cpu_candidate += materialize_cpu_call ? (uint64_t)num_total_sol : 0;
-        prof->materialize_scalar_time += materialize_scalar_time;
-        prof->materialize_scalar_call += materialize_scalar_call;
-        prof->materialize_scalar_candidate += materialize_scalar_call ? (uint64_t)num_total_sol : 0;
-        prof->materialize_cuda_failed_time += materialize_cuda_failed_time;
-        prof->materialize_cuda_failed_call += materialize_cuda_failed_call;
-        prof->materialize_cuda_failed_candidate += materialize_cuda_failed_call ? (uint64_t)num_total_sol : 0;
-        prof->materialize_cuda_pool_time += materialize_cuda_pool_time;
-        prof->materialize_cuda_basis_time += materialize_cuda_basis_time;
-        prof->materialize_cuda_desc_time += materialize_cuda_desc_time;
-        prof->materialize_cuda_build_time += materialize_cuda_build_time;
-        prof->materialize_cuda_gemm_time += materialize_cuda_gemm_time;
-        prof->materialize_cuda_coeff_time += materialize_cuda_coeff_time;
-        prof->materialize_cuda_reconstruct_time += materialize_cuda_reconstruct_time;
-        prof->materialize_cuda_copy_time += materialize_cuda_copy_time;
-        prof->materialize_cuda_phase_chunk += materialize_cuda_phase_chunk;
-        pthread_spin_unlock(&prof->profile_lock);
-    }
 
     long empty_final_ind[MAX_NTHREADS];
     long nonempty_final_ind[MAX_NTHREADS];
+    #if defined(HAVE_CUDA)
+    if (staged_materialized) {
+        const long staged_capacity = num_total_empty + num_total_nonempty;
+        const int32_t linfty_fail_bound = 1.2 * goal_norm;
+        staged_selected_count = 0;
+
+        #pragma omp parallel for
+        for (long thread = 0; thread < num_threads; thread++) {
+            const long begin_ind = (num_total_sol * thread) / num_threads;
+            const long end_ind = (num_total_sol * (thread+1)) / num_threads;
+            long ind = begin_ind;
+            long empty_ind = empty_begin[thread];
+            long nonempty_ind = nonempty_end[thread] - 1;
+
+            while (ind < end_ind && nonempty_ind >= nonempty_begin[thread]) {
+                if (vnorm_to_insert[ind] > linfty_fail_bound) {
+                    ind++;
+                    continue;
+                }
+
+                uint32_t dst = *((uint32_t *)(cvec + 3LL * nonempty_ind));
+                if (vnorm_to_insert[ind] < vnorm[dst]) {
+                    long pos = __sync_fetch_and_add(&staged_selected_count, 1);
+                    if (pos < staged_capacity) {
+                        staged_selected_indices[pos] = (uint32_t)ind;
+                        staged_selected_pos[ind] = (uint32_t)pos;
+                    }
+                    nonempty_ind--;
+                    ind++;
+                    continue;
+                } else if (empty_ind < empty_end[thread]) {
+                    long pos = __sync_fetch_and_add(&staged_selected_count, 1);
+                    if (pos < staged_capacity) {
+                        staged_selected_indices[pos] = (uint32_t)ind;
+                        staged_selected_pos[ind] = (uint32_t)pos;
+                    }
+                    ind++;
+                    empty_ind++;
+                    continue;
+                } else {
+                    ind++;
+                }
+            }
+
+            while (ind < end_ind && empty_ind < empty_end[thread]) {
+                if (vnorm_to_insert[ind] > linfty_fail_bound) {
+                    ind++;
+                    continue;
+                }
+                long pos = __sync_fetch_and_add(&staged_selected_count, 1);
+                if (pos < staged_capacity) {
+                    staged_selected_indices[pos] = (uint32_t)ind;
+                    staged_selected_pos[ind] = (uint32_t)pos;
+                }
+                ind++;
+                empty_ind++;
+            }
+        }
+
+        int gather_ok = staged_selected_count <= staged_capacity;
+        const double gather_t0 = bgj_bucket_wall_time();
+        if (gather_ok && staged_selected_count > 0) {
+            staged_selected_vec =
+                (int8_t *)NEW_VEC(staged_selected_count * vec_length, sizeof(int8_t));
+            if (!staged_selected_vec ||
+                !bgj_cuda_materialize_copy_staged_vectors_raw(staged_selected_indices,
+                                                              (uint32_t)staged_selected_count,
+                                                              (uint32_t)vec_length,
+                                                              staged_selected_vec)) {
+                gather_ok = 0;
+            }
+        }
+        const double gather_time = bgj_bucket_wall_time() - gather_t0;
+        bgj_cuda_materialize_phase_profile_t cuda_phase = {};
+        bgj_cuda_materialize_last_profile(&cuda_phase);
+        bgj_cuda_materialize_finish_staged_raw();
+        if (gather_ok) {
+            materialize_gpu_time += staged_cuda_time + gather_time;
+            materialize_gpu_call++;
+            materialize_cuda_pool_time += cuda_phase.pool_sec;
+            materialize_cuda_basis_time += cuda_phase.basis_sec;
+            materialize_cuda_desc_time += cuda_phase.desc_sec;
+            materialize_cuda_build_time += cuda_phase.build_sec;
+            materialize_cuda_gemm_time += cuda_phase.gemm_sec;
+            materialize_cuda_coeff_time += cuda_phase.coeff_sec;
+            materialize_cuda_reconstruct_time += cuda_phase.reconstruct_sec;
+            materialize_cuda_copy_time += cuda_phase.copy_sec;
+            materialize_cuda_phase_chunk += cuda_phase.chunks;
+            materialize_total_time += gather_time;
+        } else {
+            materialize_cuda_failed_time += staged_cuda_time + gather_time;
+            materialize_cuda_failed_call++;
+            staged_materialized = 0;
+            materialized = 0;
+            if (staged_selected_vec) {
+                FREE_VEC((void *)staged_selected_vec);
+                staged_selected_vec = NULL;
+            }
+            const double cpu_t0 = bgj_bucket_wall_time();
+            if (ensure_vec_to_insert() &&
+                _sol_list_to_vec_cpu_parallel(sol_list,
+                                              num_sol_list,
+                                              vec_to_insert,
+                                              vu_to_insert,
+                                              vnorm_to_insert,
+                                              vsum_to_insert)) {
+                const double cpu_time = bgj_bucket_wall_time() - cpu_t0;
+                materialized = 1;
+                materialize_cpu_time += cpu_time;
+                materialize_cpu_call++;
+                materialize_total_time += gather_time + cpu_time;
+            } else if (ensure_vec_to_insert()) {
+                const double scalar_t0 = bgj_bucket_wall_time();
+                _sol_list_to_vec(sol_list,
+                                 num_sol_list,
+                                 vec_to_insert,
+                                 vu_to_insert,
+                                 vnorm_to_insert,
+                                 vsum_to_insert);
+                const double scalar_time = bgj_bucket_wall_time() - scalar_t0;
+                materialized = 1;
+                materialize_scalar_time += scalar_time;
+                materialize_scalar_call++;
+                materialize_total_time += gather_time + scalar_time;
+            }
+        }
+    }
+    #endif
+
+    auto vec_to_insert_ptr = [&](long ind) -> int8_t * {
+        if (staged_materialized) {
+            return staged_selected_vec + (uint64_t)staged_selected_pos[ind] * vec_length;
+        }
+        return vec_to_insert + (uint64_t)ind * vec_length;
+    };
+
     #pragma omp parallel for
     for (long thread = 0; thread < num_threads; thread++) {
         const long begin_ind = (num_total_sol * thread) / num_threads;
@@ -3614,7 +3942,7 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
                 if (!uid->erase_uid(vu[dst])){
                     fprintf(stderr, "[Error] Pool_epi8_t<%u>::_pool_insert: erase uid of pool vector failed, ignored.\n", nb);
                 }
-                copy_avx2(vec + dst * vec_length, vec_to_insert + ind * vec_length, vec_length);
+                copy_avx2(vec + dst * vec_length, vec_to_insert_ptr(ind), vec_length);
                 vnorm[dst] = vnorm_to_insert[ind];
                 vu[dst] = vu_to_insert[ind];
                 vsum[dst] = vsum_to_insert[ind];
@@ -3624,7 +3952,7 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
                 ind++;
                 continue;
             } else if (empty_ind < empty_end[thread]) {
-                copy_avx2(vec + empty_ind * vec_length, vec_to_insert + ind * vec_length, vec_length);
+                copy_avx2(vec + empty_ind * vec_length, vec_to_insert_ptr(ind), vec_length);
                 vnorm[empty_ind] = vnorm_to_insert[ind];
                 vsum[empty_ind] = vsum_to_insert[ind];
                 vu[empty_ind] = vu_to_insert[ind];
@@ -3658,7 +3986,7 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
                 if (r < 0) r = 0;
                 _length_stat[r]++;
             }
-            copy_avx2(vec + empty_ind * vec_length, vec_to_insert + ind * vec_length, vec_length);
+            copy_avx2(vec + empty_ind * vec_length, vec_to_insert_ptr(ind), vec_length);
             vnorm[empty_ind] = vnorm_to_insert[ind];
             vsum[empty_ind] = vsum_to_insert[ind];
             vu[empty_ind] = vu_to_insert[ind];
@@ -3692,8 +4020,40 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
         empty_final_ind[thread] = empty_ind;
         nonempty_final_ind[thread] = nonempty_ind;
     }
-    
-    FREE_VEC((void *)vec_to_insert);
+
+    if (prof) {
+        pthread_spin_lock(&prof->profile_lock);
+        prof->materialize_time += materialize_total_time;
+        prof->materialize_call++;
+        prof->materialize_candidate += (uint64_t)num_total_sol;
+        prof->materialize_gpu_time += materialize_gpu_time;
+        prof->materialize_gpu_call += materialize_gpu_call;
+        prof->materialize_gpu_candidate += materialize_gpu_call ? (uint64_t)num_total_sol : 0;
+        prof->materialize_cpu_time += materialize_cpu_time;
+        prof->materialize_cpu_call += materialize_cpu_call;
+        prof->materialize_cpu_candidate += materialize_cpu_call ? (uint64_t)num_total_sol : 0;
+        prof->materialize_scalar_time += materialize_scalar_time;
+        prof->materialize_scalar_call += materialize_scalar_call;
+        prof->materialize_scalar_candidate += materialize_scalar_call ? (uint64_t)num_total_sol : 0;
+        prof->materialize_cuda_failed_time += materialize_cuda_failed_time;
+        prof->materialize_cuda_failed_call += materialize_cuda_failed_call;
+        prof->materialize_cuda_failed_candidate += materialize_cuda_failed_call ? (uint64_t)num_total_sol : 0;
+        prof->materialize_cuda_pool_time += materialize_cuda_pool_time;
+        prof->materialize_cuda_basis_time += materialize_cuda_basis_time;
+        prof->materialize_cuda_desc_time += materialize_cuda_desc_time;
+        prof->materialize_cuda_build_time += materialize_cuda_build_time;
+        prof->materialize_cuda_gemm_time += materialize_cuda_gemm_time;
+        prof->materialize_cuda_coeff_time += materialize_cuda_coeff_time;
+        prof->materialize_cuda_reconstruct_time += materialize_cuda_reconstruct_time;
+        prof->materialize_cuda_copy_time += materialize_cuda_copy_time;
+        prof->materialize_cuda_phase_chunk += materialize_cuda_phase_chunk;
+        pthread_spin_unlock(&prof->profile_lock);
+    }
+
+    if (vec_to_insert) FREE_VEC((void *)vec_to_insert);
+    if (staged_selected_indices) FREE_VEC((void *)staged_selected_indices);
+    if (staged_selected_pos) FREE_VEC((void *)staged_selected_pos);
+    if (staged_selected_vec) FREE_VEC((void *)staged_selected_vec);
     FREE_VEC((void *)vu_to_insert);
     FREE_VEC((void *)vnorm_to_insert);
     FREE_VEC((void *)vsum_to_insert);

@@ -145,6 +145,11 @@ finish block size with `BGJ_CUDA_MATERIALIZE_THREADS=<32|64|128|256>` when
 profiling. Set `BGJ_CUDA_MATERIALIZE_PHASE_PROFILE=1` to print CUDA phase
 timings for pool cache, basis upload, descriptor copy, vector build, GEMM,
 coefficient conversion, reconstruction, and output copy.
+For dimensions 96 and higher, the A100 path defaults to staged output copying:
+the GPU keeps candidate vectors resident, copies only norms and sums first, and
+then gathers host vectors only for candidates the insertion pass will keep. Set
+`BGJ_CUDA_MATERIALIZE_STAGED=0` to force the older full-copy path, or `1` to
+force staged copying at smaller dimensions.
 A fused one-kernel small-batch materializer is also available with
 `BGJ_CUDA_MATERIALIZE_FUSED=1` and capped by
 `BGJ_CUDA_MATERIALIZE_FUSED_MAX=<n>`, but it is not the default on A100 because

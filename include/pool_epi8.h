@@ -1069,6 +1069,7 @@ struct Pool_epi8_t {
         int _desc_to_vec_cpu(const bgj_cuda_materialize_desc_t *desc, long num_desc, long cpu_threads, int8_t *dst_vec, int32_t *dst_vnorm, int32_t *dst_vsum);
         int _sol_list_to_vec_cpu_parallel(sol_list_epi8_t **sol_list, long num_sol_list, int8_t *dst_vec, uint64_t *dst_vu, int32_t *dst_vnorm, int32_t *dst_vsum);
         int _sol_list_to_vec_cuda(sol_list_epi8_t **sol_list, long num_sol_list, int8_t *dst_vec, uint64_t *dst_vu, int32_t *dst_vnorm, int32_t *dst_vsum);
+        int _sol_list_to_vec_cuda_staged(sol_list_epi8_t **sol_list, long num_sol_list, uint64_t *dst_vu, int32_t *dst_vnorm, int32_t *dst_vsum);
         #endif
         int _sol_list_to_vec(sol_list_epi8_t **sol_list, long num_sol_list, int8_t *dst_vec, uint64_t *dst_vu, int32_t *dst_vnorm, int32_t *dst_vsum);
         template <bool profiling>

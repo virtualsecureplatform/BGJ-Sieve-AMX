@@ -1575,6 +1575,8 @@ struct bgj_cuda_materialize_scratch_t {
     int8_t *dst_vec;
     int32_t *dst_vnorm;
     int32_t *dst_vsum;
+    uint32_t *gather_indices;
+    int8_t *gather_vec;
     int8_t *host_dst_vec;
     int32_t *host_dst_vnorm;
     int32_t *host_dst_vsum;
@@ -1592,6 +1594,8 @@ struct bgj_cuda_materialize_scratch_t {
     size_t dst_vec_capacity;
     size_t dst_vnorm_capacity;
     size_t dst_vsum_capacity;
+    size_t gather_indices_capacity;
+    size_t gather_vec_capacity;
     size_t host_dst_vec_capacity;
     size_t host_dst_vnorm_capacity;
     size_t host_dst_vsum_capacity;
@@ -1606,6 +1610,10 @@ struct bgj_cuda_materialize_scratch_t {
     int stream_ready;
     int handle_ready;
     int profile_events_ready;
+    int stage_active;
+    int phase_profile_active;
+    uint32_t stage_count;
+    uint32_t stage_vec_length;
     cudaEvent_t profile_start;
     cudaEvent_t profile_stop;
     bgj_cuda_materialize_phase_profile_t last_profile;
@@ -1624,6 +1632,8 @@ struct bgj_cuda_materialize_scratch_t {
           dst_vec(NULL),
           dst_vnorm(NULL),
           dst_vsum(NULL),
+          gather_indices(NULL),
+          gather_vec(NULL),
           host_dst_vec(NULL),
           host_dst_vnorm(NULL),
           host_dst_vsum(NULL),
@@ -1641,6 +1651,8 @@ struct bgj_cuda_materialize_scratch_t {
           dst_vec_capacity(0),
           dst_vnorm_capacity(0),
           dst_vsum_capacity(0),
+          gather_indices_capacity(0),
+          gather_vec_capacity(0),
           host_dst_vec_capacity(0),
           host_dst_vnorm_capacity(0),
           host_dst_vsum_capacity(0),
@@ -1655,6 +1667,10 @@ struct bgj_cuda_materialize_scratch_t {
           stream_ready(0),
           handle_ready(0),
           profile_events_ready(0),
+          stage_active(0),
+          phase_profile_active(0),
+          stage_count(0),
+          stage_vec_length(0),
           profile_start(NULL),
           profile_stop(NULL),
           last_profile()
@@ -1679,6 +1695,8 @@ struct bgj_cuda_materialize_scratch_t {
         cudaFree(dst_vec);
         cudaFree(dst_vnorm);
         cudaFree(dst_vsum);
+        cudaFree(gather_indices);
+        cudaFree(gather_vec);
         cudaFreeHost(host_dst_vec);
         cudaFreeHost(host_dst_vnorm);
         cudaFreeHost(host_dst_vsum);
@@ -1912,6 +1930,38 @@ static int bgj_cuda_materialize_copy_outputs(bgj_cuda_materialize_scratch_t *scr
     return 1;
 }
 
+static int bgj_cuda_materialize_copy_meta_outputs(bgj_cuda_materialize_scratch_t *scratch,
+                                                  uint32_t count,
+                                                  int32_t *dst_vnorm,
+                                                  int32_t *dst_vsum)
+{
+    const size_t i32_bytes = (size_t)count * sizeof(int32_t);
+    cudaError_t err = cudaMemcpyAsync(dst_vnorm,
+                                      scratch->dst_vnorm,
+                                      i32_bytes,
+                                      cudaMemcpyDeviceToHost,
+                                      scratch->stream);
+    if (err != cudaSuccess) {
+        set_cuda_error("cudaMemcpyAsync staged materialize dst_vnorm", err);
+        return 0;
+    }
+    err = cudaMemcpyAsync(dst_vsum,
+                          scratch->dst_vsum,
+                          i32_bytes,
+                          cudaMemcpyDeviceToHost,
+                          scratch->stream);
+    if (err != cudaSuccess) {
+        set_cuda_error("cudaMemcpyAsync staged materialize dst_vsum", err);
+        return 0;
+    }
+    err = cudaStreamSynchronize(scratch->stream);
+    if (err != cudaSuccess) {
+        set_cuda_error("cudaStreamSynchronize staged materialize meta", err);
+        return 0;
+    }
+    return 1;
+}
+
 #define BGJ_CUDA_MATERIALIZE_MAX_DIM 256u
 #define BGJ_CUDA_MATERIALIZE_THREADS 256u
 
@@ -1945,6 +1995,25 @@ __global__ void bgj_cuda_materialize_mask_b_local_kernel(float *b_local,
         const uint32_t row = (uint32_t)(pos / vec_length);
         const uint32_t col = (uint32_t)(pos - (uint64_t)row * vec_length);
         if (col > row) b_local[pos] = 0.0f;
+    }
+}
+
+__global__ void bgj_cuda_materialize_gather_vectors_kernel(const int8_t *src_vec,
+                                                           uint32_t src_count,
+                                                           uint32_t vec_length,
+                                                           const uint32_t *indices,
+                                                           uint32_t count,
+                                                           int8_t *dst_vec)
+{
+    const uint64_t total = (uint64_t)count * vec_length;
+    const uint64_t stride = (uint64_t)blockDim.x * gridDim.x;
+    for (uint64_t pos = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+         pos < total;
+         pos += stride) {
+        const uint32_t cand = (uint32_t)(pos / vec_length);
+        const uint32_t j = (uint32_t)(pos - (uint64_t)cand * vec_length);
+        const uint32_t src = indices[cand];
+        dst_vec[pos] = src < src_count ? src_vec[(uint64_t)src * vec_length + j] : 0;
     }
 }
 
@@ -2356,26 +2425,28 @@ static uint32_t bgj_cuda_materialize_fused_max_count()
     return (uint32_t)value;
 }
 
-extern "C" int bgj_cuda_materialize_sol_list_raw(const int8_t *pool_vecs,
-                                                  uint64_t pool_epoch,
-                                                  uint32_t pool_size,
-                                                  uint32_t vec_length,
-                                                  const bgj_cuda_materialize_desc_t *desc,
-                                                  uint32_t count,
-                                                  const uint8_t *b_dual,
-                                                  const float *b_local,
-                                                  uint32_t csd,
-                                                  int32_t dhalf,
-                                                  int32_t dshift,
-                                                  int8_t *dst_vec,
-                                                  int32_t *dst_vnorm,
-                                                  int32_t *dst_vsum)
+static int bgj_cuda_materialize_sol_list_impl(const int8_t *pool_vecs,
+                                              uint64_t pool_epoch,
+                                              uint32_t pool_size,
+                                              uint32_t vec_length,
+                                              const bgj_cuda_materialize_desc_t *desc,
+                                              uint32_t count,
+                                              const uint8_t *b_dual,
+                                              const float *b_local,
+                                              uint32_t csd,
+                                              int32_t dhalf,
+                                              int32_t dshift,
+                                              int8_t *dst_vec,
+                                              int32_t *dst_vnorm,
+                                              int32_t *dst_vsum,
+                                              int staged)
 {
     if (count == 0) {
         set_plain_error("no CUDA error");
         return 1;
     }
-    if (!pool_vecs || !desc || !b_dual || !b_local || !dst_vec || !dst_vnorm || !dst_vsum) {
+    if (!pool_vecs || !desc || !b_dual || !b_local || (!staged && !dst_vec) ||
+        !dst_vnorm || !dst_vsum) {
         set_plain_error("invalid materialize pointer");
         return 0;
     }
@@ -2392,6 +2463,11 @@ extern "C" int bgj_cuda_materialize_sol_list_raw(const int8_t *pool_vecs,
 
     bgj_cuda_materialize_scratch_t *scratch = &bgj_cuda_materialize_scratch;
     pthread_mutex_lock(&scratch->lock);
+    if (scratch->stage_active) {
+        pthread_mutex_unlock(&scratch->lock);
+        set_plain_error("staged materialize session already active");
+        return 0;
+    }
 
     int8_t *device_pool_vecs = NULL;
     uint32_t chunk_limit = 0;
@@ -2416,6 +2492,7 @@ extern "C" int bgj_cuda_materialize_sol_list_raw(const int8_t *pool_vecs,
     memset(&scratch->last_profile, 0, sizeof(scratch->last_profile));
     scratch->last_profile.candidates = count;
     phase_profile = bgj_cuda_materialize_phase_profile_requested();
+    scratch->phase_profile_active = phase_profile;
     if (phase_profile && !bgj_cuda_prepare_materialize_profile_events(scratch)) goto fail;
     if (!bgj_cuda_prepare_materialize_stream(scratch)) goto fail;
     if (!bgj_cuda_materialize_profile_begin(scratch, phase_profile)) goto fail;
@@ -2518,13 +2595,27 @@ extern "C" int bgj_cuda_materialize_sol_list_raw(const int8_t *pool_vecs,
                                                                scratch->dst_vnorm,
                                                                scratch->dst_vsum);
         CUDA_TRY(cudaGetLastError());
-        if (!bgj_cuda_materialize_copy_outputs(scratch,
-                                               count,
-                                               vec_length,
-                                               dst_vec,
-                                               dst_vnorm,
-                                               dst_vsum)) {
-            goto fail;
+        if (staged) {
+            if (!bgj_cuda_materialize_copy_meta_outputs(scratch,
+                                                        count,
+                                                        dst_vnorm,
+                                                        dst_vsum)) {
+                goto fail;
+            }
+            scratch->stage_active = 1;
+            scratch->stage_count = count;
+            scratch->stage_vec_length = vec_length;
+            set_plain_error("no CUDA error");
+            return 1;
+        } else {
+            if (!bgj_cuda_materialize_copy_outputs(scratch,
+                                                   count,
+                                                   vec_length,
+                                                   dst_vec,
+                                                   dst_vnorm,
+                                                   dst_vsum)) {
+                goto fail;
+            }
         }
         pthread_mutex_unlock(&scratch->lock);
         set_plain_error("no CUDA error");
@@ -2568,7 +2659,9 @@ extern "C" int bgj_cuda_materialize_sol_list_raw(const int8_t *pool_vecs,
     if (use_sgemm_reconstruct) {
         CUDA_ENSURE(scratch->fvec, scratch->fvec_capacity, (size_t)chunk_limit * vec_length * sizeof(float));
     }
-    CUDA_ENSURE(scratch->dst_vec, scratch->dst_vec_capacity, (size_t)chunk_limit * vec_length * sizeof(int8_t));
+    CUDA_ENSURE(scratch->dst_vec,
+                scratch->dst_vec_capacity,
+                (size_t)(staged ? count : chunk_limit) * vec_length * sizeof(int8_t));
     CUDA_ENSURE(scratch->dst_vnorm, scratch->dst_vnorm_capacity, (size_t)chunk_limit * sizeof(int32_t));
     CUDA_ENSURE(scratch->dst_vsum, scratch->dst_vsum_capacity, (size_t)chunk_limit * sizeof(int32_t));
 
@@ -2577,6 +2670,8 @@ extern "C" int bgj_cuda_materialize_sol_list_raw(const int8_t *pool_vecs,
             (count - offset < chunk_limit) ? (count - offset) : chunk_limit;
         const uint32_t gemm_chunk_count =
             bgj_cuda_materialize_align_up(chunk_count, 16u);
+        int8_t *chunk_dst_vec =
+            staged ? scratch->dst_vec + (uint64_t)offset * vec_length : scratch->dst_vec;
         if (phase_profile) scratch->last_profile.chunks++;
         if (!bgj_cuda_materialize_profile_begin(scratch, phase_profile)) goto fail;
         CUDA_TRY(cudaMemcpyAsync(scratch->desc, desc + offset,
@@ -2683,7 +2778,7 @@ extern "C" int bgj_cuda_materialize_sol_list_raw(const int8_t *pool_vecs,
                                                                     scratch->exact_vec,
                                                                     vec_length,
                                                                     chunk_count,
-                                                                    scratch->dst_vec,
+                                                                    chunk_dst_vec,
                                                                     scratch->dst_vnorm,
                                                                     scratch->dst_vsum);
         } else if (!use_fused_coeff) {
@@ -2698,7 +2793,7 @@ extern "C" int bgj_cuda_materialize_sol_list_raw(const int8_t *pool_vecs,
                                                                               vec_length,
                                                                               csd,
                                                                               chunk_count,
-                                                                              scratch->dst_vec,
+                                                                              chunk_dst_vec,
                                                                               scratch->dst_vnorm,
                                                                               scratch->dst_vsum);
         } else {
@@ -2715,7 +2810,7 @@ extern "C" int bgj_cuda_materialize_sol_list_raw(const int8_t *pool_vecs,
                                                                           chunk_count,
                                                                           dhalf,
                                                                           dshift,
-                                                                          scratch->dst_vec,
+                                                                          chunk_dst_vec,
                                                                           scratch->dst_vnorm,
                                                                           scratch->dst_vsum);
         }
@@ -2727,13 +2822,22 @@ extern "C" int bgj_cuda_materialize_sol_list_raw(const int8_t *pool_vecs,
         }
 
         if (!bgj_cuda_materialize_profile_begin(scratch, phase_profile)) goto fail;
-        if (!bgj_cuda_materialize_copy_outputs(scratch,
-                                               chunk_count,
-                                               vec_length,
-                                               dst_vec + (uint64_t)offset * vec_length,
-                                               dst_vnorm + offset,
-                                               dst_vsum + offset)) {
-            goto fail;
+        if (staged) {
+            if (!bgj_cuda_materialize_copy_meta_outputs(scratch,
+                                                        chunk_count,
+                                                        dst_vnorm + offset,
+                                                        dst_vsum + offset)) {
+                goto fail;
+            }
+        } else {
+            if (!bgj_cuda_materialize_copy_outputs(scratch,
+                                                   chunk_count,
+                                                   vec_length,
+                                                   dst_vec + (uint64_t)offset * vec_length,
+                                                   dst_vnorm + offset,
+                                                   dst_vsum + offset)) {
+                goto fail;
+            }
         }
         if (!bgj_cuda_materialize_profile_end(scratch,
                                               phase_profile,
@@ -2742,14 +2846,164 @@ extern "C" int bgj_cuda_materialize_sol_list_raw(const int8_t *pool_vecs,
         }
     }
 
+    if (staged) {
+        scratch->stage_active = 1;
+        scratch->stage_count = count;
+        scratch->stage_vec_length = vec_length;
+        set_plain_error("no CUDA error");
+        return 1;
+    }
+
     pthread_mutex_unlock(&scratch->lock);
     set_plain_error("no CUDA error");
     return 1;
 
 fail:
     if (scratch->stream_ready) cudaStreamSynchronize(scratch->stream);
+    scratch->stage_active = 0;
+    scratch->stage_count = 0;
+    scratch->stage_vec_length = 0;
     pthread_mutex_unlock(&scratch->lock);
     return 0;
+}
+
+extern "C" int bgj_cuda_materialize_sol_list_raw(const int8_t *pool_vecs,
+                                                  uint64_t pool_epoch,
+                                                  uint32_t pool_size,
+                                                  uint32_t vec_length,
+                                                  const bgj_cuda_materialize_desc_t *desc,
+                                                  uint32_t count,
+                                                  const uint8_t *b_dual,
+                                                  const float *b_local,
+                                                  uint32_t csd,
+                                                  int32_t dhalf,
+                                                  int32_t dshift,
+                                                  int8_t *dst_vec,
+                                                  int32_t *dst_vnorm,
+                                                  int32_t *dst_vsum)
+{
+    return bgj_cuda_materialize_sol_list_impl(pool_vecs,
+                                              pool_epoch,
+                                              pool_size,
+                                              vec_length,
+                                              desc,
+                                              count,
+                                              b_dual,
+                                              b_local,
+                                              csd,
+                                              dhalf,
+                                              dshift,
+                                              dst_vec,
+                                              dst_vnorm,
+                                              dst_vsum,
+                                              0);
+}
+
+extern "C" int bgj_cuda_materialize_sol_list_staged_raw(const int8_t *pool_vecs,
+                                                         uint64_t pool_epoch,
+                                                         uint32_t pool_size,
+                                                         uint32_t vec_length,
+                                                         const bgj_cuda_materialize_desc_t *desc,
+                                                         uint32_t count,
+                                                         const uint8_t *b_dual,
+                                                         const float *b_local,
+                                                         uint32_t csd,
+                                                         int32_t dhalf,
+                                                         int32_t dshift,
+                                                         int32_t *dst_vnorm,
+                                                         int32_t *dst_vsum)
+{
+    return bgj_cuda_materialize_sol_list_impl(pool_vecs,
+                                              pool_epoch,
+                                              pool_size,
+                                              vec_length,
+                                              desc,
+                                              count,
+                                              b_dual,
+                                              b_local,
+                                              csd,
+                                              dhalf,
+                                              dshift,
+                                              NULL,
+                                              dst_vnorm,
+                                              dst_vsum,
+                                              1);
+}
+
+extern "C" int bgj_cuda_materialize_copy_staged_vectors_raw(const uint32_t *indices,
+                                                             uint32_t count,
+                                                             uint32_t vec_length,
+                                                             int8_t *dst_vec)
+{
+    bgj_cuda_materialize_scratch_t *scratch = &bgj_cuda_materialize_scratch;
+    if (!scratch->stage_active) {
+        set_plain_error("no staged materialize session active");
+        return 0;
+    }
+    if (count == 0) {
+        set_plain_error("no CUDA error");
+        return 1;
+    }
+    if (!indices || !dst_vec || vec_length != scratch->stage_vec_length) {
+        set_plain_error("invalid staged materialize gather argument");
+        return 0;
+    }
+
+    CUDA_ENSURE(scratch->gather_indices,
+                scratch->gather_indices_capacity,
+                (size_t)count * sizeof(uint32_t));
+    CUDA_ENSURE(scratch->gather_vec,
+                scratch->gather_vec_capacity,
+                (size_t)count * vec_length * sizeof(int8_t));
+
+    if (!bgj_cuda_materialize_profile_begin(scratch, scratch->phase_profile_active)) goto fail;
+    CUDA_TRY(cudaMemcpyAsync(scratch->gather_indices,
+                             indices,
+                             (size_t)count * sizeof(uint32_t),
+                             cudaMemcpyHostToDevice,
+                             scratch->stream));
+    {
+        const uint64_t total = (uint64_t)count * vec_length;
+        uint32_t blocks = (uint32_t)((total + 255u) / 256u);
+        if (blocks > 65535u) blocks = 65535u;
+        bgj_cuda_materialize_gather_vectors_kernel<<<blocks,
+                                                     256,
+                                                     0,
+                                                     scratch->stream>>>(scratch->dst_vec,
+                                                                        scratch->stage_count,
+                                                                        vec_length,
+                                                                        scratch->gather_indices,
+                                                                        count,
+                                                                        scratch->gather_vec);
+        CUDA_TRY(cudaGetLastError());
+    }
+    CUDA_TRY(cudaMemcpyAsync(dst_vec,
+                             scratch->gather_vec,
+                             (size_t)count * vec_length * sizeof(int8_t),
+                             cudaMemcpyDeviceToHost,
+                             scratch->stream));
+    CUDA_TRY(cudaStreamSynchronize(scratch->stream));
+    if (!bgj_cuda_materialize_profile_end(scratch,
+                                          scratch->phase_profile_active,
+                                          &scratch->last_profile.copy_sec)) {
+        goto fail;
+    }
+    set_plain_error("no CUDA error");
+    return 1;
+
+fail:
+    if (scratch->stream_ready) cudaStreamSynchronize(scratch->stream);
+    return 0;
+}
+
+extern "C" void bgj_cuda_materialize_finish_staged_raw()
+{
+    bgj_cuda_materialize_scratch_t *scratch = &bgj_cuda_materialize_scratch;
+    if (!scratch->stage_active) return;
+    scratch->stage_active = 0;
+    scratch->stage_count = 0;
+    scratch->stage_vec_length = 0;
+    pthread_mutex_unlock(&scratch->lock);
 }
 
 static int bgj_cuda_tensor_requested()

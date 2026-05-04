@@ -161,6 +161,44 @@ static bool run_case(uint32_t dim, uint32_t csd, uint32_t count)
         std::cerr << "materialize mismatch for dim=" << dim << " count=" << count << "\n";
         return false;
     }
+
+    std::vector<uint32_t> indices(count);
+    std::vector<int8_t> staged_vec((size_t)count * dim);
+    std::vector<int32_t> staged_norm(count);
+    std::vector<int32_t> staged_sum(count);
+    for (uint32_t i = 0; i < count; i++) indices[i] = i;
+    const int staged_ok = bgj_cuda_materialize_sol_list_staged_raw(pool.data(),
+                                                                   1235,
+                                                                   pool_size,
+                                                                   dim,
+                                                                   desc.data(),
+                                                                   count,
+                                                                   b_dual.data(),
+                                                                   b_local.data(),
+                                                                   csd,
+                                                                   128,
+                                                                   8,
+                                                                   staged_norm.data(),
+                                                                   staged_sum.data());
+    if (!staged_ok) {
+        std::cerr << "staged materialize raw failed: " << bgj_cuda_last_error() << "\n";
+        return false;
+    }
+    const int gather_ok = bgj_cuda_materialize_copy_staged_vectors_raw(indices.data(),
+                                                                       count,
+                                                                       dim,
+                                                                       staged_vec.data());
+    bgj_cuda_materialize_finish_staged_raw();
+    if (!gather_ok) {
+        std::cerr << "staged materialize gather failed: " << bgj_cuda_last_error() << "\n";
+        return false;
+    }
+    if (staged_vec != expected_vec ||
+        staged_norm != expected_norm ||
+        staged_sum != expected_sum) {
+        std::cerr << "staged materialize mismatch for dim=" << dim << " count=" << count << "\n";
+        return false;
+    }
     return true;
 }
 
