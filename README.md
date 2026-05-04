@@ -66,14 +66,14 @@ An experimental BGJ1 pool-bucketing offload is available with
 membership rule, writes the same positive/negative dot-product records used by
 the CPU search path, and falls back to CPU bucketing if the CUDA output buffer
 overflows. Tune the temporary output buffer with `BGJ_CUDA_BUCKET_MARGIN=<n>`
-or cap it with `BGJ_CUDA_BUCKET_MAX_ENTRIES=<n>`. CUDA bucketing uses a
-deterministic two-pass `dp4a` path by default so each bucket is emitted as
-positive ids in ascending order followed by negative ids in ascending order.
-Set `BGJ_CUDA_BUCKET_DETERMINISTIC=0` to profile the older append-based
-kernels. In that legacy path, an A100 INT8 Tensor Core bucketing kernel for
-full 16x16 center/vector tiles is available with `BGJ_CUDA_BUCKET_TENSOR=1`,
-but the scalar `dp4a` bucketing kernel is usually faster in the current
-SVP70/SVP80 timing runs. On A100, legacy scalar bucketing uses block-local
+or cap it with `BGJ_CUDA_BUCKET_MAX_ENTRIES=<n>`. On A100, CUDA bucketing
+defaults to the append-based INT8 Tensor Core kernel for full 16x16
+center/vector tiles because it is the fastest current path on SVP100 timing
+runs. Set `BGJ_CUDA_BUCKET_TENSOR=0` to force scalar `dp4a` append kernels.
+The deterministic two-pass `dp4a` path remains available with
+`BGJ_CUDA_BUCKET_DETERMINISTIC=1`; it emits each bucket as positive ids in
+ascending order followed by negative ids in ascending order, but is slower in
+the current A100 benchmarks. On A100, scalar append bucketing uses block-local
 compaction by default to reduce global append atomics; set
 `BGJ_CUDA_BUCKET_BLOCK_APPEND=0` to force the older per-entry append path.
 

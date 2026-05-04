@@ -56,7 +56,7 @@ static int bgj_cuda_bucket_deterministic_enabled()
 {
     const char *env = getenv("BGJ_CUDA_BUCKET_DETERMINISTIC");
     if (env && env[0]) return env[0] != '0';
-    return 1;
+    return 0;
 }
 
 template <bool record_dp>
@@ -365,10 +365,29 @@ int Pool_epi8_t<nb>::_pool_bucketing(bucket_epi8_t<record_dp> **dst3, bucket_epi
                         dst3[i]->_alloc(pcount[i], 1);
                         dst3[i]->_alloc(ncount[i], 0);
                     }
+                    std::vector<long> pwrite(batchsize, 0);
+                    std::vector<long> nwrite(batchsize, 0);
                     for (uint32_t e = 0; e < entry_count; e++) {
                         const bgj_cuda_bucket_entry_t &entry = cuda_entries[e];
                         if (entry.bucket >= batchsize || entry.id >= (uint32_t)num_vec) continue;
-                        dst3[entry.bucket]->add_vec(entry.id, vnorm[entry.id], vsum[entry.id], entry.dot);
+                        bucket_epi8_t<record_dp> *bucket = dst3[entry.bucket];
+                        if (entry.dot > 0) {
+                            const long out = pwrite[entry.bucket]++;
+                            bucket->pvec[out] = entry.id;
+                            bucket->pnorm[out] = vnorm[entry.id];
+                            bucket->psum[out] = vsum[entry.id];
+                            if (record_dp) bucket->pdot[out] = entry.dot;
+                        } else {
+                            const long out = nwrite[entry.bucket]++;
+                            bucket->nvec[out] = entry.id;
+                            bucket->nnorm[out] = vnorm[entry.id];
+                            bucket->nsum[out] = vsum[entry.id];
+                            if (record_dp) bucket->ndot[out] = entry.dot;
+                        }
+                    }
+                    for (uint32_t i = 0; i < batchsize; i++) {
+                        dst3[i]->num_pvec = pwrite[i];
+                        dst3[i]->num_nvec = nwrite[i];
                     }
                     for (uint32_t i = 0; i < batchsize; i++) {
                         if (deterministic_entries) {

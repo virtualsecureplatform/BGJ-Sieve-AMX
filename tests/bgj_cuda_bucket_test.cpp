@@ -114,6 +114,7 @@ bool run_case(uint32_t dim, uint32_t pool_size)
     std::vector<bgj_cuda_bucket_entry_t> got(expected.size() + 16);
     uint32_t count = 0;
     int overflow = 0;
+    setenv("BGJ_CUDA_BUCKET_DETERMINISTIC", "1", 1);
     const int ok = bgj_cuda_bucket_bgj1_raw(pool.data(),
                                             99,
                                             pool_size,
@@ -126,6 +127,7 @@ bool run_case(uint32_t dim, uint32_t pool_size)
                                             (uint32_t)got.size(),
                                             &count,
                                             &overflow);
+    unsetenv("BGJ_CUDA_BUCKET_DETERMINISTIC");
     if (!ok || overflow) {
         std::cerr << "CUDA bucket raw failed: " << bgj_cuda_last_error()
                   << " overflow=" << overflow << "\n";
@@ -142,6 +144,38 @@ bool run_case(uint32_t dim, uint32_t pool_size)
     if (!same_ordered_entries(expected_ordered, got)) {
         std::cerr << "CUDA deterministic bucket order mismatch for dim=" << dim
                   << " pool_size=" << pool_size << "\n";
+        return false;
+    }
+
+    unsetenv("BGJ_CUDA_BUCKET_DETERMINISTIC");
+    unsetenv("BGJ_CUDA_BUCKET_TENSOR");
+    unsetenv("BGJ_CUDA_BUCKET_BLOCK_APPEND");
+    got.assign(expected.size() + 16, bgj_cuda_bucket_entry_t());
+    count = 0;
+    overflow = 0;
+    const int default_ok = bgj_cuda_bucket_bgj1_raw(pool.data(),
+                                                   100,
+                                                   pool_size,
+                                                   center_ids,
+                                                   num_centers,
+                                                   vnorm.data(),
+                                                   dim,
+                                                   alpha_x2_u16,
+                                                   got.data(),
+                                                   (uint32_t)got.size(),
+                                                   &count,
+                                                   &overflow);
+    if (!default_ok || overflow) {
+        std::cerr << "CUDA default bucket raw failed: " << bgj_cuda_last_error()
+                  << " overflow=" << overflow << "\n";
+        return false;
+    }
+    got.resize(count);
+    if (!same_entries(expected, got)) {
+        std::cerr << "CUDA default bucket mismatch for dim=" << dim
+                  << " pool_size=" << pool_size
+                  << " expected=" << expected.size()
+                  << " got=" << got.size() << "\n";
         return false;
     }
 
@@ -165,7 +199,7 @@ bool run_case(uint32_t dim, uint32_t pool_size)
                                                                 &overflow);
     unsetenv("BGJ_CUDA_BUCKET_DETERMINISTIC");
     unsetenv("BGJ_CUDA_BUCKET_BLOCK_APPEND");
-    setenv("BGJ_CUDA_BUCKET_TENSOR", "1", 1);
+    unsetenv("BGJ_CUDA_BUCKET_TENSOR");
     if (!legacy_block_append_ok || overflow) {
         std::cerr << "CUDA legacy block-append bucket raw failed: " << bgj_cuda_last_error()
                   << " overflow=" << overflow << "\n";
@@ -190,7 +224,6 @@ int main()
         std::cerr << "SKIP: no CUDA devices: " << bgj_cuda_last_error() << "\n";
         return 0;
     }
-    setenv("BGJ_CUDA_BUCKET_TENSOR", "1", 1);
     if (!run_case(32, 97)) return 1;
     if (!run_case(64, 131)) return 1;
     std::cout << "CUDA bucket tests passed\n";

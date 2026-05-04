@@ -3814,14 +3814,14 @@ static int bgj_cuda_bucket_tensor_requested()
 {
     const char *env = getenv("BGJ_CUDA_BUCKET_TENSOR");
     if (env && env[0]) return env[0] != '0';
-    return 0;
+    return bgj_cuda_sm80_device();
 }
 
 static int bgj_cuda_bucket_deterministic_requested()
 {
     const char *env = getenv("BGJ_CUDA_BUCKET_DETERMINISTIC");
     if (env && env[0]) return env[0] != '0';
-    return 1;
+    return 0;
 }
 
 static int bgj_cuda_bucket_block_append_requested()
