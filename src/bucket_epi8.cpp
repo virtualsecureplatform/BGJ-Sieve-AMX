@@ -6,8 +6,18 @@
 
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/time.h>
+#include <algorithm>
 #include <thread>
 #include <vector>
+
+static double bgj_bucket_wall_time()
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
+}
 
 #if defined(HAVE_CUDA)
 static uint32_t bgj_cuda_bucket_entry_capacity(long batchsize,
@@ -2592,6 +2602,80 @@ static long bgj_cuda_materialize_hybrid_gpu_count(long total)
     return gpu_count;
 }
 
+static long bgj_cuda_materialize_verify_limit(long total)
+{
+    const char *env = getenv("BGJ_CUDA_MATERIALIZE_VERIFY");
+    if (!env || !env[0] || env[0] == '0') return 0;
+
+    long limit = 8192;
+    const char *limit_env = getenv("BGJ_CUDA_MATERIALIZE_VERIFY_MAX");
+    if (limit_env && limit_env[0]) {
+        char *end = NULL;
+        long parsed = strtol(limit_env, &end, 10);
+        if (end != limit_env) limit = parsed;
+    }
+    if (limit < 0) limit = 0;
+    if (limit == 0 || limit > total) limit = total;
+    return limit;
+}
+
+static long bgj_cuda_materialize_verify_norm_tolerance()
+{
+    long tolerance = 1;
+    const char *env = getenv("BGJ_CUDA_MATERIALIZE_VERIFY_NORM_TOL");
+    if (env && env[0]) {
+        char *end = NULL;
+        long parsed = strtol(env, &end, 10);
+        if (end != env) tolerance = parsed;
+    }
+    if (tolerance < 0) tolerance = 0;
+    return tolerance;
+}
+
+static int bgj_cuda_materialize_verify_windows(long total,
+                                               long limit,
+                                               long windows[3][2])
+{
+    if (total <= 0 || limit <= 0) return 0;
+    if (limit > total) limit = total;
+
+    int num_windows = 0;
+    auto add_window = [&](long begin, long count) {
+        if (count <= 0) return;
+        if (begin < 0) begin = 0;
+        if (begin >= total) return;
+        if (begin + count > total) count = total - begin;
+        for (int i = 0; i < num_windows; i++) {
+            const long old_begin = windows[i][0];
+            const long old_end = windows[i][1];
+            const long end = begin + count;
+            if (!(end <= old_begin || begin >= old_end)) {
+                const long merged_begin = std::min(begin, old_begin);
+                const long merged_end = std::max(end, old_end);
+                windows[i][0] = merged_begin;
+                windows[i][1] = merged_end;
+                return;
+            }
+        }
+        if (num_windows < 3) {
+            windows[num_windows][0] = begin;
+            windows[num_windows][1] = begin + count;
+            num_windows++;
+        }
+    };
+
+    const long first_count = std::max(1L, limit / 3);
+    const long tail_count = std::max(1L, limit / 3);
+    long middle_count = limit - first_count - tail_count;
+    if (middle_count < 0) middle_count = 0;
+
+    add_window(0, first_count);
+    if (middle_count > 0) add_window((total - middle_count) / 2, middle_count);
+    add_window(total - tail_count, tail_count);
+
+    return num_windows;
+}
+
 template <uint32_t nb>
 long Pool_epi8_t<nb>::_sol_list_to_desc(sol_list_epi8_t **sol_list,
                                         long num_sol_list,
@@ -2980,6 +3064,99 @@ int Pool_epi8_t<nb>::_sol_list_to_vec_cuda(sol_list_epi8_t **sol_list, long num_
                                                dst_vnorm,
                                                dst_vsum);
     }
+
+    if (ok) {
+        const long verify_limit = bgj_cuda_materialize_verify_limit(num_total_sol);
+        if (verify_limit > 0) {
+            long windows[3][2] = {};
+            const int num_windows =
+                bgj_cuda_materialize_verify_windows(num_total_sol, verify_limit, windows);
+            const long cpu_threads = bgj_cpu_materialize_threads(num_sol_list);
+            const long norm_tolerance = bgj_cuda_materialize_verify_norm_tolerance();
+            for (int w = 0; w < num_windows && ok; w++) {
+                const long begin = windows[w][0];
+                const long end = windows[w][1];
+                const long count = end - begin;
+                if (count <= 0) continue;
+
+                int8_t *cpu_vec =
+                    (int8_t *)NEW_VEC(count * vec_length, sizeof(int8_t));
+                int32_t *cpu_vnorm =
+                    (int32_t *)NEW_VEC(count, sizeof(int32_t));
+                int32_t *cpu_vsum =
+                    (int32_t *)NEW_VEC(count, sizeof(int32_t));
+                if (!cpu_vec || !cpu_vnorm || !cpu_vsum) {
+                    ok = 0;
+                } else if (!_desc_to_vec_cpu(desc + begin,
+                                             count,
+                                             cpu_threads,
+                                             cpu_vec,
+                                             cpu_vnorm,
+                                             cpu_vsum)) {
+                    ok = 0;
+                } else {
+                    for (long local = 0; local < count; local++) {
+                        const long global = begin + local;
+                        const int8_t *gpu_v = dst_vec + global * vec_length;
+                        const int8_t *cpu_v = cpu_vec + local * vec_length;
+                        int first_diff = -1;
+                        if (memcmp(gpu_v, cpu_v, vec_length) != 0) {
+                            for (long j = 0; j < vec_length; j++) {
+                                if (gpu_v[j] != cpu_v[j]) {
+                                    first_diff = (int)j;
+                                    break;
+                                }
+                            }
+                        }
+                        const long norm_diff =
+                            labs((long)dst_vnorm[global] - (long)cpu_vnorm[local]);
+                        if (first_diff >= 0 ||
+                            norm_diff > norm_tolerance ||
+                            dst_vsum[global] != cpu_vsum[local]) {
+                            const bgj_cuda_materialize_desc_t d = desc[global];
+                            fprintf(stderr,
+                                    "[Error] CUDA materialization verifier mismatch: "
+                                    "total=%ld checked_limit=%ld window=[%ld,%ld) "
+                                    "index=%ld type=%u x=%u y=%u z=%u "
+                                    "pool_epoch=%llu num_vec=%ld vec_length=%ld CSD=%ld "
+                                    "gpu_norm=%d cpu_norm=%d gpu_sum=%d cpu_sum=%d",
+                                    num_total_sol,
+                                    verify_limit,
+                                    begin,
+                                    end,
+                                    global,
+                                    d.type,
+                                    d.x,
+                                    d.y,
+                                    d.z,
+                                    (unsigned long long)pool_epoch,
+                                    num_vec,
+                                    vec_length,
+                                    CSD,
+                                    dst_vnorm[global],
+                                    cpu_vnorm[local],
+                                    dst_vsum[global],
+                                    cpu_vsum[local]);
+                            if (first_diff >= 0) {
+                                fprintf(stderr,
+                                        " first_vec_diff=%d gpu=%d cpu=%d",
+                                        first_diff,
+                                        (int)gpu_v[first_diff],
+                                        (int)cpu_v[first_diff]);
+                            }
+                            fprintf(stderr, "\n");
+                            ok = 0;
+                            break;
+                        }
+                    }
+                }
+                if (cpu_vec) FREE_VEC((void *)cpu_vec);
+                if (cpu_vnorm) FREE_VEC((void *)cpu_vnorm);
+                if (cpu_vsum) FREE_VEC((void *)cpu_vsum);
+            }
+        }
+    }
+
     FREE_VEC(desc);
     if (!ok) {
         static int warned = 0;
@@ -3299,16 +3476,76 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
     int32_t *vnorm_to_insert = (int32_t *) NEW_VEC(num_total_sol, sizeof(int32_t));
     int32_t *vsum_to_insert = (int32_t *) NEW_VEC(num_total_sol, sizeof(int32_t));
     int materialized = 0;
+    double materialize_total_time = 0.0;
+    double materialize_gpu_time = 0.0;
+    double materialize_cpu_time = 0.0;
+    double materialize_scalar_time = 0.0;
+    double materialize_cuda_failed_time = 0.0;
+    uint64_t materialize_gpu_call = 0;
+    uint64_t materialize_cpu_call = 0;
+    uint64_t materialize_scalar_call = 0;
+    uint64_t materialize_cuda_failed_call = 0;
+    const double materialize_start = bgj_bucket_wall_time();
     #if defined(HAVE_CUDA)
-    if (bgj_cuda_search_requested() &&
-        _sol_list_to_vec_cuda(sol_list, num_sol_list, vec_to_insert, vu_to_insert, vnorm_to_insert, vsum_to_insert)) {
-        materialized = 1;
-    } else if (_sol_list_to_vec_cpu_parallel(sol_list, num_sol_list, vec_to_insert, vu_to_insert, vnorm_to_insert, vsum_to_insert)) {
-        materialized = 1;
+    if (bgj_cuda_search_requested()) {
+        const int try_cuda_materialize = bgj_cuda_materialize_requested();
+        const double t0 = bgj_bucket_wall_time();
+        const int cuda_ok =
+            _sol_list_to_vec_cuda(sol_list,
+                                  num_sol_list,
+                                  vec_to_insert,
+                                  vu_to_insert,
+                                  vnorm_to_insert,
+                                  vsum_to_insert);
+        const double cuda_time = bgj_bucket_wall_time() - t0;
+        if (cuda_ok) {
+            materialized = 1;
+            materialize_gpu_time += cuda_time;
+            materialize_gpu_call++;
+        } else {
+            if (try_cuda_materialize) {
+                materialize_cuda_failed_time += cuda_time;
+                materialize_cuda_failed_call++;
+            }
+            const double cpu_t0 = bgj_bucket_wall_time();
+            if (_sol_list_to_vec_cpu_parallel(sol_list,
+                                              num_sol_list,
+                                              vec_to_insert,
+                                              vu_to_insert,
+                                              vnorm_to_insert,
+                                              vsum_to_insert)) {
+                materialized = 1;
+                materialize_cpu_time += bgj_bucket_wall_time() - cpu_t0;
+                materialize_cpu_call++;
+            }
+        }
     }
     #endif
     if (!materialized) {
+        const double scalar_t0 = bgj_bucket_wall_time();
         _sol_list_to_vec(sol_list, num_sol_list, vec_to_insert, vu_to_insert, vnorm_to_insert, vsum_to_insert);
+        materialize_scalar_time += bgj_bucket_wall_time() - scalar_t0;
+        materialize_scalar_call++;
+    }
+    materialize_total_time = bgj_bucket_wall_time() - materialize_start;
+    if (prof) {
+        pthread_spin_lock(&prof->profile_lock);
+        prof->materialize_time += materialize_total_time;
+        prof->materialize_call++;
+        prof->materialize_candidate += (uint64_t)num_total_sol;
+        prof->materialize_gpu_time += materialize_gpu_time;
+        prof->materialize_gpu_call += materialize_gpu_call;
+        prof->materialize_gpu_candidate += materialize_gpu_call ? (uint64_t)num_total_sol : 0;
+        prof->materialize_cpu_time += materialize_cpu_time;
+        prof->materialize_cpu_call += materialize_cpu_call;
+        prof->materialize_cpu_candidate += materialize_cpu_call ? (uint64_t)num_total_sol : 0;
+        prof->materialize_scalar_time += materialize_scalar_time;
+        prof->materialize_scalar_call += materialize_scalar_call;
+        prof->materialize_scalar_candidate += materialize_scalar_call ? (uint64_t)num_total_sol : 0;
+        prof->materialize_cuda_failed_time += materialize_cuda_failed_time;
+        prof->materialize_cuda_failed_call += materialize_cuda_failed_call;
+        prof->materialize_cuda_failed_candidate += materialize_cuda_failed_call ? (uint64_t)num_total_sol : 0;
+        pthread_spin_unlock(&prof->profile_lock);
     }
 
     long empty_final_ind[MAX_NTHREADS];

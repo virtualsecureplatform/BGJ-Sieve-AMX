@@ -108,6 +108,11 @@ struct bgj_profile_data_t {
     double cuda_single_time0 = 0.0;
     double cuda_batch_time0 = 0.0;
     double cuda_fallback_time0 = 0.0;
+    double materialize_time = 0.0;
+    double materialize_gpu_time = 0.0;
+    double materialize_cpu_time = 0.0;
+    double materialize_scalar_time = 0.0;
+    double materialize_cuda_failed_time = 0.0;
 
     uint64_t bucket0_ndp = 0;
     uint64_t bucket1_ndp = 0;
@@ -122,6 +127,16 @@ struct bgj_profile_data_t {
     uint64_t cuda_batch_bucket0 = 0;
     uint64_t cuda_batch_call0 = 0;
     uint64_t cuda_fallback_bucket0 = 0;
+    uint64_t materialize_call = 0;
+    uint64_t materialize_candidate = 0;
+    uint64_t materialize_gpu_call = 0;
+    uint64_t materialize_gpu_candidate = 0;
+    uint64_t materialize_cpu_call = 0;
+    uint64_t materialize_cpu_candidate = 0;
+    uint64_t materialize_scalar_call = 0;
+    uint64_t materialize_scalar_candidate = 0;
+    uint64_t materialize_cuda_failed_call = 0;
+    uint64_t materialize_cuda_failed_candidate = 0;
 
     uint64_t try_add2 = 0;
     uint64_t succ_add2 = 0;

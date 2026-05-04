@@ -80,8 +80,8 @@ static void materialize_oracle(const std::vector<int8_t> &pool,
         int32_t out_sum128 = 0;
         for (uint32_t j = 0; j < dim; j++) {
             float value = 0.0f;
-            for (uint32_t i = 0; i < csd; i++) {
-                value += (float)coeff[i] * b_local[(uint64_t)i * dim + j];
+            for (uint32_t i = j; i < csd; i++) {
+                value = std::fma(b_local[(uint64_t)i * dim + j], (float)coeff[i], value);
             }
             const int rounded = (int)lrintf(value);
             const int wrapped = wrap_i8(rounded);
@@ -96,10 +96,9 @@ static void materialize_oracle(const std::vector<int8_t> &pool,
     }
 }
 
-static bool run_case(uint32_t dim, uint32_t count)
+static bool run_case(uint32_t dim, uint32_t csd, uint32_t count)
 {
     const uint32_t pool_size = 41;
-    const uint32_t csd = dim;
     std::vector<int8_t> pool((size_t)pool_size * dim);
     std::vector<bgj_cuda_materialize_desc_t> desc(count);
     std::vector<uint8_t> b_dual((size_t)csd * dim);
@@ -118,11 +117,15 @@ static bool run_case(uint32_t dim, uint32_t count)
     }
     for (uint32_t i = 0; i < csd; i++) {
         for (uint32_t j = 0; j < dim; j++) {
-            b_dual[(uint64_t)i * dim + j] = (uint8_t)(128 + ((int)((i * 3 + j * 7 + 42) % 5) - 2));
+            b_dual[(uint64_t)i * dim + j] =
+                (uint8_t)((i * 37 + j * 101 + 42) & 255);
             if (i == j) {
                 b_local[(uint64_t)i * dim + j] = 0.25f;
             } else if (j < i && ((i + j) % 17 == 0)) {
                 b_local[(uint64_t)i * dim + j] = 0.125f;
+            } else if (j > i) {
+                b_local[(uint64_t)i * dim + j] =
+                    (float)(((i * 11 + j * 5 + 3) % 7) - 3) * 0.0625f;
             }
         }
     }
@@ -168,8 +171,10 @@ int main()
         return 0;
     }
     setenv("BGJ_CUDA_MATERIALIZE_CHUNK", "17", 1);
-    if (!run_case(32, 19)) return 1;
-    if (!run_case(64, 73)) return 1;
+    if (!run_case(32, 32, 19)) return 1;
+    if (!run_case(64, 64, 73)) return 1;
+    if (!run_case(96, 46, 19)) return 1;
+    if (!run_case(64, 49, 19)) return 1;
     std::cout << "CUDA materialize tests passed\n";
     return 0;
 }

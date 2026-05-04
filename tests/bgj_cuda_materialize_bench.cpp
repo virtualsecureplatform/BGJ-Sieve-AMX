@@ -56,10 +56,13 @@ static void fill_case(uint32_t dim,
     for (uint32_t i = 0; i < dim; i++) {
         for (uint32_t j = 0; j < dim; j++) {
             b_dual[(uint64_t)i * dim + j] =
-                (uint8_t)(128 + ((int)((i * 3 + j * 7 + 42) % 5) - 2));
+                (uint8_t)((i * 37 + j * 101 + 42) & 255);
             if (j <= i) {
                 b_local[(uint64_t)i * dim + j] =
                     (i == j) ? 0.25f : (((i + j) % 17 == 0) ? 0.125f : 0.0f);
+            } else {
+                b_local[(uint64_t)i * dim + j] =
+                    (float)(((i * 11 + j * 5 + 3) % 7) - 3) * 0.0625f;
             }
         }
     }
@@ -145,7 +148,7 @@ static uint64_t materialize_cpu(const std::vector<int8_t> &pool,
         for (uint32_t j = 0; j < dim; j++) {
             float value = 0.0f;
             for (uint32_t i = j; i < dim; i++) {
-                value += (float)coeff[i] * b_local[(uint64_t)i * dim + j];
+                value = std::fma(b_local[(uint64_t)i * dim + j], (float)coeff[i], value);
             }
             const int rounded = (int)lrintf(value);
             const int wrapped = wrap_i8(rounded);

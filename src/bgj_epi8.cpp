@@ -300,6 +300,18 @@ template <uint32_t nb>
 void bgj_profile_data_t<nb>::insert_log(uint64_t num_total_sol, double insert_time) {
     if (log_level >= 2 && p->CSD > MIN_LOG_CSD){
         fprintf(log_out, "insert %ld solutions in %fs\n", num_total_sol, insert_time);
+        if (materialize_call) {
+            fprintf(log_out,
+                    "materialize: total=%lu candidates in %.6fs, "
+                    "gpu=%lu/%lu in %.6fs, cpu=%lu/%lu in %.6fs, "
+                    "scalar=%lu/%lu in %.6fs, cuda_failed=%lu/%lu in %.6fs\n",
+                    materialize_candidate, materialize_time,
+                    materialize_gpu_call, materialize_gpu_candidate, materialize_gpu_time,
+                    materialize_cpu_call, materialize_cpu_candidate, materialize_cpu_time,
+                    materialize_scalar_call, materialize_scalar_candidate, materialize_scalar_time,
+                    materialize_cuda_failed_call, materialize_cuda_failed_candidate,
+                    materialize_cuda_failed_time);
+        }
     }
     if (log_level == 0 && p->CSD > MIN_LOG_CSD){
         fprintf(log_err, ".");
@@ -327,6 +339,18 @@ void bgj_profile_data_t<nb>::final_log(int bgj, long sieving_stucked) {
             double speed0;
             fprintf(log_out, "bucket time = %fs, search time = %fs, sort time = %fs, insert time = %fs\n",
                      bucket0_time, search0_time, sort_time, insert_time);
+            if (materialize_call) {
+                fprintf(log_out,
+                        "materialize: total=%lu candidates in %.6fs, "
+                        "gpu=%lu/%lu in %.6fs, cpu=%lu/%lu in %.6fs, "
+                        "scalar=%lu/%lu in %.6fs, cuda_failed=%lu/%lu in %.6fs\n",
+                        materialize_candidate, materialize_time,
+                        materialize_gpu_call, materialize_gpu_candidate, materialize_gpu_time,
+                        materialize_cpu_call, materialize_cpu_candidate, materialize_cpu_time,
+                        materialize_scalar_call, materialize_scalar_candidate, materialize_scalar_time,
+                        materialize_cuda_failed_call, materialize_cuda_failed_candidate,
+                        materialize_cuda_failed_time);
+            }
             speed0 = p->CSD * 2 * bucket0_ndp/bucket0_time/1073741824.0;
             fprintf(log_out, "bucket0 speed: %f bucket/s, %f GFLOPS\n", num_bucket0/bucket0_time, speed0);
             speed0 = p->CSD * 2 * search0_ndp/search0_time/1073741824.0;
@@ -670,6 +694,11 @@ void bgj_profile_data_t<nb>::combine(bgj_profile_data_t<nb> *prof) {
     cuda_single_time0 += prof->cuda_single_time0;
     cuda_batch_time0 += prof->cuda_batch_time0;
     cuda_fallback_time0 += prof->cuda_fallback_time0;
+    materialize_time += prof->materialize_time;
+    materialize_gpu_time += prof->materialize_gpu_time;
+    materialize_cpu_time += prof->materialize_cpu_time;
+    materialize_scalar_time += prof->materialize_scalar_time;
+    materialize_cuda_failed_time += prof->materialize_cuda_failed_time;
 
     bucket0_ndp += prof->bucket0_ndp;
     bucket1_ndp += prof->bucket1_ndp;
@@ -684,6 +713,16 @@ void bgj_profile_data_t<nb>::combine(bgj_profile_data_t<nb> *prof) {
     cuda_batch_bucket0 += prof->cuda_batch_bucket0;
     cuda_batch_call0 += prof->cuda_batch_call0;
     cuda_fallback_bucket0 += prof->cuda_fallback_bucket0;
+    materialize_call += prof->materialize_call;
+    materialize_candidate += prof->materialize_candidate;
+    materialize_gpu_call += prof->materialize_gpu_call;
+    materialize_gpu_candidate += prof->materialize_gpu_candidate;
+    materialize_cpu_call += prof->materialize_cpu_call;
+    materialize_cpu_candidate += prof->materialize_cpu_candidate;
+    materialize_scalar_call += prof->materialize_scalar_call;
+    materialize_scalar_candidate += prof->materialize_scalar_candidate;
+    materialize_cuda_failed_call += prof->materialize_cuda_failed_call;
+    materialize_cuda_failed_candidate += prof->materialize_cuda_failed_candidate;
 
     try_add2 += prof->try_add2;
     succ_add2 += prof->succ_add2;
