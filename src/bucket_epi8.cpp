@@ -4,6 +4,8 @@
 #include "../include/bgj_cuda.h"
 #endif
 
+#include <thread>
+
 
 ///////////////// bucket_epi8_t /////////////////
 
@@ -2421,27 +2423,68 @@ int Pool_epi8_t<nb>::_search_nn(bucket_epi8_t<record_dp> *bkt, sol_list_epi8_t *
 }
 
 #if defined(HAVE_CUDA)
+static int bgj_cpu_materialize_threads_env_present()
+{
+    const char *env = getenv("BGJ_CPU_MATERIALIZE_THREADS");
+    if (!env || !env[0]) return 0;
+    char *end = NULL;
+    long parsed = strtol(env, &end, 10);
+    return end != env && parsed > 0;
+}
+
+static long bgj_cpu_materialize_threads(long fallback)
+{
+    const char *env = getenv("BGJ_CPU_MATERIALIZE_THREADS");
+    long value = fallback > 0 ? fallback : 1;
+    if (env && env[0]) {
+        char *end = NULL;
+        long parsed = strtol(env, &end, 10);
+        if (end != env) value = parsed;
+    }
+    if (value < 1) value = 1;
+    if (value > MAX_NTHREADS) value = MAX_NTHREADS;
+    return value;
+}
+
+static int bgj_cuda_materialize_hybrid_requested()
+{
+    const char *env = getenv("BGJ_CUDA_MATERIALIZE_HYBRID");
+    return env && env[0] && env[0] != '0';
+}
+
+static long bgj_cuda_materialize_hybrid_gpu_count(long total)
+{
+    const char *count_env = getenv("BGJ_CUDA_MATERIALIZE_GPU_COUNT");
+    if (count_env && count_env[0]) {
+        char *end = NULL;
+        long parsed = strtol(count_env, &end, 10);
+        if (end != count_env) {
+            if (parsed < 0) parsed = 0;
+            if (parsed > total) parsed = total;
+            return parsed;
+        }
+    }
+
+    double percent = 50.0;
+    const char *pct_env = getenv("BGJ_CUDA_MATERIALIZE_GPU_PERCENT");
+    if (pct_env && pct_env[0]) {
+        char *end = NULL;
+        double parsed = strtod(pct_env, &end);
+        if (end != pct_env) percent = parsed;
+    }
+    if (percent < 0.0) percent = 0.0;
+    if (percent > 100.0) percent = 100.0;
+    long gpu_count = (long)((percent * (double)total) / 100.0);
+    if (gpu_count < 0) gpu_count = 0;
+    if (gpu_count > total) gpu_count = total;
+    return gpu_count;
+}
+
 template <uint32_t nb>
-int Pool_epi8_t<nb>::_sol_list_to_vec_cuda(sol_list_epi8_t **sol_list, long num_sol_list, int8_t *dst_vec, uint64_t *dst_vu, int32_t *dst_vnorm, int32_t *dst_vsum) {
-    if (!bgj_cuda_materialize_requested() || bgj_cuda_device_count() <= 0) return 0;
-    if (num_sol_list <= 0) return 1;
-
-    long num_total_sol = 0;
-    for (long thread = 0; thread < num_sol_list; thread++) {
-        num_total_sol += sol_list[thread]->num_sol();
-    }
-    if (num_total_sol == 0) return 1;
-    if (num_total_sol > 0xffffffffL ||
-        num_vec < 0 || num_vec > 0xffffffffL ||
-        vec_length <= 0 || vec_length > 0xffffffffL ||
-        CSD <= 0 || CSD > 0xffffffffL) {
-        return 0;
-    }
-
-    bgj_cuda_materialize_desc_t *desc =
-        (bgj_cuda_materialize_desc_t *) NEW_VEC(num_total_sol, sizeof(bgj_cuda_materialize_desc_t));
-    if (!desc) return 0;
-
+long Pool_epi8_t<nb>::_sol_list_to_desc(sol_list_epi8_t **sol_list,
+                                        long num_sol_list,
+                                        bgj_cuda_materialize_desc_t *desc,
+                                        uint64_t *dst_vu) {
     long out = 0;
     for (long thread = 0; thread < num_sol_list; thread++) {
         sol_list_epi8_t *sol = sol_list[thread];
@@ -2484,21 +2527,347 @@ int Pool_epi8_t<nb>::_sol_list_to_vec_cuda(sol_list_epi8_t **sol_list, long num_
             out++;
         }
     }
+    return out;
+}
 
-    const int ok = bgj_cuda_materialize_sol_list_raw(vec,
-                                                     pool_epoch,
-                                                     (uint32_t)num_vec,
-                                                     (uint32_t)vec_length,
-                                                     desc,
-                                                     (uint32_t)num_total_sol,
-                                                     _b_dual,
-                                                     _b_local ? _b_local[0] : NULL,
-                                                     (uint32_t)CSD,
-                                                     _dhalf,
-                                                     _dshift,
-                                                     dst_vec,
-                                                     dst_vnorm,
-                                                     dst_vsum);
+template <uint32_t nb>
+int Pool_epi8_t<nb>::_desc_to_vec_cpu(const bgj_cuda_materialize_desc_t *desc,
+                                      long num_desc,
+                                      long cpu_threads,
+                                      int8_t *dst_vec,
+                                      int32_t *dst_vnorm,
+                                      int32_t *dst_vsum) {
+    if (num_desc <= 0) return 1;
+    if (cpu_threads < 1) cpu_threads = 1;
+    if (cpu_threads > num_desc) cpu_threads = num_desc;
+    const __m256i diff_bound = _mm256_set1_epi16(0x3);
+
+    #pragma omp parallel num_threads(cpu_threads)
+    {
+        __attribute__ ((aligned (32))) int8_t tmp[vec_length * 8];
+        __attribute__ ((aligned (32))) int16_t tck[vec_length * 8];
+        __attribute__ ((aligned (32))) int32_t coeff[8 * vec_length];
+        __attribute__ ((aligned (32))) float fvec[vec_length * 8];
+        __attribute__ ((aligned (32))) float fnorm[8];
+        __attribute__ ((aligned (32))) int32_t sum[8];
+
+        const long tid = omp_get_thread_num();
+        const long nth = omp_get_num_threads();
+        long ind = (num_desc * tid) / nth;
+        const long end_ind = (num_desc * (tid + 1)) / nth;
+
+        while (ind < end_ind - 7) {
+            for (long i = 0; i < 8; i++) {
+                const bgj_cuda_materialize_desc_t d = desc[ind + i];
+                int8_t *src1 = vec + d.x * vec_length;
+                int8_t *src2 = vec + d.y * vec_length;
+                int8_t *src3 = vec + d.z * vec_length;
+                if (d.type == BGJ_CUDA_SOL_A) {
+                    copy_avx2(tmp + i * vec_length, src1, vec_length);
+                    add_avx2(tmp + i * vec_length, src2, vec_length);
+                    for (long l = 0; l < vec_length; l += 16) {
+                        __m256i x1 = _mm256_cvtepi8_epi16(_mm_load_si128((__m128i *)(src1 + l)));
+                        __m256i x2 = _mm256_cvtepi8_epi16(_mm_load_si128((__m128i *)(src2 + l)));
+                        _mm256_store_si256((__m256i *)(tck + i * vec_length + l), _mm256_add_epi16(x1, x2));
+                    }
+                } else if (d.type == BGJ_CUDA_SOL_S) {
+                    copy_avx2(tmp + i * vec_length, src1, vec_length);
+                    sub_avx2(tmp + i * vec_length, src2, vec_length);
+                    for (long l = 0; l < vec_length; l += 16) {
+                        __m256i x1 = _mm256_cvtepi8_epi16(_mm_load_si128((__m128i *)(src1 + l)));
+                        __m256i x2 = _mm256_cvtepi8_epi16(_mm_load_si128((__m128i *)(src2 + l)));
+                        _mm256_store_si256((__m256i *)(tck + i * vec_length + l), _mm256_sub_epi16(x1, x2));
+                    }
+                } else if (d.type == BGJ_CUDA_SOL_AA) {
+                    copy_avx2(tmp + i * vec_length, src1, vec_length);
+                    add_avx2(tmp + i * vec_length, src2, vec_length);
+                    add_avx2(tmp + i * vec_length, src3, vec_length);
+                    for (long l = 0; l < vec_length; l += 16) {
+                        __m256i x1 = _mm256_cvtepi8_epi16(_mm_load_si128((__m128i *)(src1 + l)));
+                        __m256i x2 = _mm256_cvtepi8_epi16(_mm_load_si128((__m128i *)(src2 + l)));
+                        __m256i x3 = _mm256_cvtepi8_epi16(_mm_load_si128((__m128i *)(src3 + l)));
+                        _mm256_store_si256((__m256i *)(tck + i * vec_length + l), _mm256_add_epi16(_mm256_add_epi16(x1, x2), x3));
+                    }
+                } else if (d.type == BGJ_CUDA_SOL_SA) {
+                    copy_avx2(tmp + i * vec_length, src1, vec_length);
+                    sub_avx2(tmp + i * vec_length, src2, vec_length);
+                    add_avx2(tmp + i * vec_length, src3, vec_length);
+                    for (long l = 0; l < vec_length; l += 16) {
+                        __m256i x1 = _mm256_cvtepi8_epi16(_mm_load_si128((__m128i *)(src1 + l)));
+                        __m256i x2 = _mm256_cvtepi8_epi16(_mm_load_si128((__m128i *)(src2 + l)));
+                        __m256i x3 = _mm256_cvtepi8_epi16(_mm_load_si128((__m128i *)(src3 + l)));
+                        _mm256_store_si256((__m256i *)(tck + i * vec_length + l), _mm256_add_epi16(_mm256_sub_epi16(x1, x2), x3));
+                    }
+                } else {
+                    copy_avx2(tmp + i * vec_length, src1, vec_length);
+                    sub_avx2(tmp + i * vec_length, src2, vec_length);
+                    sub_avx2(tmp + i * vec_length, src3, vec_length);
+                    for (long l = 0; l < vec_length; l += 16) {
+                        __m256i x1 = _mm256_cvtepi8_epi16(_mm_load_si128((__m128i *)(src1 + l)));
+                        __m256i x2 = _mm256_cvtepi8_epi16(_mm_load_si128((__m128i *)(src2 + l)));
+                        __m256i x3 = _mm256_cvtepi8_epi16(_mm_load_si128((__m128i *)(src3 + l)));
+                        _mm256_store_si256((__m256i *)(tck + i * vec_length + l), _mm256_sub_epi16(_mm256_sub_epi16(x1, x2), x3));
+                    }
+                }
+            }
+
+            _compute_sum_b8(sum, tmp);
+            _compute_coeff_b8(coeff, tmp, sum);
+            _compute_fvec_b8(fvec, coeff);
+            _compute_fnorm_b8(fnorm, fvec);
+            _mm256_storeu_si256((__m256i *)(dst_vnorm + ind), _mm256_cvtps_epi32(_mm256_load_ps(fnorm)));
+
+            for (long i = 0; i < vec_length; i += 16) {
+                for (long j = 0; j < 8; j++) {
+                    __m128i lo = _mm256_cvtepi32_epi8(_mm256_cvtps_epi32(_mm256_load_ps(fvec + j * vec_length + i)));
+                    __m128i hi = _mm256_cvtepi32_epi8(_mm256_cvtps_epi32(_mm256_load_ps(fvec + j * vec_length + i + 8)));
+                    _mm_store_si128((__m128i *)(dst_vec + (ind + j) * vec_length + i), _mm_or_si128(_mm_slli_si128(hi, 8), lo));
+                }
+            }
+
+            uint32_t rej = 0;
+            for (long i = 0; i < 8; i++) {
+                for (long l = 0; l < vec_length; l += 16) {
+                    __m256i diff = _mm256_abs_epi16(_mm256_sub_epi16(_mm256_load_si256((__m256i *)(tck + i * vec_length + l)), _mm256_cvtepi8_epi16(_mm_load_si128((__m128i *)(dst_vec + (ind + i) * vec_length + l)))));
+                    if (_mm256_movemask_epi8(_mm256_cmpgt_epi16(diff, diff_bound))) {
+                        rej |= (1 << i);
+                        break;
+                    }
+                }
+                #if REJ_ENTRY128
+                do {
+                    __m256i err0x80 = _mm256_setzero_si256();
+                    __m256i all0x80 = _mm256_set1_epi32(0x80808080);
+                    for (long l = 0; l < vec_length; l += 32) {
+                        err0x80 = _mm256_or_si256(err0x80, _mm256_cmpeq_epi8(all0x80, _mm256_load_si256((__m256i *)(dst_vec + (ind + i) * vec_length + l))));
+                    }
+                    if (!_mm256_testz_si256(err0x80, err0x80)) rej |= (1 << i);
+                } while (0);
+                #endif
+            }
+            while (rej) {
+                int32_t r = __builtin_ctz(rej);
+                rej -= (1 << r);
+                dst_vnorm[ind + r] = 2147483647;
+            }
+
+            _compute_sum_b8(dst_vsum + ind, dst_vec + ind * vec_length);
+            ind += 8;
+        }
+
+        while (ind < end_ind) {
+            const bgj_cuda_materialize_desc_t d = desc[ind];
+            int8_t *src1 = vec + d.x * vec_length;
+            int8_t *src2 = vec + d.y * vec_length;
+            int8_t *src3 = vec + d.z * vec_length;
+            if (d.type == BGJ_CUDA_SOL_A) {
+                copy_avx2(tmp, src1, vec_length);
+                add_avx2(tmp, src2, vec_length);
+                for (long l = 0; l < vec_length; l += 16) {
+                    __m256i x1 = _mm256_cvtepi8_epi16(_mm_load_si128((__m128i *)(src1 + l)));
+                    __m256i x2 = _mm256_cvtepi8_epi16(_mm_load_si128((__m128i *)(src2 + l)));
+                    _mm256_store_si256((__m256i *)(tck + l), _mm256_add_epi16(x1, x2));
+                }
+            } else if (d.type == BGJ_CUDA_SOL_S) {
+                copy_avx2(tmp, src1, vec_length);
+                sub_avx2(tmp, src2, vec_length);
+                for (long l = 0; l < vec_length; l += 16) {
+                    __m256i x1 = _mm256_cvtepi8_epi16(_mm_load_si128((__m128i *)(src1 + l)));
+                    __m256i x2 = _mm256_cvtepi8_epi16(_mm_load_si128((__m128i *)(src2 + l)));
+                    _mm256_store_si256((__m256i *)(tck + l), _mm256_sub_epi16(x1, x2));
+                }
+            } else if (d.type == BGJ_CUDA_SOL_AA) {
+                copy_avx2(tmp, src1, vec_length);
+                add_avx2(tmp, src2, vec_length);
+                add_avx2(tmp, src3, vec_length);
+                for (long l = 0; l < vec_length; l += 16) {
+                    __m256i x1 = _mm256_cvtepi8_epi16(_mm_load_si128((__m128i *)(src1 + l)));
+                    __m256i x2 = _mm256_cvtepi8_epi16(_mm_load_si128((__m128i *)(src2 + l)));
+                    __m256i x3 = _mm256_cvtepi8_epi16(_mm_load_si128((__m128i *)(src3 + l)));
+                    _mm256_store_si256((__m256i *)(tck + l), _mm256_add_epi16(_mm256_add_epi16(x1, x2), x3));
+                }
+            } else if (d.type == BGJ_CUDA_SOL_SA) {
+                copy_avx2(tmp, src1, vec_length);
+                sub_avx2(tmp, src2, vec_length);
+                add_avx2(tmp, src3, vec_length);
+                for (long l = 0; l < vec_length; l += 16) {
+                    __m256i x1 = _mm256_cvtepi8_epi16(_mm_load_si128((__m128i *)(src1 + l)));
+                    __m256i x2 = _mm256_cvtepi8_epi16(_mm_load_si128((__m128i *)(src2 + l)));
+                    __m256i x3 = _mm256_cvtepi8_epi16(_mm_load_si128((__m128i *)(src3 + l)));
+                    _mm256_store_si256((__m256i *)(tck + l), _mm256_add_epi16(_mm256_sub_epi16(x1, x2), x3));
+                }
+            } else {
+                copy_avx2(tmp, src1, vec_length);
+                sub_avx2(tmp, src2, vec_length);
+                sub_avx2(tmp, src3, vec_length);
+                for (long l = 0; l < vec_length; l += 16) {
+                    __m256i x1 = _mm256_cvtepi8_epi16(_mm_load_si128((__m128i *)(src1 + l)));
+                    __m256i x2 = _mm256_cvtepi8_epi16(_mm_load_si128((__m128i *)(src2 + l)));
+                    __m256i x3 = _mm256_cvtepi8_epi16(_mm_load_si128((__m128i *)(src3 + l)));
+                    _mm256_store_si256((__m256i *)(tck + l), _mm256_sub_epi16(_mm256_sub_epi16(x1, x2), x3));
+                }
+            }
+
+            dst_vsum[ind] = _compute_sum(tmp);
+            _compute_coeff(coeff, tmp, dst_vsum[ind]);
+            _compute_fvec(fvec, coeff);
+            fnorm[0] = 0.5 * dot_avx2(fvec, fvec, vec_length);
+            dst_vnorm[ind] = round(fnorm[0]);
+            for (long i = 0; i < vec_length; i += 16) {
+                __m128i lo = _mm256_cvtepi32_epi8(_mm256_cvtps_epi32(_mm256_load_ps(fvec + i)));
+                __m128i hi = _mm256_cvtepi32_epi8(_mm256_cvtps_epi32(_mm256_load_ps(fvec + i + 8)));
+                _mm_store_si128((__m128i *)(dst_vec + ind * vec_length + i), _mm_or_si128(_mm_slli_si128(hi, 8), lo));
+            }
+
+            for (long l = 0; l < vec_length; l += 16) {
+                __m256i diff = _mm256_abs_epi16(_mm256_sub_epi16(_mm256_load_si256((__m256i *)(tck + l)), _mm256_cvtepi8_epi16(_mm_load_si128((__m128i *)(dst_vec + ind * vec_length + l)))));
+                if (_mm256_movemask_epi8(_mm256_cmpgt_epi16(diff, diff_bound))) {
+                    dst_vnorm[ind] = 2147483647;
+                    break;
+                }
+            }
+
+            #if REJ_ENTRY128
+            do {
+                __m256i err0x80 = _mm256_setzero_si256();
+                __m256i all0x80 = _mm256_set1_epi32(0x80808080);
+                for (long l = 0; l < vec_length; l += 32) {
+                    err0x80 = _mm256_or_si256(err0x80, _mm256_cmpeq_epi8(all0x80, _mm256_load_si256((__m256i *)(dst_vec + ind * vec_length + l))));
+                }
+                if (!_mm256_testz_si256(err0x80, err0x80)) dst_vnorm[ind] = 2147483647;
+            } while (0);
+            #endif
+
+            dst_vsum[ind] = _compute_sum(dst_vec + ind * vec_length);
+            ind++;
+        }
+    }
+
+    return 1;
+}
+
+template <uint32_t nb>
+int Pool_epi8_t<nb>::_sol_list_to_vec_cpu_parallel(sol_list_epi8_t **sol_list,
+                                                   long num_sol_list,
+                                                   int8_t *dst_vec,
+                                                   uint64_t *dst_vu,
+                                                   int32_t *dst_vnorm,
+                                                   int32_t *dst_vsum) {
+    if (!bgj_cpu_materialize_threads_env_present()) return 0;
+    if (num_sol_list <= 0) return 1;
+
+    long num_total_sol = 0;
+    for (long thread = 0; thread < num_sol_list; thread++) {
+        num_total_sol += sol_list[thread]->num_sol();
+    }
+    if (num_total_sol == 0) return 1;
+    if (num_total_sol > 0xffffffffL) return 0;
+
+    bgj_cuda_materialize_desc_t *desc =
+        (bgj_cuda_materialize_desc_t *)NEW_VEC(num_total_sol, sizeof(bgj_cuda_materialize_desc_t));
+    if (!desc) return 0;
+    _sol_list_to_desc(sol_list, num_sol_list, desc, dst_vu);
+    const long cpu_threads = bgj_cpu_materialize_threads(num_sol_list);
+    const int ok = _desc_to_vec_cpu(desc, num_total_sol, cpu_threads, dst_vec, dst_vnorm, dst_vsum);
+    FREE_VEC(desc);
+    return ok;
+}
+
+template <uint32_t nb>
+int Pool_epi8_t<nb>::_sol_list_to_vec_cuda(sol_list_epi8_t **sol_list, long num_sol_list, int8_t *dst_vec, uint64_t *dst_vu, int32_t *dst_vnorm, int32_t *dst_vsum) {
+    if (!bgj_cuda_materialize_requested() || bgj_cuda_device_count() <= 0) return 0;
+    if (num_sol_list <= 0) return 1;
+
+    long num_total_sol = 0;
+    for (long thread = 0; thread < num_sol_list; thread++) {
+        num_total_sol += sol_list[thread]->num_sol();
+    }
+    if (num_total_sol == 0) return 1;
+    if (num_total_sol > 0xffffffffL ||
+        num_vec < 0 || num_vec > 0xffffffffL ||
+        vec_length <= 0 || vec_length > 0xffffffffL ||
+        CSD <= 0 || CSD > 0xffffffffL) {
+        return 0;
+    }
+
+    bgj_cuda_materialize_desc_t *desc =
+        (bgj_cuda_materialize_desc_t *) NEW_VEC(num_total_sol, sizeof(bgj_cuda_materialize_desc_t));
+    if (!desc) return 0;
+
+    const long flattened = _sol_list_to_desc(sol_list, num_sol_list, desc, dst_vu);
+    if (flattened != num_total_sol) {
+        FREE_VEC(desc);
+        return 0;
+    }
+
+    int ok = 0;
+    if (bgj_cuda_materialize_hybrid_requested()) {
+        const long gpu_count = bgj_cuda_materialize_hybrid_gpu_count(num_total_sol);
+        const long cpu_count = num_total_sol - gpu_count;
+        const long cpu_threads = bgj_cpu_materialize_threads(num_sol_list);
+        if (gpu_count <= 0) {
+            ok = _desc_to_vec_cpu(desc, num_total_sol, cpu_threads, dst_vec, dst_vnorm, dst_vsum);
+        } else if (cpu_count <= 0) {
+            ok = bgj_cuda_materialize_sol_list_raw(vec,
+                                                   pool_epoch,
+                                                   (uint32_t)num_vec,
+                                                   (uint32_t)vec_length,
+                                                   desc,
+                                                   (uint32_t)num_total_sol,
+                                                   _b_dual,
+                                                   _b_local ? _b_local[0] : NULL,
+                                                   (uint32_t)CSD,
+                                                   _dhalf,
+                                                   _dshift,
+                                                   dst_vec,
+                                                   dst_vnorm,
+                                                   dst_vsum);
+        } else {
+            int gpu_ok = 0;
+            std::thread gpu_thread([&]() {
+                gpu_ok = bgj_cuda_materialize_sol_list_raw(vec,
+                                                           pool_epoch,
+                                                           (uint32_t)num_vec,
+                                                           (uint32_t)vec_length,
+                                                           desc,
+                                                           (uint32_t)gpu_count,
+                                                           _b_dual,
+                                                           _b_local ? _b_local[0] : NULL,
+                                                           (uint32_t)CSD,
+                                                           _dhalf,
+                                                           _dshift,
+                                                           dst_vec,
+                                                           dst_vnorm,
+                                                           dst_vsum);
+            });
+            const int cpu_ok = _desc_to_vec_cpu(desc + gpu_count,
+                                                cpu_count,
+                                                cpu_threads,
+                                                dst_vec + (uint64_t)gpu_count * vec_length,
+                                                dst_vnorm + gpu_count,
+                                                dst_vsum + gpu_count);
+            gpu_thread.join();
+            ok = gpu_ok && cpu_ok;
+            if (!ok && cpu_ok) {
+                ok = _desc_to_vec_cpu(desc, num_total_sol, cpu_threads, dst_vec, dst_vnorm, dst_vsum);
+            }
+        }
+    } else {
+        ok = bgj_cuda_materialize_sol_list_raw(vec,
+                                               pool_epoch,
+                                               (uint32_t)num_vec,
+                                               (uint32_t)vec_length,
+                                               desc,
+                                               (uint32_t)num_total_sol,
+                                               _b_dual,
+                                               _b_local ? _b_local[0] : NULL,
+                                               (uint32_t)CSD,
+                                               _dhalf,
+                                               _dshift,
+                                               dst_vec,
+                                               dst_vnorm,
+                                               dst_vsum);
+    }
     FREE_VEC(desc);
     if (!ok) {
         static int warned = 0;
@@ -2817,11 +3186,16 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
     uint64_t *vu_to_insert = (uint64_t *) NEW_VEC(num_total_sol, sizeof(uint64_t));
     int32_t *vnorm_to_insert = (int32_t *) NEW_VEC(num_total_sol, sizeof(int32_t));
     int32_t *vsum_to_insert = (int32_t *) NEW_VEC(num_total_sol, sizeof(int32_t));
+    int materialized = 0;
     #if defined(HAVE_CUDA)
-    if (!(bgj_cuda_search_requested() &&
-          _sol_list_to_vec_cuda(sol_list, num_sol_list, vec_to_insert, vu_to_insert, vnorm_to_insert, vsum_to_insert)))
+    if (bgj_cuda_search_requested() &&
+        _sol_list_to_vec_cuda(sol_list, num_sol_list, vec_to_insert, vu_to_insert, vnorm_to_insert, vsum_to_insert)) {
+        materialized = 1;
+    } else if (_sol_list_to_vec_cpu_parallel(sol_list, num_sol_list, vec_to_insert, vu_to_insert, vnorm_to_insert, vsum_to_insert)) {
+        materialized = 1;
+    }
     #endif
-    {
+    if (!materialized) {
         _sol_list_to_vec(sol_list, num_sol_list, vec_to_insert, vu_to_insert, vnorm_to_insert, vsum_to_insert);
     }
 

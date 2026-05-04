@@ -113,9 +113,15 @@ cuBLAS chunk size with `BGJ_CUDA_MATERIALIZE_CHUNK=<n>` when profiling it.
 A fused one-kernel small-batch materializer is also available with
 `BGJ_CUDA_MATERIALIZE_FUSED=1` and capped by
 `BGJ_CUDA_MATERIALIZE_FUSED_MAX=<n>`, but it is not the default on A100 because
-cached cuBLAS is usually faster in the current microbenchmarks. The
-materializer remains off by default because current end-to-end SVP-60/70 A100
-timings are still slower than the optimized AVX2 CPU materializer.
+cached cuBLAS is usually faster in the current microbenchmarks. Set
+`BGJ_CUDA_MATERIALIZE_HYBRID=1` to split a materialization batch between GPU
+and CPU; tune the GPU share with `BGJ_CUDA_MATERIALIZE_GPU_PERCENT=<0..100>` or
+an exact `BGJ_CUDA_MATERIALIZE_GPU_COUNT=<n>`. In CUDA builds,
+`BGJ_CPU_MATERIALIZE_THREADS=<n>` enables the shared descriptor materializer on
+the CPU and can temporarily use more CPU cores for this step, including when
+CUDA materialization is disabled. The materializer remains off by default
+because current end-to-end SVP-60/70 A100 timings are still slower than the
+optimized AVX2 CPU materializer.
 The default CUDA/BGJ build now instantiates `Pool_epi8_t<6>` and
 `Pool_epi8_t<7>`, allowing non-LSH BGJ/CUDA paths to use 192- and
 224-dimensional int8 pool vectors. The LSH and AMX paths remain capped by their
