@@ -3,6 +3,9 @@
 #include "../include/bucket_epi8.h"
 #include "../include/bgj_cuda.h"
 
+#include <errno.h>
+#include <math.h>
+#include <stdlib.h>
 #include <sys/time.h>
 #include <malloc.h>
 
@@ -42,6 +45,49 @@ static double bgj_epi8_wall_time()
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
+}
+
+static int bgj_epi8_parse_env_double(const char *name, double *value)
+{
+    const char *env = getenv(name);
+    if (!env || !env[0]) return 0;
+
+    errno = 0;
+    char *end = NULL;
+    const double parsed = strtod(env, &end);
+    if (errno || end == env || (end && *end) || !isfinite(parsed)) return 0;
+
+    *value = parsed;
+    return 1;
+}
+
+static double bgj1_epi8_bucket_alpha_runtime(long csd, long num_vec)
+{
+    double alpha = BGJ1_EPI8_BUCKET_ALPHA;
+    double value = 0.0;
+
+    if (bgj_epi8_parse_env_double("BGJ1_EPI8_BUCKET_ALPHA", &value) ||
+        bgj_epi8_parse_env_double("BGJ_EPI8_BUCKET_ALPHA", &value)) {
+        if (value > 0.0 && value < 1.0) alpha = value;
+    } else if (bgj_epi8_parse_env_double("BGJ1_EPI8_BUCKET_TARGET_SIZE", &value) ||
+               bgj_epi8_parse_env_double("BGJ_EPI8_BUCKET_TARGET_SIZE", &value)
+#if defined(HAVE_CUDA)
+               || (bgj_cuda_search_requested() && csd >= 40 && (value = 8192.0) > 0.0)
+#endif
+    ) {
+        if (value > 0.0 && csd > 0 && num_vec > 0) {
+            double ratio = value / (double)num_vec;
+            if (ratio > 0.95) ratio = 0.95;
+            if (ratio < 1e-9) ratio = 1e-9;
+
+            const double alpha2 = 1.0 - pow(ratio, 2.0 / (double)csd);
+            if (alpha2 > 0.0 && alpha2 < 1.0) alpha = sqrt(alpha2);
+        }
+    }
+
+    if (alpha < 0.01) alpha = 0.01;
+    if (alpha > 0.95) alpha = 0.95;
+    return alpha;
 }
 
 ///////////////// bgj_profile_data_t impl /////////////////
@@ -625,7 +671,6 @@ int Pool_epi8_t<nb>::bgj1_Sieve(long log_level, long lps_auto_adj){
     main_profile.init(this, log_level);
 
     ///////////////// params /////////////////
-    double alpha = BGJ1_EPI8_BUCKET_ALPHA;
     const double saturation_radius = 4.0/3.0;
     const double saturation_ratio = 0.375;
     const double one_epoch_ratio = 0.025;
@@ -639,6 +684,10 @@ int Pool_epi8_t<nb>::bgj1_Sieve(long log_level, long lps_auto_adj){
     main_profile.sort_time += CURRENT_TIME;
 
     main_profile.initial_log(1);
+    if (log_level >= 3 && CSD > MIN_LOG_CSD) {
+        fprintf(main_profile.log_out, "runtime_bucket_alpha = %f\n",
+                bgj1_epi8_bucket_alpha_runtime(CSD, num_vec));
+    }
 
     long sieving_stucked = 0;
     double first_collect_sol = -1.0;
@@ -670,6 +719,7 @@ int Pool_epi8_t<nb>::bgj1_Sieve(long log_level, long lps_auto_adj){
         bool rel_collection_stop = false;
         do {
             ///////////////// bucketing /////////////////
+            const double alpha = bgj1_epi8_bucket_alpha_runtime(CSD, num_vec);
             TIMER_START;
             bucket_epi8_t<BGJ1_EPI8_USE_3RED> *main_bucket[BGJ1_EPI8_BUCKET_BATCHSIZE];
             if (max_norm > 65535) {

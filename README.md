@@ -92,6 +92,16 @@ host threads, `BGJ_CUDA_BATCH_SIZE=<n>` to tune the group size, or
 `BGJ_CUDA_BATCH_MIN_DOTS=<n>` to tune the size threshold. With BGJ log level
 `2` or higher, the BGJ1 profile prints CUDA single-bucket, batched, cred, and
 fallback bucket counts, dot counts, and timings.
+For A100 tuning, BGJ1 bucket density can be changed without rebuilding:
+`BGJ1_EPI8_BUCKET_ALPHA=<x>` sets the alpha directly, while
+`BGJ1_EPI8_BUCKET_TARGET_SIZE=<n>` derives an alpha for the current pool size
+and sieving dimension. Lower alpha means larger buckets, which can feed the
+Tensor Core path better but may also increase solution materialization and
+insertion cost. CUDA BGJ1 runs at dimension 40 or larger use target `8192` by
+default unless an alpha or target is explicitly set. Benchmark modes such as
+`cuda-target8192-batch8` set this target through `bench/bgj_cuda_seed42.py`;
+on the current A100 dim70/dim80 seed-42 challenge runs, targets around `8192`
+were the best of the tested `2048/4096/8192/16384` range.
 Dense buckets can produce many CUDA solution records; `BGJ_CUDA_MAX_RESULTS`
 sets the per-bucket result capacity and defaults to `16777216` for the A100
 tuning path. On overflow the CUDA path now consumes the capped result prefix and

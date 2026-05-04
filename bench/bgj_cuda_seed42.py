@@ -333,6 +333,10 @@ def mode_command(app, lattice, mode, threads, log_level, seed):
         env["BGJ_CUDA_BATCH_SIZE"] = batch_match.group(1)
         env["BGJ_CUDA_BATCH_MIN_DOTS"] = "1"
 
+    target_match = re.search(r"target(\d+)", mode)
+    if target_match:
+        env["BGJ1_EPI8_BUCKET_TARGET_SIZE"] = target_match.group(1)
+
     if "tensor-off" in mode:
         env["BGJ_CUDA_TENSOR"] = "0"
 
