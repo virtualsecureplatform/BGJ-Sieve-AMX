@@ -42,6 +42,20 @@ bool same_entries(std::vector<bgj_cuda_bucket_entry_t> a,
     return true;
 }
 
+bool same_ordered_entries(const std::vector<bgj_cuda_bucket_entry_t> &a,
+                          const std::vector<bgj_cuda_bucket_entry_t> &b)
+{
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); i++) {
+        if (a[i].bucket != b[i].bucket ||
+            a[i].id != b[i].id ||
+            a[i].dot != b[i].dot) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool run_case(uint32_t dim, uint32_t pool_size)
 {
     const uint32_t alpha_x2_u16 = (uint32_t)std::llround(65536.0 * 2.0 * 0.35);
@@ -80,6 +94,22 @@ bool run_case(uint32_t dim, uint32_t pool_size)
             expected.push_back(entry);
         }
     }
+    std::vector<bgj_cuda_bucket_entry_t> expected_ordered;
+    for (uint32_t b = 0; b < num_centers; b++) {
+        for (int sign = 0; sign < 2; sign++) {
+            for (uint32_t id = 0; id < pool_size; id++) {
+                const int32_t dot = row_dot(pool, center_ids[b], id, dim);
+                if ((sign == 0 && dot <= 0) || (sign == 1 && dot > 0)) continue;
+                const int32_t bound = (int32_t)(((int64_t)vnorm[id] * alpha_x2_u16) >> 16);
+                if ((dot < 0 ? -dot : dot) <= bound) continue;
+                bgj_cuda_bucket_entry_t entry;
+                entry.bucket = b;
+                entry.id = id;
+                entry.dot = dot;
+                expected_ordered.push_back(entry);
+            }
+        }
+    }
 
     std::vector<bgj_cuda_bucket_entry_t> got(expected.size() + 16);
     uint32_t count = 0;
@@ -109,32 +139,41 @@ bool run_case(uint32_t dim, uint32_t pool_size)
                   << " got=" << got.size() << "\n";
         return false;
     }
+    if (!same_ordered_entries(expected_ordered, got)) {
+        std::cerr << "CUDA deterministic bucket order mismatch for dim=" << dim
+                  << " pool_size=" << pool_size << "\n";
+        return false;
+    }
 
+    setenv("BGJ_CUDA_BUCKET_DETERMINISTIC", "0", 1);
+    setenv("BGJ_CUDA_BUCKET_TENSOR", "0", 1);
     setenv("BGJ_CUDA_BUCKET_BLOCK_APPEND", "1", 1);
     got.assign(expected.size() + 16, bgj_cuda_bucket_entry_t());
     count = 0;
     overflow = 0;
-    const int block_append_ok = bgj_cuda_bucket_bgj1_raw(pool.data(),
-                                                         101,
-                                                         pool_size,
-                                                         center_ids,
-                                                         num_centers,
-                                                         vnorm.data(),
-                                                         dim,
-                                                         alpha_x2_u16,
-                                                         got.data(),
-                                                         (uint32_t)got.size(),
-                                                         &count,
-                                                         &overflow);
+    const int legacy_block_append_ok = bgj_cuda_bucket_bgj1_raw(pool.data(),
+                                                                101,
+                                                                pool_size,
+                                                                center_ids,
+                                                                num_centers,
+                                                                vnorm.data(),
+                                                                dim,
+                                                                alpha_x2_u16,
+                                                                got.data(),
+                                                                (uint32_t)got.size(),
+                                                                &count,
+                                                                &overflow);
+    unsetenv("BGJ_CUDA_BUCKET_DETERMINISTIC");
     unsetenv("BGJ_CUDA_BUCKET_BLOCK_APPEND");
-    if (!block_append_ok || overflow) {
-        std::cerr << "CUDA block-append bucket raw failed: " << bgj_cuda_last_error()
+    setenv("BGJ_CUDA_BUCKET_TENSOR", "1", 1);
+    if (!legacy_block_append_ok || overflow) {
+        std::cerr << "CUDA legacy block-append bucket raw failed: " << bgj_cuda_last_error()
                   << " overflow=" << overflow << "\n";
         return false;
     }
     got.resize(count);
     if (!same_entries(expected, got)) {
-        std::cerr << "CUDA block-append bucket mismatch for dim=" << dim
+        std::cerr << "CUDA legacy block-append bucket mismatch for dim=" << dim
                   << " pool_size=" << pool_size
                   << " expected=" << expected.size()
                   << " got=" << got.size() << "\n";

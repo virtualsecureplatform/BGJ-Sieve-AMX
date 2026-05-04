@@ -52,6 +52,13 @@ static uint32_t bgj_cuda_bucket_entry_capacity(long batchsize,
     return (uint32_t)capacity;
 }
 
+static int bgj_cuda_bucket_deterministic_enabled()
+{
+    const char *env = getenv("BGJ_CUDA_BUCKET_DETERMINISTIC");
+    if (env && env[0]) return env[0] != '0';
+    return 1;
+}
+
 template <bool record_dp>
 static void bgj_bucket_remove_center_unordered(bucket_epi8_t<record_dp> *bkt)
 {
@@ -329,6 +336,7 @@ int Pool_epi8_t<nb>::_pool_bucketing(bucket_epi8_t<record_dp> **dst3, bucket_epi
             if (cuda_entries.size() == (size_t)entry_capacity) {
                 uint32_t entry_count = 0;
                 int overflow = 0;
+                const int deterministic_entries = bgj_cuda_bucket_deterministic_enabled();
                 const int ok = bgj_cuda_bucket_bgj1_raw(vec,
                                                         pool_epoch,
                                                         (uint32_t)num_vec,
@@ -363,7 +371,11 @@ int Pool_epi8_t<nb>::_pool_bucketing(bucket_epi8_t<record_dp> **dst3, bucket_epi
                         dst3[entry.bucket]->add_vec(entry.id, vnorm[entry.id], vsum[entry.id], entry.dot);
                     }
                     for (uint32_t i = 0; i < batchsize; i++) {
-                        bgj_bucket_remove_center_unordered(dst3[i]);
+                        if (deterministic_entries) {
+                            dst3[i]->remove_center(0);
+                        } else {
+                            bgj_bucket_remove_center_unordered(dst3[i]);
+                        }
                     }
                     FREE_VEC((void *) center);
                     return 1;
