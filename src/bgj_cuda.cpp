@@ -35,6 +35,11 @@ int bgj_cuda_materialize_requested()
     return 0;
 }
 
+int bgj_cuda_bucket_requested()
+{
+    return 0;
+}
+
 int bgj_cuda_device_count()
 {
     return 0;
@@ -159,6 +164,15 @@ static int bgj_cuda_sort_results_requested()
 int bgj_cuda_materialize_requested()
 {
     const char *env = getenv("BGJ_CUDA_MATERIALIZE");
+    if (env && env[0]) return env[0] != '0';
+    return 0;
+}
+
+int bgj_cuda_bucket_requested()
+{
+    const char *env = getenv("BGJ_CUDA_BUCKET");
+    if (env && env[0]) return env[0] != '0';
+    env = getenv("BGJ_CUDA_BUCKETING");
     if (env && env[0]) return env[0] != '0';
     return 0;
 }

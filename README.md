@@ -25,8 +25,8 @@ $ make
 ```
 
 CUDA support can be enabled for the exact pair-search stage of `bgj1`. The
-CPU implementation is still used for bucketing, lifting, insertion, and the
-other sieve variants.
+CPU implementation is still used by default for bucketing, lifting, insertion,
+and the other sieve variants.
 
 ```bash
 $ make clean
@@ -59,6 +59,16 @@ with `BGJ_CUDA_SEARCH=1`. If CUDA is unavailable or an internal result buffer
 overflows, the code falls back to the existing CPU search for that bucket. The
 default result buffer holds `4194304` candidates per bucket and can be changed
 with `BGJ_CUDA_MAX_RESULTS`.
+
+An experimental BGJ1 pool-bucketing offload is available with
+`BGJ_CUDA_BUCKET=1`. It preserves the current threshold-based bucket
+membership rule, writes the same positive/negative dot-product records used by
+the CPU search path, and falls back to CPU bucketing if the CUDA output buffer
+overflows. Tune the temporary output buffer with `BGJ_CUDA_BUCKET_MARGIN=<n>`
+or cap it with `BGJ_CUDA_BUCKET_MAX_ENTRIES=<n>`. An A100 INT8 Tensor Core
+bucketing kernel for full 16x16 center/vector tiles is available for profiling
+with `BGJ_CUDA_BUCKET_TENSOR=1`, but the scalar `dp4a` bucketing kernel is the
+default because it is faster in the current SVP70/SVP80 timing runs.
 
 On A100-class GPUs, CUDA search uses experimental INT8 Tensor Core paths for
 full 16x16 bucket tiles by default. Tensor kernels process four independent
@@ -165,6 +175,16 @@ $ /tmp/bgj_cuda_raw_bench
 $ BGJ_CUDA_TENSOR=0 /tmp/bgj_cuda_raw_bench
 $ /tmp/bgj_cuda_raw_bench 160 8192 8192 100 1 1 8
 $ /tmp/bgj_cuda_raw_bench 224 8192 8192 50 1 1 1 8
+```
+
+The raw CUDA bucketer has a small oracle test:
+
+```bash
+$ clang++ -O2 -g -std=c++11 -DHAVE_CUDA tests/bgj_cuda_bucket_test.cpp src/libllib.a \
+    -Iinclude -Idep/ntl/include -Ldep/ntl/lib -lntl -Ldep/gmp/lib -lgmp -lm \
+    -L/usr/local/cuda/lib64 -Wl,-rpath=/usr/local/cuda/lib64 -lcudart -lcublas \
+    -fopenmp=libomp -stdlib=libc++ -pthread -o /tmp/bgj_cuda_bucket_test
+$ /tmp/bgj_cuda_bucket_test
 ```
 
 The raw CUDA materializer has a small correctness test:

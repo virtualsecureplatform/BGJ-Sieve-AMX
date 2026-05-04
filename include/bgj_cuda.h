@@ -24,6 +24,14 @@ struct bgj_cuda_materialize_desc_t {
     uint32_t z;
 };
 
+struct bgj_cuda_bucket_entry_t {
+    uint32_t bucket;
+    uint32_t id;
+    int32_t norm;
+    int32_t sum;
+    int32_t dot;
+};
+
 int bgj_cuda_device_count();
 const char *bgj_cuda_last_error();
 int bgj_cuda_search_requested();
@@ -31,6 +39,21 @@ void bgj_cuda_set_search_requested(int enabled);
 uint32_t bgj_cuda_batch_size(uint32_t host_threads);
 uint64_t bgj_cuda_batch_min_dots();
 int bgj_cuda_materialize_requested();
+int bgj_cuda_bucket_requested();
+
+extern "C" int bgj_cuda_bucket_bgj1_raw(const int8_t *pool_vecs,
+                                         uint64_t pool_epoch,
+                                         uint32_t pool_size,
+                                         const uint32_t *center_ids,
+                                         uint32_t num_centers,
+                                         const int32_t *vnorm,
+                                         const int32_t *vsum,
+                                         uint32_t vec_length,
+                                         uint32_t alpha_x2_u16,
+                                         bgj_cuda_bucket_entry_t *entries,
+                                         uint32_t entry_capacity,
+                                         uint32_t *entry_count,
+                                         int *overflow);
 
 extern "C" int bgj_cuda_materialize_sol_list_raw(const int8_t *pool_vecs,
                                                   uint64_t pool_epoch,

@@ -185,6 +185,61 @@ struct bgj_cuda_raw_batch_scratch_t {
 
 static thread_local bgj_cuda_raw_batch_scratch_t bgj_cuda_raw_batch_scratch;
 
+struct bgj_cuda_bucket_scratch_t {
+    uint32_t *center_ids;
+    int8_t *center_vecs;
+    int32_t *vnorm;
+    int32_t *vsum;
+    bgj_cuda_bucket_entry_t *entries;
+    uint32_t *entry_count;
+    int *overflow;
+    cudaStream_t stream;
+
+    size_t center_id_capacity;
+    size_t center_vec_capacity;
+    size_t vnorm_capacity;
+    size_t vsum_capacity;
+    size_t entry_capacity;
+    size_t entry_count_capacity;
+    size_t overflow_capacity;
+    int stream_ready;
+
+    bgj_cuda_bucket_scratch_t()
+        : center_ids(NULL),
+          center_vecs(NULL),
+          vnorm(NULL),
+          vsum(NULL),
+          entries(NULL),
+          entry_count(NULL),
+          overflow(NULL),
+          stream(NULL),
+          center_id_capacity(0),
+          center_vec_capacity(0),
+          vnorm_capacity(0),
+          vsum_capacity(0),
+          entry_capacity(0),
+          entry_count_capacity(0),
+          overflow_capacity(0),
+          stream_ready(0)
+    {
+    }
+
+    ~bgj_cuda_bucket_scratch_t()
+    {
+        if (stream_ready) cudaStreamSynchronize(stream);
+        cudaFree(center_ids);
+        cudaFree(center_vecs);
+        cudaFree(vnorm);
+        cudaFree(vsum);
+        cudaFree(entries);
+        cudaFree(entry_count);
+        cudaFree(overflow);
+        if (stream_ready) cudaStreamDestroy(stream);
+    }
+};
+
+static thread_local bgj_cuda_bucket_scratch_t bgj_cuda_bucket_scratch;
+
 static void set_cuda_error(const char *context, cudaError_t err)
 {
     snprintf(bgj_cuda_error, sizeof(bgj_cuda_error), "%s: %s", context, cudaGetErrorString(err));
@@ -1144,6 +1199,140 @@ __global__ void bgj_cuda_pack_pool_vecs_kernel(const int8_t *pool_vecs,
     }
 }
 
+__device__ void bgj_cuda_push_bucket_entry(bgj_cuda_bucket_entry_t *entries,
+                                           uint32_t *entry_count,
+                                           int *overflow,
+                                           uint32_t capacity,
+                                           uint32_t bucket,
+                                           uint32_t id,
+                                           int32_t norm,
+                                           int32_t sum,
+                                           int32_t dot)
+{
+    const uint32_t out = atomicAdd(entry_count, 1u);
+    if (out < capacity) {
+        entries[out].bucket = bucket;
+        entries[out].id = id;
+        entries[out].norm = norm;
+        entries[out].sum = sum;
+        entries[out].dot = dot;
+    } else {
+        *overflow = 1;
+    }
+}
+
+__global__ void bgj_cuda_bucket_bgj1_kernel(const int8_t *pool_vecs,
+                                            const uint32_t *center_ids,
+                                            uint32_t num_centers,
+                                            const int32_t *vnorm,
+                                            const int32_t *vsum,
+                                            uint32_t pool_size,
+                                            uint32_t start_id,
+                                            uint32_t candidate_count,
+                                            uint32_t vec_length,
+                                            uint32_t alpha_x2_u16,
+                                            bgj_cuda_bucket_entry_t *entries,
+                                            uint32_t entry_capacity,
+                                            uint32_t *entry_count,
+                                            int *overflow)
+{
+    const uint64_t total = (uint64_t)candidate_count * num_centers;
+    const uint64_t stride = (uint64_t)blockDim.x * gridDim.x;
+    for (uint64_t pos = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+         pos < total;
+         pos += stride) {
+        const uint32_t bucket = (uint32_t)(pos / candidate_count);
+        const uint32_t id = start_id + (uint32_t)(pos - (uint64_t)bucket * candidate_count);
+        const uint32_t center_id = center_ids[bucket];
+        if (center_id >= pool_size) continue;
+
+        const int32_t dot = bgj_cuda_dot_i8(pool_vecs + (uint64_t)center_id * vec_length,
+                                            pool_vecs + (uint64_t)id * vec_length,
+                                            vec_length);
+        const int32_t norm = vnorm[id];
+        const int32_t sum = vsum[id];
+        const int32_t bound = (int32_t)(((int64_t)norm * (int64_t)alpha_x2_u16) >> 16);
+        const int32_t abs_dot = dot < 0 ? -dot : dot;
+        if (abs_dot > bound) {
+            bgj_cuda_push_bucket_entry(entries,
+                                       entry_count,
+                                       overflow,
+                                       entry_capacity,
+                                       bucket,
+                                       id,
+                                       norm,
+                                       sum,
+                                       dot);
+        }
+    }
+}
+
+__global__ __launch_bounds__(BGJ_CUDA_TENSOR_THREADS_PER_BLOCK, 2)
+void bgj_cuda_bucket_bgj1_tensor_kernel(const int8_t *center_vecs,
+                                        const int8_t *pool_vecs,
+                                        uint32_t num_center_tiles,
+                                        uint32_t num_pool_tiles,
+                                        const int32_t *vnorm,
+                                        const int32_t *vsum,
+                                        uint32_t vec_length,
+                                        uint32_t alpha_x2_u16,
+                                        bgj_cuda_bucket_entry_t *entries,
+                                        uint32_t entry_capacity,
+                                        uint32_t *entry_count,
+                                        int *overflow)
+{
+    const uint32_t warp_id = threadIdx.x / BGJ_CUDA_WARP_SIZE;
+    const uint32_t lane_id = threadIdx.x % BGJ_CUDA_WARP_SIZE;
+    const uint32_t tile = blockIdx.x * BGJ_CUDA_TENSOR_WARPS_PER_BLOCK + warp_id;
+    const uint32_t total_tiles = num_center_tiles * num_pool_tiles;
+    if (tile >= total_tiles) return;
+
+    const uint32_t center_tile = tile / num_pool_tiles;
+    const uint32_t pool_tile = tile - center_tile * num_pool_tiles;
+    const uint32_t bucket_base = center_tile * 16u;
+    const uint32_t id_base = pool_tile * 16u;
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, signed char, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, signed char, wmma::col_major> b_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, int> c_frag;
+    wmma::fill_fragment(c_frag, 0);
+
+    for (uint32_t k = 0; k < vec_length; k += 16) {
+        wmma::load_matrix_sync(a_frag,
+                               (const signed char *)(center_vecs + (uint64_t)bucket_base * vec_length + k),
+                               vec_length);
+        wmma::load_matrix_sync(b_frag,
+                               (const signed char *)(pool_vecs + (uint64_t)id_base * vec_length + k),
+                               vec_length);
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+    }
+
+    #pragma unroll
+    for (uint32_t element = 0; element < c_frag.num_elements; element++) {
+        uint32_t row;
+        uint32_t col;
+        bgj_cuda_tensor_accumulator_coord(lane_id, element, &row, &col);
+        const uint32_t bucket = bucket_base + row;
+        const uint32_t id = id_base + col;
+        const int32_t dot = c_frag.x[element];
+        const int32_t norm = vnorm[id];
+        const int32_t sum = vsum[id];
+        const int32_t bound = (int32_t)(((int64_t)norm * (int64_t)alpha_x2_u16) >> 16);
+        const int32_t abs_dot = dot < 0 ? -dot : dot;
+        if (abs_dot > bound) {
+            bgj_cuda_push_bucket_entry(entries,
+                                       entry_count,
+                                       overflow,
+                                       entry_capacity,
+                                       bucket,
+                                       id,
+                                       norm,
+                                       sum,
+                                       dot);
+        }
+    }
+}
+
 #define CUDA_TRY(call)                                      \
     do {                                                    \
         cudaError_t err__ = (call);                         \
@@ -1296,6 +1485,18 @@ static int bgj_cuda_prepare_stream(bgj_cuda_raw_scratch_t *scratch)
     cudaError_t err = cudaStreamCreateWithFlags(&scratch->stream, cudaStreamNonBlocking);
     if (err != cudaSuccess) {
         set_cuda_error("cudaStreamCreateWithFlags", err);
+        return 0;
+    }
+    scratch->stream_ready = 1;
+    return 1;
+}
+
+static int bgj_cuda_prepare_bucket_stream(bgj_cuda_bucket_scratch_t *scratch)
+{
+    if (scratch->stream_ready) return 1;
+    cudaError_t err = cudaStreamCreateWithFlags(&scratch->stream, cudaStreamNonBlocking);
+    if (err != cudaSuccess) {
+        set_cuda_error("cudaStreamCreateWithFlags bucket", err);
         return 0;
     }
     scratch->stream_ready = 1;
@@ -2209,6 +2410,205 @@ static int bgj_cuda_tensor_capable()
     }
     capable = prop.major >= 8 ? 1 : 0;
     return capable;
+}
+
+static int bgj_cuda_bucket_tensor_requested()
+{
+    const char *env = getenv("BGJ_CUDA_BUCKET_TENSOR");
+    if (env && env[0]) return env[0] != '0';
+    return 0;
+}
+
+extern "C" int bgj_cuda_bucket_bgj1_raw(const int8_t *pool_vecs,
+                                         uint64_t pool_epoch,
+                                         uint32_t pool_size,
+                                         const uint32_t *center_ids,
+                                         uint32_t num_centers,
+                                         const int32_t *vnorm,
+                                         const int32_t *vsum,
+                                         uint32_t vec_length,
+                                         uint32_t alpha_x2_u16,
+                                         bgj_cuda_bucket_entry_t *entries,
+                                         uint32_t entry_capacity,
+                                         uint32_t *entry_count,
+                                         int *overflow)
+{
+    if (entry_count) *entry_count = 0;
+    if (overflow) *overflow = 0;
+    if (!pool_vecs || !center_ids || !vnorm || !vsum || !entries ||
+        !entry_count || !overflow) {
+        set_plain_error("invalid bucket pointer");
+        return 0;
+    }
+    if (pool_size == 0 || num_centers == 0 || vec_length == 0) {
+        set_plain_error("no CUDA error");
+        return 1;
+    }
+    if (entry_capacity == 0) {
+        set_plain_error("bucket entry capacity is zero");
+        return 0;
+    }
+
+    bgj_cuda_bucket_scratch_t *scratch = &bgj_cuda_bucket_scratch;
+    if (!bgj_cuda_prepare_bucket_stream(scratch)) return 0;
+    cudaStream_t stream = scratch->stream;
+    int8_t *device_pool_vecs = NULL;
+    uint32_t h_entry_count = 0;
+    int h_overflow = 0;
+
+    const size_t pool_vec_bytes = (size_t)pool_size * (size_t)vec_length * sizeof(int8_t);
+    const size_t center_id_bytes = (size_t)num_centers * sizeof(uint32_t);
+    const size_t center_vec_bytes = (size_t)num_centers * (size_t)vec_length * sizeof(int8_t);
+    const size_t i32_bytes = (size_t)pool_size * sizeof(int32_t);
+    const size_t entry_bytes = (size_t)entry_capacity * sizeof(bgj_cuda_bucket_entry_t);
+
+    if (!bgj_cuda_prepare_shared_pool_cache(pool_vecs,
+                                            pool_epoch,
+                                            pool_size,
+                                            vec_length,
+                                            pool_vec_bytes,
+                                            stream,
+                                            &device_pool_vecs)) {
+        goto fail;
+    }
+
+    CUDA_ENSURE(scratch->center_ids, scratch->center_id_capacity, center_id_bytes);
+    CUDA_ENSURE(scratch->vnorm, scratch->vnorm_capacity, i32_bytes);
+    CUDA_ENSURE(scratch->vsum, scratch->vsum_capacity, i32_bytes);
+    CUDA_ENSURE(scratch->entries, scratch->entry_capacity, entry_bytes);
+    CUDA_ENSURE(scratch->entry_count, scratch->entry_count_capacity, sizeof(uint32_t));
+    CUDA_ENSURE(scratch->overflow, scratch->overflow_capacity, sizeof(int));
+
+    CUDA_TRY(cudaMemcpyAsync(scratch->center_ids,
+                             center_ids,
+                             center_id_bytes,
+                             cudaMemcpyHostToDevice,
+                             stream));
+    CUDA_TRY(cudaMemcpyAsync(scratch->vnorm,
+                             vnorm,
+                             i32_bytes,
+                             cudaMemcpyHostToDevice,
+                             stream));
+    CUDA_TRY(cudaMemcpyAsync(scratch->vsum,
+                             vsum,
+                             i32_bytes,
+                             cudaMemcpyHostToDevice,
+                             stream));
+    CUDA_TRY(cudaMemsetAsync(scratch->entry_count, 0, sizeof(uint32_t), stream));
+    CUDA_TRY(cudaMemsetAsync(scratch->overflow, 0, sizeof(int), stream));
+
+    {
+        const int use_tensor = bgj_cuda_bucket_tensor_requested() &&
+                               bgj_cuda_tensor_capable() &&
+                               (vec_length % 16u) == 0 &&
+                               num_centers >= 16u &&
+                               (num_centers % 16u) == 0 &&
+                               pool_size >= 16u;
+        const uint32_t threads = 256;
+        uint32_t scalar_start = 0;
+        uint32_t scalar_count = pool_size;
+
+        if (use_tensor) {
+            const uint32_t tensor_pool_size = (pool_size / 16u) * 16u;
+            const uint32_t center_pack_blocks =
+                (uint32_t)((center_vec_bytes + threads - 1u) / threads);
+            uint32_t bounded_center_pack_blocks = center_pack_blocks;
+            if (bounded_center_pack_blocks == 0) bounded_center_pack_blocks = 1;
+            if (bounded_center_pack_blocks > 65535u) bounded_center_pack_blocks = 65535u;
+
+            CUDA_ENSURE(scratch->center_vecs, scratch->center_vec_capacity, center_vec_bytes);
+            bgj_cuda_pack_pool_vecs_kernel<<<bounded_center_pack_blocks,
+                                             threads,
+                                             0,
+                                             stream>>>(device_pool_vecs,
+                                                       scratch->center_ids,
+                                                       num_centers,
+                                                       vec_length,
+                                                       scratch->center_vecs);
+            CUDA_TRY(cudaGetLastError());
+
+            const uint32_t num_center_tiles = num_centers / 16u;
+            const uint32_t num_pool_tiles = tensor_pool_size / 16u;
+            const uint64_t tensor_tiles = (uint64_t)num_center_tiles * num_pool_tiles;
+            uint32_t tensor_grid =
+                (uint32_t)((tensor_tiles + BGJ_CUDA_TENSOR_WARPS_PER_BLOCK - 1u) /
+                           BGJ_CUDA_TENSOR_WARPS_PER_BLOCK);
+            if (tensor_grid == 0) tensor_grid = 1;
+            bgj_cuda_bucket_bgj1_tensor_kernel<<<tensor_grid,
+                                                 BGJ_CUDA_TENSOR_THREADS_PER_BLOCK,
+                                                 0,
+                                                 stream>>>(scratch->center_vecs,
+                                                           device_pool_vecs,
+                                                           num_center_tiles,
+                                                           num_pool_tiles,
+                                                           scratch->vnorm,
+                                                           scratch->vsum,
+                                                           vec_length,
+                                                           alpha_x2_u16,
+                                                           scratch->entries,
+                                                           entry_capacity,
+                                                           scratch->entry_count,
+                                                           scratch->overflow);
+            CUDA_TRY(cudaGetLastError());
+            scalar_start = tensor_pool_size;
+            scalar_count = pool_size - tensor_pool_size;
+        }
+
+        if (scalar_count) {
+            const uint64_t total_pairs = (uint64_t)scalar_count * num_centers;
+            uint32_t blocks = (uint32_t)((total_pairs + threads - 1u) / threads);
+            if (blocks == 0) blocks = 1;
+            if (blocks > 65535u) blocks = 65535u;
+            bgj_cuda_bucket_bgj1_kernel<<<blocks, threads, 0, stream>>>(device_pool_vecs,
+                                                                        scratch->center_ids,
+                                                                        num_centers,
+                                                                        scratch->vnorm,
+                                                                        scratch->vsum,
+                                                                        pool_size,
+                                                                        scalar_start,
+                                                                        scalar_count,
+                                                                        vec_length,
+                                                                        alpha_x2_u16,
+                                                                        scratch->entries,
+                                                                        entry_capacity,
+                                                                        scratch->entry_count,
+                                                                        scratch->overflow);
+            CUDA_TRY(cudaGetLastError());
+        }
+    }
+    CUDA_TRY(cudaMemcpyAsync(&h_entry_count,
+                             scratch->entry_count,
+                             sizeof(uint32_t),
+                             cudaMemcpyDeviceToHost,
+                             stream));
+    CUDA_TRY(cudaMemcpyAsync(&h_overflow,
+                             scratch->overflow,
+                             sizeof(int),
+                             cudaMemcpyDeviceToHost,
+                             stream));
+    CUDA_TRY(cudaStreamSynchronize(stream));
+
+    if (h_entry_count > entry_capacity) {
+        h_entry_count = entry_capacity;
+        h_overflow = 1;
+    }
+    if (h_entry_count) {
+        CUDA_TRY(cudaMemcpyAsync(entries,
+                                 scratch->entries,
+                                 (size_t)h_entry_count * sizeof(bgj_cuda_bucket_entry_t),
+                                 cudaMemcpyDeviceToHost,
+                                 stream));
+        CUDA_TRY(cudaStreamSynchronize(stream));
+    }
+
+    *entry_count = h_entry_count;
+    *overflow = h_overflow;
+    set_plain_error("no CUDA error");
+    return 1;
+
+fail:
+    if (scratch->stream_ready) cudaStreamSynchronize(scratch->stream);
+    return 0;
 }
 
 static int bgj_cuda_search_bucket_raw_submit(bgj_cuda_raw_scratch_t *scratch,

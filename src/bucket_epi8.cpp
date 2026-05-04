@@ -4,7 +4,58 @@
 #include "../include/bgj_cuda.h"
 #endif
 
+#include <stdint.h>
+#include <stdlib.h>
 #include <thread>
+#include <vector>
+
+#if defined(HAVE_CUDA)
+static uint32_t bgj_cuda_bucket_entry_capacity(long batchsize,
+                                               long expect_bucket_size,
+                                               long num_vec)
+{
+    if (batchsize <= 0 || num_vec <= 0) return 0;
+    uint64_t margin = 4;
+    const char *margin_env = getenv("BGJ_CUDA_BUCKET_MARGIN");
+    if (margin_env && margin_env[0]) {
+        uint64_t parsed = strtoull(margin_env, NULL, 10);
+        if (parsed > 0) margin = parsed;
+    }
+    if (margin > 64) margin = 64;
+
+    uint64_t max_entries = 1ULL << 24;
+    const char *max_env = getenv("BGJ_CUDA_BUCKET_MAX_ENTRIES");
+    if (max_env && max_env[0]) {
+        uint64_t parsed = strtoull(max_env, NULL, 10);
+        if (parsed > 0) max_entries = parsed;
+    }
+
+    const uint64_t centers = (uint64_t)batchsize;
+    const uint64_t expected = expect_bucket_size > 0 ? (uint64_t)expect_bucket_size : 1024ULL;
+    uint64_t capacity = centers * expected * margin + centers * 1024ULL;
+    const uint64_t floor_capacity = centers * 4096ULL;
+    const uint64_t full_capacity = centers * (uint64_t)num_vec;
+    if (capacity < floor_capacity) capacity = floor_capacity;
+    if (capacity > full_capacity) capacity = full_capacity;
+    if (capacity > max_entries) capacity = max_entries;
+    if (capacity > 0xffffffffULL) capacity = 0xffffffffULL;
+    return (uint32_t)capacity;
+}
+
+template <bool record_dp>
+static void bgj_bucket_remove_center_unordered(bucket_epi8_t<record_dp> *bkt)
+{
+    for (long i = 0; i < bkt->num_pvec; i++) {
+        if (bkt->pvec[i] != bkt->center_ind) continue;
+        bkt->num_pvec--;
+        bkt->pvec[i] = bkt->pvec[bkt->num_pvec];
+        bkt->pnorm[i] = bkt->pnorm[bkt->num_pvec];
+        bkt->psum[i] = bkt->psum[bkt->num_pvec];
+        if (record_dp) bkt->pdot[i] = bkt->pdot[bkt->num_pvec];
+        return;
+    }
+}
+#endif
 
 
 ///////////////// bucket_epi8_t /////////////////
@@ -251,8 +302,70 @@ int Pool_epi8_t<nb>::_pool_bucketing(bucket_epi8_t<record_dp> **dst3, bucket_epi
         } while(!pass);
     }
 
+    #if defined(HAVE_CUDA)
+    if (for_bgj1 && record_dp && bgj_cuda_bucket_requested() &&
+        bgj_cuda_device_count() > 0 &&
+        num_vec > 0 && num_vec <= 0xffffffffL) {
+        const uint32_t entry_capacity =
+            bgj_cuda_bucket_entry_capacity(batchsize, expect_bucket3_size, num_vec);
+        if (entry_capacity > 0) {
+            static thread_local std::vector<bgj_cuda_bucket_entry_t> cuda_entries;
+            try {
+                cuda_entries.resize((size_t)entry_capacity);
+            } catch (...) {
+                cuda_entries.clear();
+            }
+
+            if (cuda_entries.size() == (size_t)entry_capacity) {
+                uint32_t entry_count = 0;
+                int overflow = 0;
+                const int ok = bgj_cuda_bucket_bgj1_raw(vec,
+                                                        pool_epoch,
+                                                        (uint32_t)num_vec,
+                                                        center_ind_list,
+                                                        batchsize,
+                                                        vnorm,
+                                                        vsum,
+                                                        (uint32_t)vec_length,
+                                                        alpha3x2_epu16,
+                                                        cuda_entries.data(),
+                                                        entry_capacity,
+                                                        &entry_count,
+                                                        &overflow);
+                if (ok && !overflow) {
+                    std::vector<long> pcount(batchsize, 0);
+                    std::vector<long> ncount(batchsize, 0);
+                    for (uint32_t e = 0; e < entry_count; e++) {
+                        const bgj_cuda_bucket_entry_t &entry = cuda_entries[e];
+                        if (entry.bucket >= batchsize || entry.id >= (uint32_t)num_vec) continue;
+                        if (entry.dot > 0) {
+                            pcount[entry.bucket]++;
+                        } else {
+                            ncount[entry.bucket]++;
+                        }
+                    }
+                    for (uint32_t i = 0; i < batchsize; i++) {
+                        dst3[i]->_alloc(pcount[i], 1);
+                        dst3[i]->_alloc(ncount[i], 0);
+                    }
+                    for (uint32_t e = 0; e < entry_count; e++) {
+                        const bgj_cuda_bucket_entry_t &entry = cuda_entries[e];
+                        if (entry.bucket >= batchsize || entry.id >= (uint32_t)num_vec) continue;
+                        dst3[entry.bucket]->add_vec(entry.id, entry.norm, entry.sum, entry.dot);
+                    }
+                    for (uint32_t i = 0; i < batchsize; i++) {
+                        bgj_bucket_remove_center_unordered(dst3[i]);
+                    }
+                    FREE_VEC((void *) center);
+                    return 1;
+                }
+            }
+        }
+    }
+    #endif
+
     /////// each thread collect vectors in local buckets ///////
-    #pragma omp parallel for 
+    #pragma omp parallel for
     for (long thread = 0; thread < num_threads; thread++) {
         ///// prepare local buckets //////
         local_bucket3[thread] = new bucket_epi8_t<record_dp>[batchsize];
