@@ -325,7 +325,6 @@ int Pool_epi8_t<nb>::_pool_bucketing(bucket_epi8_t<record_dp> **dst3, bucket_epi
                                                         center_ind_list,
                                                         batchsize,
                                                         vnorm,
-                                                        vsum,
                                                         (uint32_t)vec_length,
                                                         alpha3x2_epu16,
                                                         cuda_entries.data(),
@@ -351,7 +350,7 @@ int Pool_epi8_t<nb>::_pool_bucketing(bucket_epi8_t<record_dp> **dst3, bucket_epi
                     for (uint32_t e = 0; e < entry_count; e++) {
                         const bgj_cuda_bucket_entry_t &entry = cuda_entries[e];
                         if (entry.bucket >= batchsize || entry.id >= (uint32_t)num_vec) continue;
-                        dst3[entry.bucket]->add_vec(entry.id, entry.norm, entry.sum, entry.dot);
+                        dst3[entry.bucket]->add_vec(entry.id, vnorm[entry.id], vsum[entry.id], entry.dot);
                     }
                     for (uint32_t i = 0; i < batchsize; i++) {
                         bgj_bucket_remove_center_unordered(dst3[i]);

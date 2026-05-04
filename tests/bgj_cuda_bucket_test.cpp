@@ -23,9 +23,7 @@ bool entry_less(const bgj_cuda_bucket_entry_t &a, const bgj_cuda_bucket_entry_t 
 {
     if (a.bucket != b.bucket) return a.bucket < b.bucket;
     if (a.id != b.id) return a.id < b.id;
-    if (a.dot != b.dot) return a.dot < b.dot;
-    if (a.norm != b.norm) return a.norm < b.norm;
-    return a.sum < b.sum;
+    return a.dot < b.dot;
 }
 
 bool same_entries(std::vector<bgj_cuda_bucket_entry_t> a,
@@ -37,8 +35,6 @@ bool same_entries(std::vector<bgj_cuda_bucket_entry_t> a,
     for (size_t i = 0; i < a.size(); i++) {
         if (a[i].bucket != b[i].bucket ||
             a[i].id != b[i].id ||
-            a[i].norm != b[i].norm ||
-            a[i].sum != b[i].sum ||
             a[i].dot != b[i].dot) {
             return false;
         }
@@ -80,8 +76,6 @@ bool run_case(uint32_t dim, uint32_t pool_size)
             bgj_cuda_bucket_entry_t entry;
             entry.bucket = b;
             entry.id = id;
-            entry.norm = vnorm[id];
-            entry.sum = vsum[id];
             entry.dot = dot;
             expected.push_back(entry);
         }
@@ -96,7 +90,6 @@ bool run_case(uint32_t dim, uint32_t pool_size)
                                             center_ids,
                                             num_centers,
                                             vnorm.data(),
-                                            vsum.data(),
                                             dim,
                                             alpha_x2_u16,
                                             got.data(),

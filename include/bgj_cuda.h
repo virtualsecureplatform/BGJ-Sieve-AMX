@@ -24,12 +24,11 @@ struct bgj_cuda_materialize_desc_t {
     uint32_t z;
 };
 
-struct bgj_cuda_bucket_entry_t {
+struct alignas(16) bgj_cuda_bucket_entry_t {
     uint32_t bucket;
     uint32_t id;
-    int32_t norm;
-    int32_t sum;
     int32_t dot;
+    uint32_t reserved;
 };
 
 int bgj_cuda_device_count();
@@ -47,7 +46,6 @@ extern "C" int bgj_cuda_bucket_bgj1_raw(const int8_t *pool_vecs,
                                          const uint32_t *center_ids,
                                          uint32_t num_centers,
                                          const int32_t *vnorm,
-                                         const int32_t *vsum,
                                          uint32_t vec_length,
                                          uint32_t alpha_x2_u16,
                                          bgj_cuda_bucket_entry_t *entries,

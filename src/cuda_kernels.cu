@@ -189,7 +189,6 @@ struct bgj_cuda_bucket_scratch_t {
     uint32_t *center_ids;
     int8_t *center_vecs;
     int32_t *vnorm;
-    int32_t *vsum;
     bgj_cuda_bucket_entry_t *entries;
     uint32_t *entry_count;
     int *overflow;
@@ -198,7 +197,6 @@ struct bgj_cuda_bucket_scratch_t {
     size_t center_id_capacity;
     size_t center_vec_capacity;
     size_t vnorm_capacity;
-    size_t vsum_capacity;
     size_t entry_capacity;
     size_t entry_count_capacity;
     size_t overflow_capacity;
@@ -208,7 +206,6 @@ struct bgj_cuda_bucket_scratch_t {
         : center_ids(NULL),
           center_vecs(NULL),
           vnorm(NULL),
-          vsum(NULL),
           entries(NULL),
           entry_count(NULL),
           overflow(NULL),
@@ -216,7 +213,6 @@ struct bgj_cuda_bucket_scratch_t {
           center_id_capacity(0),
           center_vec_capacity(0),
           vnorm_capacity(0),
-          vsum_capacity(0),
           entry_capacity(0),
           entry_count_capacity(0),
           overflow_capacity(0),
@@ -230,7 +226,6 @@ struct bgj_cuda_bucket_scratch_t {
         cudaFree(center_ids);
         cudaFree(center_vecs);
         cudaFree(vnorm);
-        cudaFree(vsum);
         cudaFree(entries);
         cudaFree(entry_count);
         cudaFree(overflow);
@@ -1205,16 +1200,12 @@ __device__ void bgj_cuda_push_bucket_entry(bgj_cuda_bucket_entry_t *entries,
                                            uint32_t capacity,
                                            uint32_t bucket,
                                            uint32_t id,
-                                           int32_t norm,
-                                           int32_t sum,
                                            int32_t dot)
 {
     const uint32_t out = atomicAdd(entry_count, 1u);
     if (out < capacity) {
         entries[out].bucket = bucket;
         entries[out].id = id;
-        entries[out].norm = norm;
-        entries[out].sum = sum;
         entries[out].dot = dot;
     } else {
         *overflow = 1;
@@ -1225,7 +1216,6 @@ __global__ void bgj_cuda_bucket_bgj1_kernel(const int8_t *pool_vecs,
                                             const uint32_t *center_ids,
                                             uint32_t num_centers,
                                             const int32_t *vnorm,
-                                            const int32_t *vsum,
                                             uint32_t pool_size,
                                             uint32_t start_id,
                                             uint32_t candidate_count,
@@ -1250,7 +1240,6 @@ __global__ void bgj_cuda_bucket_bgj1_kernel(const int8_t *pool_vecs,
                                             pool_vecs + (uint64_t)id * vec_length,
                                             vec_length);
         const int32_t norm = vnorm[id];
-        const int32_t sum = vsum[id];
         const int32_t bound = (int32_t)(((int64_t)norm * (int64_t)alpha_x2_u16) >> 16);
         const int32_t abs_dot = dot < 0 ? -dot : dot;
         if (abs_dot > bound) {
@@ -1260,8 +1249,6 @@ __global__ void bgj_cuda_bucket_bgj1_kernel(const int8_t *pool_vecs,
                                        entry_capacity,
                                        bucket,
                                        id,
-                                       norm,
-                                       sum,
                                        dot);
         }
     }
@@ -1273,7 +1260,6 @@ void bgj_cuda_bucket_bgj1_tensor_kernel(const int8_t *center_vecs,
                                         uint32_t num_center_tiles,
                                         uint32_t num_pool_tiles,
                                         const int32_t *vnorm,
-                                        const int32_t *vsum,
                                         uint32_t vec_length,
                                         uint32_t alpha_x2_u16,
                                         bgj_cuda_bucket_entry_t *entries,
@@ -1316,7 +1302,6 @@ void bgj_cuda_bucket_bgj1_tensor_kernel(const int8_t *center_vecs,
         const uint32_t id = id_base + col;
         const int32_t dot = c_frag.x[element];
         const int32_t norm = vnorm[id];
-        const int32_t sum = vsum[id];
         const int32_t bound = (int32_t)(((int64_t)norm * (int64_t)alpha_x2_u16) >> 16);
         const int32_t abs_dot = dot < 0 ? -dot : dot;
         if (abs_dot > bound) {
@@ -1326,8 +1311,6 @@ void bgj_cuda_bucket_bgj1_tensor_kernel(const int8_t *center_vecs,
                                        entry_capacity,
                                        bucket,
                                        id,
-                                       norm,
-                                       sum,
                                        dot);
         }
     }
@@ -2425,7 +2408,6 @@ extern "C" int bgj_cuda_bucket_bgj1_raw(const int8_t *pool_vecs,
                                          const uint32_t *center_ids,
                                          uint32_t num_centers,
                                          const int32_t *vnorm,
-                                         const int32_t *vsum,
                                          uint32_t vec_length,
                                          uint32_t alpha_x2_u16,
                                          bgj_cuda_bucket_entry_t *entries,
@@ -2435,7 +2417,7 @@ extern "C" int bgj_cuda_bucket_bgj1_raw(const int8_t *pool_vecs,
 {
     if (entry_count) *entry_count = 0;
     if (overflow) *overflow = 0;
-    if (!pool_vecs || !center_ids || !vnorm || !vsum || !entries ||
+    if (!pool_vecs || !center_ids || !vnorm || !entries ||
         !entry_count || !overflow) {
         set_plain_error("invalid bucket pointer");
         return 0;
@@ -2474,7 +2456,6 @@ extern "C" int bgj_cuda_bucket_bgj1_raw(const int8_t *pool_vecs,
 
     CUDA_ENSURE(scratch->center_ids, scratch->center_id_capacity, center_id_bytes);
     CUDA_ENSURE(scratch->vnorm, scratch->vnorm_capacity, i32_bytes);
-    CUDA_ENSURE(scratch->vsum, scratch->vsum_capacity, i32_bytes);
     CUDA_ENSURE(scratch->entries, scratch->entry_capacity, entry_bytes);
     CUDA_ENSURE(scratch->entry_count, scratch->entry_count_capacity, sizeof(uint32_t));
     CUDA_ENSURE(scratch->overflow, scratch->overflow_capacity, sizeof(int));
@@ -2486,11 +2467,6 @@ extern "C" int bgj_cuda_bucket_bgj1_raw(const int8_t *pool_vecs,
                              stream));
     CUDA_TRY(cudaMemcpyAsync(scratch->vnorm,
                              vnorm,
-                             i32_bytes,
-                             cudaMemcpyHostToDevice,
-                             stream));
-    CUDA_TRY(cudaMemcpyAsync(scratch->vsum,
-                             vsum,
                              i32_bytes,
                              cudaMemcpyHostToDevice,
                              stream));
@@ -2542,7 +2518,6 @@ extern "C" int bgj_cuda_bucket_bgj1_raw(const int8_t *pool_vecs,
                                                            num_center_tiles,
                                                            num_pool_tiles,
                                                            scratch->vnorm,
-                                                           scratch->vsum,
                                                            vec_length,
                                                            alpha_x2_u16,
                                                            scratch->entries,
@@ -2563,7 +2538,6 @@ extern "C" int bgj_cuda_bucket_bgj1_raw(const int8_t *pool_vecs,
                                                                         scratch->center_ids,
                                                                         num_centers,
                                                                         scratch->vnorm,
-                                                                        scratch->vsum,
                                                                         pool_size,
                                                                         scalar_start,
                                                                         scalar_count,
