@@ -311,6 +311,21 @@ void bgj_profile_data_t<nb>::insert_log(uint64_t num_total_sol, double insert_ti
                     materialize_scalar_call, materialize_scalar_candidate, materialize_scalar_time,
                     materialize_cuda_failed_call, materialize_cuda_failed_candidate,
                     materialize_cuda_failed_time);
+            if (materialize_cuda_phase_chunk) {
+                fprintf(log_out,
+                        "materialize cuda phases: chunks=%lu, pool=%.6fs, basis=%.6fs, "
+                        "desc=%.6fs, build=%.6fs, gemm=%.6fs, coeff=%.6fs, "
+                        "reconstruct=%.6fs, copy=%.6fs\n",
+                        materialize_cuda_phase_chunk,
+                        materialize_cuda_pool_time,
+                        materialize_cuda_basis_time,
+                        materialize_cuda_desc_time,
+                        materialize_cuda_build_time,
+                        materialize_cuda_gemm_time,
+                        materialize_cuda_coeff_time,
+                        materialize_cuda_reconstruct_time,
+                        materialize_cuda_copy_time);
+            }
         }
     }
     if (log_level == 0 && p->CSD > MIN_LOG_CSD){
@@ -350,6 +365,21 @@ void bgj_profile_data_t<nb>::final_log(int bgj, long sieving_stucked) {
                         materialize_scalar_call, materialize_scalar_candidate, materialize_scalar_time,
                         materialize_cuda_failed_call, materialize_cuda_failed_candidate,
                         materialize_cuda_failed_time);
+                if (materialize_cuda_phase_chunk) {
+                    fprintf(log_out,
+                            "materialize cuda phases: chunks=%lu, pool=%.6fs, basis=%.6fs, "
+                            "desc=%.6fs, build=%.6fs, gemm=%.6fs, coeff=%.6fs, "
+                            "reconstruct=%.6fs, copy=%.6fs\n",
+                            materialize_cuda_phase_chunk,
+                            materialize_cuda_pool_time,
+                            materialize_cuda_basis_time,
+                            materialize_cuda_desc_time,
+                            materialize_cuda_build_time,
+                            materialize_cuda_gemm_time,
+                            materialize_cuda_coeff_time,
+                            materialize_cuda_reconstruct_time,
+                            materialize_cuda_copy_time);
+                }
             }
             speed0 = p->CSD * 2 * bucket0_ndp/bucket0_time/1073741824.0;
             fprintf(log_out, "bucket0 speed: %f bucket/s, %f GFLOPS\n", num_bucket0/bucket0_time, speed0);
@@ -699,6 +729,14 @@ void bgj_profile_data_t<nb>::combine(bgj_profile_data_t<nb> *prof) {
     materialize_cpu_time += prof->materialize_cpu_time;
     materialize_scalar_time += prof->materialize_scalar_time;
     materialize_cuda_failed_time += prof->materialize_cuda_failed_time;
+    materialize_cuda_pool_time += prof->materialize_cuda_pool_time;
+    materialize_cuda_basis_time += prof->materialize_cuda_basis_time;
+    materialize_cuda_desc_time += prof->materialize_cuda_desc_time;
+    materialize_cuda_build_time += prof->materialize_cuda_build_time;
+    materialize_cuda_gemm_time += prof->materialize_cuda_gemm_time;
+    materialize_cuda_coeff_time += prof->materialize_cuda_coeff_time;
+    materialize_cuda_reconstruct_time += prof->materialize_cuda_reconstruct_time;
+    materialize_cuda_copy_time += prof->materialize_cuda_copy_time;
 
     bucket0_ndp += prof->bucket0_ndp;
     bucket1_ndp += prof->bucket1_ndp;
@@ -723,6 +761,7 @@ void bgj_profile_data_t<nb>::combine(bgj_profile_data_t<nb> *prof) {
     materialize_scalar_candidate += prof->materialize_scalar_candidate;
     materialize_cuda_failed_call += prof->materialize_cuda_failed_call;
     materialize_cuda_failed_candidate += prof->materialize_cuda_failed_candidate;
+    materialize_cuda_phase_chunk += prof->materialize_cuda_phase_chunk;
 
     try_add2 += prof->try_add2;
     succ_add2 += prof->succ_add2;

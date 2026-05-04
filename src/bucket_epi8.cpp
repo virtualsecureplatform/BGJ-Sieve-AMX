@@ -3481,10 +3481,19 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
     double materialize_cpu_time = 0.0;
     double materialize_scalar_time = 0.0;
     double materialize_cuda_failed_time = 0.0;
+    double materialize_cuda_pool_time = 0.0;
+    double materialize_cuda_basis_time = 0.0;
+    double materialize_cuda_desc_time = 0.0;
+    double materialize_cuda_build_time = 0.0;
+    double materialize_cuda_gemm_time = 0.0;
+    double materialize_cuda_coeff_time = 0.0;
+    double materialize_cuda_reconstruct_time = 0.0;
+    double materialize_cuda_copy_time = 0.0;
     uint64_t materialize_gpu_call = 0;
     uint64_t materialize_cpu_call = 0;
     uint64_t materialize_scalar_call = 0;
     uint64_t materialize_cuda_failed_call = 0;
+    uint64_t materialize_cuda_phase_chunk = 0;
     const double materialize_start = bgj_bucket_wall_time();
     #if defined(HAVE_CUDA)
     if (bgj_cuda_search_requested()) {
@@ -3498,10 +3507,21 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
                                   vnorm_to_insert,
                                   vsum_to_insert);
         const double cuda_time = bgj_bucket_wall_time() - t0;
+        bgj_cuda_materialize_phase_profile_t cuda_phase = {};
+        bgj_cuda_materialize_last_profile(&cuda_phase);
         if (cuda_ok) {
             materialized = 1;
             materialize_gpu_time += cuda_time;
             materialize_gpu_call++;
+            materialize_cuda_pool_time += cuda_phase.pool_sec;
+            materialize_cuda_basis_time += cuda_phase.basis_sec;
+            materialize_cuda_desc_time += cuda_phase.desc_sec;
+            materialize_cuda_build_time += cuda_phase.build_sec;
+            materialize_cuda_gemm_time += cuda_phase.gemm_sec;
+            materialize_cuda_coeff_time += cuda_phase.coeff_sec;
+            materialize_cuda_reconstruct_time += cuda_phase.reconstruct_sec;
+            materialize_cuda_copy_time += cuda_phase.copy_sec;
+            materialize_cuda_phase_chunk += cuda_phase.chunks;
         } else {
             if (try_cuda_materialize) {
                 materialize_cuda_failed_time += cuda_time;
@@ -3545,6 +3565,15 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
         prof->materialize_cuda_failed_time += materialize_cuda_failed_time;
         prof->materialize_cuda_failed_call += materialize_cuda_failed_call;
         prof->materialize_cuda_failed_candidate += materialize_cuda_failed_call ? (uint64_t)num_total_sol : 0;
+        prof->materialize_cuda_pool_time += materialize_cuda_pool_time;
+        prof->materialize_cuda_basis_time += materialize_cuda_basis_time;
+        prof->materialize_cuda_desc_time += materialize_cuda_desc_time;
+        prof->materialize_cuda_build_time += materialize_cuda_build_time;
+        prof->materialize_cuda_gemm_time += materialize_cuda_gemm_time;
+        prof->materialize_cuda_coeff_time += materialize_cuda_coeff_time;
+        prof->materialize_cuda_reconstruct_time += materialize_cuda_reconstruct_time;
+        prof->materialize_cuda_copy_time += materialize_cuda_copy_time;
+        prof->materialize_cuda_phase_chunk += materialize_cuda_phase_chunk;
         pthread_spin_unlock(&prof->profile_lock);
     }
 

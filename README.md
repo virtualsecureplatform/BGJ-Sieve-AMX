@@ -132,13 +132,19 @@ path and avoiding a full host-side sort of dense result buffers; set
 debugging.
 An experimental CUDA candidate materializer is available with
 `BGJ_CUDA_MATERIALIZE=1`. It chunks solution records, uses signed INT8 cuBLAS
-GEMM for coefficient reconstruction, and uses cuBLAS SGEMM for the float
-reconstruction stage. It keeps the basis resident on the GPU across repeated
-calls when the hashed `_b_dual`/`_b_local` content is unchanged and stages
-device-to-host output through reusable pinned host buffers. Disable those with
-`BGJ_CUDA_MATERIALIZE_BASIS_CACHE=0` and
-`BGJ_CUDA_MATERIALIZE_PINNED_HOST=0` when isolating transfer costs. Tune the
-cuBLAS chunk size with `BGJ_CUDA_MATERIALIZE_CHUNK=<n>` when profiling it.
+GEMM for coefficient reconstruction, and defaults to the exact CUDA
+reconstruction kernel on A100. It keeps the basis resident on the GPU across
+repeated calls when the hashed `_b_dual`/`_b_local` content is unchanged and
+copies device output directly to the insertion buffers by default. Set
+`BGJ_CUDA_MATERIALIZE_BASIS_CACHE=0` when isolating basis upload costs,
+`BGJ_CUDA_MATERIALIZE_PINNED_HOST=1` to re-enable the older pinned-host staging
+path, `BGJ_CUDA_MATERIALIZE_SGEMM=1` to use the SGEMM reconstruction path, or
+`BGJ_CUDA_MATERIALIZE_FUSED_COEFF=1` to test fused int32 coefficient conversion.
+Tune the cuBLAS chunk size with `BGJ_CUDA_MATERIALIZE_CHUNK=<n>` and the exact
+finish block size with `BGJ_CUDA_MATERIALIZE_THREADS=<32|64|128|256>` when
+profiling. Set `BGJ_CUDA_MATERIALIZE_PHASE_PROFILE=1` to print CUDA phase
+timings for pool cache, basis upload, descriptor copy, vector build, GEMM,
+coefficient conversion, reconstruction, and output copy.
 A fused one-kernel small-batch materializer is also available with
 `BGJ_CUDA_MATERIALIZE_FUSED=1` and capped by
 `BGJ_CUDA_MATERIALIZE_FUSED_MAX=<n>`, but it is not the default on A100 because

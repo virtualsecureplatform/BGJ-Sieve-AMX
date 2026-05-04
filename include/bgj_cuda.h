@@ -24,6 +24,19 @@ struct bgj_cuda_materialize_desc_t {
     uint32_t z;
 };
 
+struct bgj_cuda_materialize_phase_profile_t {
+    uint64_t chunks;
+    uint64_t candidates;
+    double pool_sec;
+    double basis_sec;
+    double desc_sec;
+    double build_sec;
+    double gemm_sec;
+    double coeff_sec;
+    double reconstruct_sec;
+    double copy_sec;
+};
+
 struct alignas(16) bgj_cuda_bucket_entry_t {
     uint32_t bucket;
     uint32_t id;
@@ -67,5 +80,6 @@ extern "C" int bgj_cuda_materialize_sol_list_raw(const int8_t *pool_vecs,
                                                   int8_t *dst_vec,
                                                   int32_t *dst_vnorm,
                                                   int32_t *dst_vsum);
+extern "C" void bgj_cuda_materialize_last_profile(bgj_cuda_materialize_phase_profile_t *profile);
 
 #endif

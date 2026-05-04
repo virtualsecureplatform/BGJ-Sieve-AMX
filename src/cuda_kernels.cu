@@ -1605,6 +1605,10 @@ struct bgj_cuda_materialize_scratch_t {
     int b_dual_i8_ready;
     int stream_ready;
     int handle_ready;
+    int profile_events_ready;
+    cudaEvent_t profile_start;
+    cudaEvent_t profile_stop;
+    bgj_cuda_materialize_phase_profile_t last_profile;
     pthread_mutex_t lock;
 
     bgj_cuda_materialize_scratch_t()
@@ -1649,8 +1653,13 @@ struct bgj_cuda_materialize_scratch_t {
           basis_ready(0),
           b_dual_i8_ready(0),
           stream_ready(0),
-          handle_ready(0)
+          handle_ready(0),
+          profile_events_ready(0),
+          profile_start(NULL),
+          profile_stop(NULL),
+          last_profile()
     {
+        memset(&last_profile, 0, sizeof(last_profile));
         pthread_mutex_init(&lock, NULL);
     }
 
@@ -1673,6 +1682,10 @@ struct bgj_cuda_materialize_scratch_t {
         cudaFreeHost(host_dst_vec);
         cudaFreeHost(host_dst_vnorm);
         cudaFreeHost(host_dst_vsum);
+        if (profile_events_ready) {
+            cudaEventDestroy(profile_start);
+            cudaEventDestroy(profile_stop);
+        }
         if (stream_ready) cudaStreamDestroy(stream);
         pthread_mutex_destroy(&lock);
     }
@@ -1724,6 +1737,74 @@ static int bgj_cuda_prepare_materialize_handle(bgj_cuda_materialize_scratch_t *s
         return 0;
     }
     return 1;
+}
+
+static int bgj_cuda_materialize_phase_profile_requested()
+{
+    const char *env = getenv("BGJ_CUDA_MATERIALIZE_PHASE_PROFILE");
+    return env && env[0] && env[0] != '0';
+}
+
+static int bgj_cuda_prepare_materialize_profile_events(bgj_cuda_materialize_scratch_t *scratch)
+{
+    if (scratch->profile_events_ready) return 1;
+    cudaError_t err = cudaEventCreate(&scratch->profile_start);
+    if (err != cudaSuccess) {
+        set_cuda_error("cudaEventCreate materialize profile start", err);
+        return 0;
+    }
+    err = cudaEventCreate(&scratch->profile_stop);
+    if (err != cudaSuccess) {
+        set_cuda_error("cudaEventCreate materialize profile stop", err);
+        cudaEventDestroy(scratch->profile_start);
+        scratch->profile_start = NULL;
+        return 0;
+    }
+    scratch->profile_events_ready = 1;
+    return 1;
+}
+
+static int bgj_cuda_materialize_profile_begin(bgj_cuda_materialize_scratch_t *scratch,
+                                              int enabled)
+{
+    if (!enabled) return 1;
+    cudaError_t err = cudaEventRecord(scratch->profile_start, scratch->stream);
+    if (err != cudaSuccess) {
+        set_cuda_error("cudaEventRecord materialize profile begin", err);
+        return 0;
+    }
+    return 1;
+}
+
+static int bgj_cuda_materialize_profile_end(bgj_cuda_materialize_scratch_t *scratch,
+                                            int enabled,
+                                            double *dst_sec)
+{
+    if (!enabled) return 1;
+    cudaError_t err = cudaEventRecord(scratch->profile_stop, scratch->stream);
+    if (err != cudaSuccess) {
+        set_cuda_error("cudaEventRecord materialize profile end", err);
+        return 0;
+    }
+    err = cudaEventSynchronize(scratch->profile_stop);
+    if (err != cudaSuccess) {
+        set_cuda_error("cudaEventSynchronize materialize profile", err);
+        return 0;
+    }
+    float ms = 0.0f;
+    err = cudaEventElapsedTime(&ms, scratch->profile_start, scratch->profile_stop);
+    if (err != cudaSuccess) {
+        set_cuda_error("cudaEventElapsedTime materialize profile", err);
+        return 0;
+    }
+    *dst_sec += (double)ms * 0.001;
+    return 1;
+}
+
+extern "C" void bgj_cuda_materialize_last_profile(bgj_cuda_materialize_phase_profile_t *profile)
+{
+    if (!profile) return;
+    *profile = bgj_cuda_materialize_scratch.last_profile;
 }
 
 static int bgj_cuda_materialize_pinned_host_requested()
@@ -1984,16 +2065,76 @@ static void bgj_cuda_materialize_finish_kernel(const float *fvec,
 }
 
 __global__ __launch_bounds__(BGJ_CUDA_MATERIALIZE_THREADS, 1)
-static void bgj_cuda_materialize_exact_finish_kernel(const float *coeff_f32,
+static void bgj_cuda_materialize_exact_finish_kernel(const int32_t *coeff_i32,
                                                      uint32_t coeff_ld,
                                                      const float *b_local,
                                                      const int16_t *exact_vec,
                                                      uint32_t vec_length,
                                                      uint32_t csd,
                                                      uint32_t count,
+                                                     int32_t dhalf,
+                                                     int32_t dshift,
                                                      int8_t *dst_vec,
                                                      int32_t *dst_vnorm,
                                                      int32_t *dst_vsum)
+{
+    const uint32_t cand = blockIdx.x;
+    if (cand >= count) return;
+
+    __shared__ int32_t ireduce[BGJ_CUDA_MATERIALIZE_THREADS];
+    __shared__ float freduce[BGJ_CUDA_MATERIALIZE_THREADS];
+    __shared__ int reject_flag;
+    const uint32_t tid = threadIdx.x;
+    if (tid == 0) reject_flag = 0;
+    __syncthreads();
+
+    int local_sum = 0;
+    float local_norm = 0.0f;
+    int local_reject = 0;
+    const int32_t *cand_coeff = coeff_i32 + (uint64_t)cand * coeff_ld;
+    for (uint32_t j = tid; j < vec_length; j += blockDim.x) {
+        float value = 0.0f;
+        for (uint32_t i = j; i < csd; i++) {
+            const int32_t coeff = (cand_coeff[i] + dhalf) >> dshift;
+            value = fmaf(b_local[(uint64_t)i * vec_length + j], (float)coeff, value);
+        }
+        const int rounded = __float2int_rn(value);
+        const int wrapped = bgj_cuda_wrap_i8(rounded);
+        dst_vec[(uint64_t)cand * vec_length + j] = (int8_t)wrapped;
+        local_sum += wrapped;
+        local_norm = fmaf(value, value, local_norm);
+        const int diff = (int)exact_vec[(uint64_t)cand * vec_length + j] - wrapped;
+        if ((diff < -3 || diff > 3) || wrapped == -128) local_reject = 1;
+    }
+
+    if (local_reject) atomicExch(&reject_flag, 1);
+    ireduce[tid] = local_sum;
+    freduce[tid] = local_norm;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            ireduce[tid] += ireduce[tid + stride];
+            freduce[tid] += freduce[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        dst_vsum[cand] = 128 * ireduce[0];
+        dst_vnorm[cand] = reject_flag ? 2147483647 : __float2int_rn(0.5f * freduce[0]);
+    }
+}
+
+__global__ __launch_bounds__(BGJ_CUDA_MATERIALIZE_THREADS, 1)
+static void bgj_cuda_materialize_exact_finish_f32_kernel(const float *coeff_f32,
+                                                         uint32_t coeff_ld,
+                                                         const float *b_local,
+                                                         const int16_t *exact_vec,
+                                                         uint32_t vec_length,
+                                                         uint32_t csd,
+                                                         uint32_t count,
+                                                         int8_t *dst_vec,
+                                                         int32_t *dst_vnorm,
+                                                         int32_t *dst_vsum)
 {
     const uint32_t cand = blockIdx.x;
     if (cand >= count) return;
@@ -2175,9 +2316,31 @@ static int bgj_cuda_materialize_sgemm_requested()
     return env && env[0] && env[0] != '0';
 }
 
+static int bgj_cuda_materialize_fused_coeff_requested()
+{
+    const char *env = getenv("BGJ_CUDA_MATERIALIZE_FUSED_COEFF");
+    if (env && env[0]) return env[0] != '0';
+    return 0;
+}
+
 static uint32_t bgj_cuda_materialize_align_up(uint32_t value, uint32_t alignment)
 {
     return (value + alignment - 1u) & ~(alignment - 1u);
+}
+
+static uint32_t bgj_cuda_materialize_thread_count()
+{
+    const char *env = getenv("BGJ_CUDA_MATERIALIZE_THREADS");
+    unsigned long value = 32UL;
+    if (env && env[0]) {
+        char *end = NULL;
+        unsigned long parsed = strtoul(env, &end, 10);
+        if (end != env && parsed > 0) value = parsed;
+    }
+    if (value <= 32UL) return 32u;
+    if (value <= 64UL) return 64u;
+    if (value <= 128UL) return 128u;
+    return 256u;
 }
 
 static uint32_t bgj_cuda_materialize_fused_max_count()
@@ -2240,6 +2403,8 @@ extern "C" int bgj_cuda_materialize_sol_list_raw(const int8_t *pool_vecs,
     float beta_f = 0.0f;
     int use_fused = 0;
     int use_sgemm_reconstruct = 0;
+    int use_fused_coeff = 0;
+    int phase_profile = 0;
     const size_t pool_vec_bytes = (size_t)pool_size * vec_length * sizeof(int8_t);
     const size_t b_dual_bytes = (size_t)csd * vec_length * sizeof(uint8_t);
     const size_t b_local_bytes = (size_t)csd * vec_length * sizeof(float);
@@ -2248,7 +2413,12 @@ extern "C" int bgj_cuda_materialize_sol_list_raw(const int8_t *pool_vecs,
     uint64_t b_dual_hash = 0;
     uint64_t b_local_hash = 0;
     int upload_basis = 1;
+    memset(&scratch->last_profile, 0, sizeof(scratch->last_profile));
+    scratch->last_profile.candidates = count;
+    phase_profile = bgj_cuda_materialize_phase_profile_requested();
+    if (phase_profile && !bgj_cuda_prepare_materialize_profile_events(scratch)) goto fail;
     if (!bgj_cuda_prepare_materialize_stream(scratch)) goto fail;
+    if (!bgj_cuda_materialize_profile_begin(scratch, phase_profile)) goto fail;
     if (!bgj_cuda_prepare_shared_pool_cache(pool_vecs,
                                             pool_epoch,
                                             pool_size,
@@ -2256,6 +2426,11 @@ extern "C" int bgj_cuda_materialize_sol_list_raw(const int8_t *pool_vecs,
                                             pool_vec_bytes,
                                             scratch->stream,
                                             &device_pool_vecs)) {
+        goto fail;
+    }
+    if (!bgj_cuda_materialize_profile_end(scratch,
+                                          phase_profile,
+                                          &scratch->last_profile.pool_sec)) {
         goto fail;
     }
 
@@ -2279,6 +2454,7 @@ extern "C" int bgj_cuda_materialize_sol_list_raw(const int8_t *pool_vecs,
             scratch->basis_b_local_hash != b_local_hash;
     }
     if (upload_basis) {
+        if (!bgj_cuda_materialize_profile_begin(scratch, phase_profile)) goto fail;
         CUDA_TRY(cudaMemcpyAsync(scratch->b_dual, b_dual,
                                  b_dual_bytes,
                                  cudaMemcpyHostToDevice, scratch->stream));
@@ -2306,11 +2482,17 @@ extern "C" int bgj_cuda_materialize_sol_list_raw(const int8_t *pool_vecs,
                                                                           vec_length);
             CUDA_TRY(cudaGetLastError());
         }
+        if (!bgj_cuda_materialize_profile_end(scratch,
+                                              phase_profile,
+                                              &scratch->last_profile.basis_sec)) {
+            goto fail;
+        }
     }
 
     use_fused = bgj_cuda_materialize_fused_requested() &&
                 count <= bgj_cuda_materialize_fused_max_count();
     use_sgemm_reconstruct = bgj_cuda_materialize_sgemm_requested();
+    use_fused_coeff = bgj_cuda_materialize_fused_coeff_requested();
     if (use_fused) {
         CUDA_ENSURE(scratch->desc, scratch->desc_capacity, (size_t)count * sizeof(bgj_cuda_materialize_desc_t));
         CUDA_ENSURE(scratch->dst_vec, scratch->dst_vec_capacity, (size_t)count * vec_length * sizeof(int8_t));
@@ -2380,7 +2562,9 @@ extern "C" int bgj_cuda_materialize_sol_list_raw(const int8_t *pool_vecs,
     CUDA_ENSURE(scratch->tmp_vec, scratch->tmp_vec_capacity, (size_t)chunk_limit_gemm * vec_length * sizeof(int8_t));
     CUDA_ENSURE(scratch->exact_vec, scratch->exact_vec_capacity, (size_t)chunk_limit * vec_length * sizeof(int16_t));
     CUDA_ENSURE(scratch->coeff_i32, scratch->coeff_i32_capacity, (size_t)chunk_limit_gemm * gemm_csd * sizeof(int32_t));
-    CUDA_ENSURE(scratch->coeff_f32, scratch->coeff_f32_capacity, (size_t)chunk_limit_gemm * gemm_csd * sizeof(float));
+    if (use_sgemm_reconstruct || !use_fused_coeff) {
+        CUDA_ENSURE(scratch->coeff_f32, scratch->coeff_f32_capacity, (size_t)chunk_limit_gemm * gemm_csd * sizeof(float));
+    }
     if (use_sgemm_reconstruct) {
         CUDA_ENSURE(scratch->fvec, scratch->fvec_capacity, (size_t)chunk_limit * vec_length * sizeof(float));
     }
@@ -2393,10 +2577,18 @@ extern "C" int bgj_cuda_materialize_sol_list_raw(const int8_t *pool_vecs,
             (count - offset < chunk_limit) ? (count - offset) : chunk_limit;
         const uint32_t gemm_chunk_count =
             bgj_cuda_materialize_align_up(chunk_count, 16u);
+        if (phase_profile) scratch->last_profile.chunks++;
+        if (!bgj_cuda_materialize_profile_begin(scratch, phase_profile)) goto fail;
         CUDA_TRY(cudaMemcpyAsync(scratch->desc, desc + offset,
                                  (size_t)chunk_count * sizeof(bgj_cuda_materialize_desc_t),
                                  cudaMemcpyHostToDevice, scratch->stream));
+        if (!bgj_cuda_materialize_profile_end(scratch,
+                                              phase_profile,
+                                              &scratch->last_profile.desc_sec)) {
+            goto fail;
+        }
 
+        if (!bgj_cuda_materialize_profile_begin(scratch, phase_profile)) goto fail;
         bgj_cuda_materialize_build_kernel<<<chunk_count,
                                             BGJ_CUDA_MATERIALIZE_THREADS,
                                             0,
@@ -2414,7 +2606,13 @@ extern "C" int bgj_cuda_materialize_sol_list_raw(const int8_t *pool_vecs,
                                          vec_length * sizeof(int8_t),
                                      scratch->stream));
         }
+        if (!bgj_cuda_materialize_profile_end(scratch,
+                                              phase_profile,
+                                              &scratch->last_profile.build_sec)) {
+            goto fail;
+        }
 
+        if (!bgj_cuda_materialize_profile_begin(scratch, phase_profile)) goto fail;
         CUBLAS_TRY(cublasGemmEx(scratch->handle,
                                 CUBLAS_OP_T,
                                 CUBLAS_OP_N,
@@ -2434,21 +2632,35 @@ extern "C" int bgj_cuda_materialize_sol_list_raw(const int8_t *pool_vecs,
                                 (int)gemm_csd,
                                 CUBLAS_COMPUTE_32I,
                                 CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        if (!bgj_cuda_materialize_profile_end(scratch,
+                                              phase_profile,
+                                              &scratch->last_profile.gemm_sec)) {
+            goto fail;
+        }
 
-        const uint64_t coeff_total = (uint64_t)chunk_count * csd;
-        uint32_t coeff_blocks = (uint32_t)((coeff_total + 255u) / 256u);
-        if (coeff_blocks > 65535u) coeff_blocks = 65535u;
-        bgj_cuda_materialize_coeff_kernel<<<coeff_blocks, 256, 0, scratch->stream>>>(
-            scratch->coeff_i32,
-            csd,
-            gemm_csd,
-            chunk_count,
-            dhalf,
-            dshift,
-            scratch->coeff_f32);
-        CUDA_TRY(cudaGetLastError());
+        if (use_sgemm_reconstruct || !use_fused_coeff) {
+            const uint64_t coeff_total = (uint64_t)chunk_count * csd;
+            uint32_t coeff_blocks = (uint32_t)((coeff_total + 255u) / 256u);
+            if (coeff_blocks > 65535u) coeff_blocks = 65535u;
+            if (!bgj_cuda_materialize_profile_begin(scratch, phase_profile)) goto fail;
+            bgj_cuda_materialize_coeff_kernel<<<coeff_blocks, 256, 0, scratch->stream>>>(
+                scratch->coeff_i32,
+                csd,
+                gemm_csd,
+                chunk_count,
+                dhalf,
+                dshift,
+                scratch->coeff_f32);
+            CUDA_TRY(cudaGetLastError());
+            if (!bgj_cuda_materialize_profile_end(scratch,
+                                                  phase_profile,
+                                                  &scratch->last_profile.coeff_sec)) {
+                goto fail;
+            }
+        }
 
         if (use_sgemm_reconstruct) {
+            if (!bgj_cuda_materialize_profile_begin(scratch, phase_profile)) goto fail;
             CUBLAS_TRY(cublasSgemm(scratch->handle,
                                    CUBLAS_OP_T,
                                    CUBLAS_OP_T,
@@ -2474,29 +2686,58 @@ extern "C" int bgj_cuda_materialize_sol_list_raw(const int8_t *pool_vecs,
                                                                     scratch->dst_vec,
                                                                     scratch->dst_vnorm,
                                                                     scratch->dst_vsum);
+        } else if (!use_fused_coeff) {
+            if (!bgj_cuda_materialize_profile_begin(scratch, phase_profile)) goto fail;
+            bgj_cuda_materialize_exact_finish_f32_kernel<<<chunk_count,
+                                                           bgj_cuda_materialize_thread_count(),
+                                                           0,
+                                                           scratch->stream>>>(scratch->coeff_f32,
+                                                                              gemm_csd,
+                                                                              scratch->b_local,
+                                                                              scratch->exact_vec,
+                                                                              vec_length,
+                                                                              csd,
+                                                                              chunk_count,
+                                                                              scratch->dst_vec,
+                                                                              scratch->dst_vnorm,
+                                                                              scratch->dst_vsum);
         } else {
+            if (!bgj_cuda_materialize_profile_begin(scratch, phase_profile)) goto fail;
             bgj_cuda_materialize_exact_finish_kernel<<<chunk_count,
-                                                       BGJ_CUDA_MATERIALIZE_THREADS,
+                                                       bgj_cuda_materialize_thread_count(),
                                                        0,
-                                                       scratch->stream>>>(scratch->coeff_f32,
+                                                       scratch->stream>>>(scratch->coeff_i32,
                                                                           gemm_csd,
                                                                           scratch->b_local,
                                                                           scratch->exact_vec,
                                                                           vec_length,
                                                                           csd,
                                                                           chunk_count,
+                                                                          dhalf,
+                                                                          dshift,
                                                                           scratch->dst_vec,
                                                                           scratch->dst_vnorm,
                                                                           scratch->dst_vsum);
         }
         CUDA_TRY(cudaGetLastError());
+        if (!bgj_cuda_materialize_profile_end(scratch,
+                                              phase_profile,
+                                              &scratch->last_profile.reconstruct_sec)) {
+            goto fail;
+        }
 
+        if (!bgj_cuda_materialize_profile_begin(scratch, phase_profile)) goto fail;
         if (!bgj_cuda_materialize_copy_outputs(scratch,
                                                chunk_count,
                                                vec_length,
                                                dst_vec + (uint64_t)offset * vec_length,
                                                dst_vnorm + offset,
                                                dst_vsum + offset)) {
+            goto fail;
+        }
+        if (!bgj_cuda_materialize_profile_end(scratch,
+                                              phase_profile,
+                                              &scratch->last_profile.copy_sec)) {
             goto fail;
         }
     }

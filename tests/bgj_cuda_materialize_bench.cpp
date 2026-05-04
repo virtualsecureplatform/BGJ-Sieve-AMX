@@ -214,6 +214,7 @@ int main(int argc, char **argv)
     std::vector<int8_t> gpu_vec((size_t)count * dim);
     std::vector<int32_t> gpu_norm(count);
     std::vector<int32_t> gpu_sum(count);
+    bgj_cuda_materialize_phase_profile_t phase_total = {};
     for (uint32_t r = 0; r < 2; r++) {
         if (!bgj_cuda_materialize_sol_list_raw(pool.data(), 42, pool_size, dim,
                                                desc.data(), count, b_dual.data(),
@@ -235,11 +236,25 @@ int main(int argc, char **argv)
             std::cerr << "benchmark failed: " << bgj_cuda_last_error() << "\n";
             return 1;
         }
+        bgj_cuda_materialize_phase_profile_t phase = {};
+        bgj_cuda_materialize_last_profile(&phase);
+        phase_total.chunks += phase.chunks;
+        phase_total.candidates += phase.candidates;
+        phase_total.pool_sec += phase.pool_sec;
+        phase_total.basis_sec += phase.basis_sec;
+        phase_total.desc_sec += phase.desc_sec;
+        phase_total.build_sec += phase.build_sec;
+        phase_total.gemm_sec += phase.gemm_sec;
+        phase_total.coeff_sec += phase.coeff_sec;
+        phase_total.reconstruct_sec += phase.reconstruct_sec;
+        phase_total.copy_sec += phase.copy_sec;
     }
     const double gpu_sec = seconds_since(start);
     const uint64_t gpu_hash = checksum(gpu_vec, gpu_norm, gpu_sum);
 
-    std::cout << "dim,count,repeats,pool_size,cpu_sec,gpu_sec,cpu_candidates_per_sec,gpu_candidates_per_sec,speedup,cpu_hash,gpu_hash\n";
+    std::cout << "dim,count,repeats,pool_size,cpu_sec,gpu_sec,cpu_candidates_per_sec,gpu_candidates_per_sec,speedup,cpu_hash,gpu_hash,"
+                 "phase_chunks,phase_candidates,phase_pool_sec,phase_basis_sec,phase_desc_sec,phase_build_sec,phase_gemm_sec,"
+                 "phase_coeff_sec,phase_reconstruct_sec,phase_copy_sec\n";
     const double total = (double)count * repeats;
     const double cpu_cps = run_cpu && cpu_sec > 0.0 ? total / cpu_sec : 0.0;
     const double gpu_cps = gpu_sec > 0.0 ? total / gpu_sec : 0.0;
@@ -254,7 +269,17 @@ int main(int argc, char **argv)
               << gpu_cps << ","
               << speedup << ","
               << cpu_hash << ","
-              << gpu_hash << "\n";
+              << gpu_hash << ","
+              << phase_total.chunks << ","
+              << phase_total.candidates << ","
+              << phase_total.pool_sec << ","
+              << phase_total.basis_sec << ","
+              << phase_total.desc_sec << ","
+              << phase_total.build_sec << ","
+              << phase_total.gemm_sec << ","
+              << phase_total.coeff_sec << ","
+              << phase_total.reconstruct_sec << ","
+              << phase_total.copy_sec << "\n";
     if (run_cpu && cpu_hash != gpu_hash) {
         std::cerr << "warning: CPU/GPU checksum mismatch\n";
     }
