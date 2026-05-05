@@ -339,6 +339,23 @@ def mode_command(app, lattice, mode, threads, log_level, seed):
 
     if "tensor-off" in mode:
         env["BGJ_CUDA_TENSOR"] = "0"
+    if "no-reorder" in mode:
+        env["BGJ_CUDA_TENSOR_REORDER"] = "0"
+    if "wide-off" in mode:
+        env["BGJ_CUDA_TENSOR_NP_WIDE"] = "0"
+    if "np-multi" in mode:
+        env["BGJ_CUDA_TENSOR_NP_MULTI"] = "1"
+    if "shared-a" in mode:
+        env["BGJ_CUDA_TENSOR_NP_WIDE"] = "0"
+        env["BGJ_CUDA_TENSOR_NP_SHARED_A"] = "1"
+
+    np_min_match = re.search(r"np-min(\d+)", mode)
+    if np_min_match:
+        env["BGJ_CUDA_TENSOR_NP_MIN_TILES"] = np_min_match.group(1)
+
+    same_min_match = re.search(r"same-min(\d+)", mode)
+    if same_min_match:
+        env["BGJ_CUDA_TENSOR_SAME_MIN_TILES"] = same_min_match.group(1)
 
     command = [str(app), str(lattice), algo, str(threads), str(log_level), str(seed)]
     return command, env

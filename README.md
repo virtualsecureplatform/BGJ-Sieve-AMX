@@ -115,6 +115,16 @@ challenge runs. Set `BGJ_CUDA_BATCH=1` to enable batching,
 `BGJ_CUDA_BATCH_MIN_DOTS=<n>` to tune the size threshold. With BGJ log level
 `2` or higher, the BGJ1 profile prints CUDA single-bucket, batched, cred, and
 fallback bucket counts, dot counts, and timings.
+Do not enable search batching by default without rebenchmarking: a May 2026
+A100/GPU1 SVP100 seed-42 challenge run with a 600s timeout regressed from
+`281.15s` total / `102.80s` search in the default single-bucket mode to
+`414.83s` total / `211.26s` search with `cuda-batch4`, because batching delays
+the BGJ1 early-stop check and creates many more solution records. In the same
+run, `BGJ_CUDA_TENSOR_REORDER=0` was only marginally faster
+(`280.69s` total / `101.66s` search) and is not enough evidence to change the
+default fragment prepack path. The benchmark harness accepts profiling modes
+such as `cuda-no-reorder`, `cuda-wide-off`, `cuda-np-multi`,
+`cuda-shared-a`, `cuda-np-min1024`, and `cuda-same-min64`.
 For A100 tuning, BGJ1 bucket density can be changed without rebuilding:
 `BGJ1_EPI8_BUCKET_ALPHA=<x>` sets the alpha directly, while
 `BGJ1_EPI8_BUCKET_TARGET_SIZE=<n>` derives an alpha for the current pool size
