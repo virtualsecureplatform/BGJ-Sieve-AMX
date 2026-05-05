@@ -19,6 +19,23 @@ static double bgj_bucket_wall_time()
     return (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
 }
 
+static int bgj_insert_batch_uid_erase_enabled()
+{
+    const char *env = getenv("BGJ_INSERT_BATCH_UID_ERASE");
+    if (env && env[0]) return env[0] != '0';
+    #if defined(HAVE_CUDA)
+    if (bgj_cuda_search_requested()) return 1;
+    #endif
+    return 0;
+}
+
+static int bgj_insert_phase_profile_enabled()
+{
+    const char *env = getenv("BGJ_INSERT_PHASE_PROFILE");
+    if (!env || !env[0]) return 0;
+    return env[0] != '0';
+}
+
 #if defined(HAVE_CUDA)
 static uint32_t bgj_cuda_bucket_entry_capacity(long batchsize,
                                                long expect_bucket_size,
@@ -3695,6 +3712,39 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
     uint64_t materialize_scalar_call = 0;
     uint64_t materialize_cuda_failed_call = 0;
     uint64_t materialize_cuda_phase_chunk = 0;
+    const int insert_phase_profile = bgj_insert_phase_profile_enabled();
+    int batch_uid_erase = bgj_insert_batch_uid_erase_enabled();
+    const int collect_insert_phase = insert_phase_profile || batch_uid_erase;
+    uint64_t *deferred_uid_erase = NULL;
+    uint64_t *deferred_shard_counts = NULL;
+    long deferred_uid_count[MAX_NTHREADS] = {};
+    double insert_scan_time = 0.0;
+    double insert_uid_erase_time = 0.0;
+    double insert_uid_batch_time = 0.0;
+    double insert_copy_time = 0.0;
+    double insert_compact_time = 0.0;
+    uint64_t insert_uid_erase_count = 0;
+    uint64_t insert_uid_erase_fail = 0;
+    uint64_t insert_copy_count = 0;
+    uint64_t insert_compact_move = 0;
+    if (batch_uid_erase && num_total_sol > 0) {
+        deferred_uid_erase =
+            (uint64_t *)NEW_VEC(num_total_sol, sizeof(uint64_t));
+        deferred_shard_counts =
+            (uint64_t *)NEW_VEC((long)num_threads * UidHashTable::NUM_UID_LOCK,
+                                sizeof(uint64_t));
+        if (!deferred_uid_erase || !deferred_shard_counts) {
+            batch_uid_erase = 0;
+            if (deferred_uid_erase) {
+                FREE_VEC((void *)deferred_uid_erase);
+                deferred_uid_erase = NULL;
+            }
+            if (deferred_shard_counts) {
+                FREE_VEC((void *)deferred_shard_counts);
+                deferred_shard_counts = NULL;
+            }
+        }
+    }
     auto ensure_vec_to_insert = [&]() -> int {
         if (vec_to_insert) return 1;
         vec_to_insert = (int8_t *) NEW_VEC(num_total_sol * vec_length, sizeof(int8_t));
@@ -3938,6 +3988,7 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
         return vec_to_insert + (uint64_t)ind * vec_length;
     };
 
+    const double insert_scan_start = bgj_bucket_wall_time();
     #pragma omp parallel for
     for (long thread = 0; thread < num_threads; thread++) {
         const long begin_ind = (num_total_sol * thread) / num_threads;
@@ -3949,15 +4000,57 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
         uint64_t _length_stat[256] = {};
         uint64_t _num_linfty_failed = 0;
         uint64_t _num_l2_failed = 0;
+        uint64_t _insert_uid_erase_count = 0;
+        uint64_t _insert_uid_erase_fail = 0;
+        uint64_t _insert_copy_count = 0;
+        double _insert_uid_erase_time = 0.0;
+        double _insert_copy_time = 0.0;
+        long _deferred_uid_count = 0;
 
         const int32_t linfty_fail_bound = 1.2 * goal_norm;
+        auto erase_or_defer_uid = [&](uint64_t erase_uid) {
+            if (collect_insert_phase) _insert_uid_erase_count++;
+            if (batch_uid_erase) {
+                if (erase_uid == 0) {
+                    if (collect_insert_phase) _insert_uid_erase_fail++;
+                    return;
+                }
+                uid->normalize_uid(erase_uid);
+                deferred_uid_erase[begin_ind + _deferred_uid_count] = erase_uid;
+                deferred_shard_counts[(long)thread * UidHashTable::NUM_UID_LOCK +
+                                      (erase_uid % UidHashTable::NUM_UID_LOCK)]++;
+                _deferred_uid_count++;
+                return;
+            }
+            double t0 = 0.0;
+            if (insert_phase_profile) t0 = bgj_bucket_wall_time();
+            const int ok = uid->erase_uid(erase_uid);
+            if (insert_phase_profile) _insert_uid_erase_time += bgj_bucket_wall_time() - t0;
+            if (!ok) {
+                if (collect_insert_phase) {
+                    _insert_uid_erase_fail++;
+                } else {
+                    fprintf(stderr,
+                            "[Error] Pool_epi8_t<%u>::_pool_insert: erase uid failed, ignored.\n",
+                            nb);
+                }
+            }
+        };
+        auto copy_insert_vec = [&](int8_t *dst, long src_ind) {
+            if (collect_insert_phase) _insert_copy_count++;
+            if (insert_phase_profile) {
+                const double t0 = bgj_bucket_wall_time();
+                copy_avx2(dst, vec_to_insert_ptr(src_ind), vec_length);
+                _insert_copy_time += bgj_bucket_wall_time() - t0;
+            } else {
+                copy_avx2(dst, vec_to_insert_ptr(src_ind), vec_length);
+            }
+        };
 
         while (ind < end_ind && nonempty_ind >= nonempty_begin[thread]) {
             if (vnorm_to_insert[ind] > linfty_fail_bound) {
                 if (profiling) _num_linfty_failed++;
-                if (!uid->erase_uid(vu_to_insert[ind])){
-                    fprintf(stderr, "[Error] Pool_epi8_t<%u>::_pool_insert: erase uid of non inserted vector failed, ignored.\n", nb);
-                }
+                erase_or_defer_uid(vu_to_insert[ind]);
                 ind++;
                 continue;
             }
@@ -3970,10 +4063,8 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
                 _length_stat[r]++;
             }
             if (vnorm_to_insert[ind] < vnorm[dst]) {
-                if (!uid->erase_uid(vu[dst])){
-                    fprintf(stderr, "[Error] Pool_epi8_t<%u>::_pool_insert: erase uid of pool vector failed, ignored.\n", nb);
-                }
-                copy_avx2(vec + dst * vec_length, vec_to_insert_ptr(ind), vec_length);
+                erase_or_defer_uid(vu[dst]);
+                copy_insert_vec(vec + dst * vec_length, ind);
                 vnorm[dst] = vnorm_to_insert[ind];
                 vu[dst] = vu_to_insert[ind];
                 vsum[dst] = vsum_to_insert[ind];
@@ -3983,7 +4074,7 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
                 ind++;
                 continue;
             } else if (empty_ind < empty_end[thread]) {
-                copy_avx2(vec + empty_ind * vec_length, vec_to_insert_ptr(ind), vec_length);
+                copy_insert_vec(vec + empty_ind * vec_length, ind);
                 vnorm[empty_ind] = vnorm_to_insert[ind];
                 vsum[empty_ind] = vsum_to_insert[ind];
                 vu[empty_ind] = vu_to_insert[ind];
@@ -3995,9 +4086,7 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
                 continue;
             } else {
                 if (profiling) _num_l2_failed++;
-                if (!uid->erase_uid(vu_to_insert[ind])){
-                    fprintf(stderr, "[Error] Pool_epi8_t<%u>::_pool_insert: erase uid of non inserted vector failed, ignored.\n", nb);
-                }
+                erase_or_defer_uid(vu_to_insert[ind]);
                 ind++;
             }
         }
@@ -4005,9 +4094,7 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
         while (ind < end_ind && empty_ind < empty_end[thread]) {
             if (vnorm_to_insert[ind] > linfty_fail_bound) {
                 if (profiling) _num_linfty_failed++;
-                if (!uid->erase_uid(vu_to_insert[ind])){
-                    fprintf(stderr, "[Error] Pool_epi8_t<%u>::_pool_insert: erase uid of non inserted vector failed, ignored.\n", nb);
-                }
+                erase_or_defer_uid(vu_to_insert[ind]);
                 ind++;
                 continue;
             }
@@ -4017,7 +4104,7 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
                 if (r < 0) r = 0;
                 _length_stat[r]++;
             }
-            copy_avx2(vec + empty_ind * vec_length, vec_to_insert_ptr(ind), vec_length);
+            copy_insert_vec(vec + empty_ind * vec_length, ind);
             vnorm[empty_ind] = vnorm_to_insert[ind];
             vsum[empty_ind] = vsum_to_insert[ind];
             vu[empty_ind] = vu_to_insert[ind];
@@ -4029,9 +4116,7 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
         }
 
         while (ind < end_ind) {
-            if (!uid->erase_uid(vu_to_insert[ind])){
-                fprintf(stderr, "[Error] Pool_epi8_t<%u>::_pool_insert: erase uid of non inserted vector failed, ignored.\n", nb);
-            }
+            erase_or_defer_uid(vu_to_insert[ind]);
             ind++;
         }
  
@@ -4046,10 +4131,111 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
                 num_not_try += _num_not_try;
             }
             num_total_insert += _num_total_insert;
+            insert_uid_erase_count += _insert_uid_erase_count;
+            insert_uid_erase_fail += _insert_uid_erase_fail;
+            insert_uid_erase_time += _insert_uid_erase_time;
+            insert_copy_count += _insert_copy_count;
+            insert_copy_time += _insert_copy_time;
             pthread_spin_unlock(&prof->profile_lock);
+        } else {
+            __sync_fetch_and_add(&insert_uid_erase_count, _insert_uid_erase_count);
+            __sync_fetch_and_add(&insert_uid_erase_fail, _insert_uid_erase_fail);
+            __sync_fetch_and_add(&insert_copy_count, _insert_copy_count);
         }
+        if (!prof && insert_phase_profile) {
+            #pragma omp atomic
+            insert_uid_erase_time += _insert_uid_erase_time;
+            #pragma omp atomic
+            insert_copy_time += _insert_copy_time;
+        }
+        if (batch_uid_erase) deferred_uid_count[thread] = _deferred_uid_count;
         empty_final_ind[thread] = empty_ind;
         nonempty_final_ind[thread] = nonempty_ind;
+    }
+    insert_scan_time = bgj_bucket_wall_time() - insert_scan_start;
+
+    if (batch_uid_erase) {
+        const double batch_t0 = bgj_bucket_wall_time();
+        const long nshard = UidHashTable::NUM_UID_LOCK;
+        uint64_t total_deferred = 0;
+        for (long thread = 0; thread < num_threads; thread++) {
+            total_deferred += (uint64_t)deferred_uid_count[thread];
+        }
+
+        if (total_deferred > 0) {
+            uint64_t *shard_offset =
+                (uint64_t *)NEW_VEC(nshard + 1, sizeof(uint64_t));
+            uint64_t *thread_shard_pos =
+                (uint64_t *)NEW_VEC((long)num_threads * nshard, sizeof(uint64_t));
+            uint64_t *grouped_uid =
+                (uint64_t *)NEW_VEC((long)total_deferred, sizeof(uint64_t));
+            if (shard_offset && thread_shard_pos && grouped_uid) {
+                for (long shard = 0; shard < nshard; shard++) {
+                    uint64_t shard_total = 0;
+                    for (long thread = 0; thread < num_threads; thread++) {
+                        shard_total +=
+                            deferred_shard_counts[(long)thread * nshard + shard];
+                    }
+                    shard_offset[shard + 1] = shard_offset[shard] + shard_total;
+                }
+                for (long shard = 0; shard < nshard; shard++) {
+                    uint64_t pos = shard_offset[shard];
+                    for (long thread = 0; thread < num_threads; thread++) {
+                        thread_shard_pos[(long)thread * nshard + shard] = pos;
+                        pos += deferred_shard_counts[(long)thread * nshard + shard];
+                    }
+                }
+
+                #pragma omp parallel for
+                for (long thread = 0; thread < num_threads; thread++) {
+                    const long begin_ind = (num_total_sol * thread) / num_threads;
+                    uint64_t *local_pos = thread_shard_pos + (long)thread * nshard;
+                    for (long i = 0; i < deferred_uid_count[thread]; i++) {
+                        const uint64_t erase_uid = deferred_uid_erase[begin_ind + i];
+                        const long shard = erase_uid % nshard;
+                        grouped_uid[local_pos[shard]++] = erase_uid;
+                    }
+                }
+
+                uint64_t batch_fail = 0;
+                #pragma omp parallel for reduction(+:batch_fail)
+                for (long shard = 0; shard < nshard; shard++) {
+                    const uint64_t begin = shard_offset[shard];
+                    const uint64_t end = shard_offset[shard + 1];
+                    if (begin == end) continue;
+                    pthread_spin_lock(&uid->uid_lock[shard].a);
+                    for (uint64_t i = begin; i < end; i++) {
+                        if (uid->uid_table[shard].a.erase(grouped_uid[i]) == 0) {
+                            batch_fail++;
+                        }
+                    }
+                    pthread_spin_unlock(&uid->uid_lock[shard].a);
+                }
+                insert_uid_erase_fail += batch_fail;
+            } else {
+                uint64_t fallback_fail = 0;
+                #pragma omp parallel for reduction(+:fallback_fail)
+                for (long thread = 0; thread < num_threads; thread++) {
+                    const long begin_ind = (num_total_sol * thread) / num_threads;
+                    for (long i = 0; i < deferred_uid_count[thread]; i++) {
+                        if (!uid->erase_uid(deferred_uid_erase[begin_ind + i])) {
+                            fallback_fail++;
+                        }
+                    }
+                }
+                insert_uid_erase_fail += fallback_fail;
+            }
+            if (shard_offset) FREE_VEC((void *)shard_offset);
+            if (thread_shard_pos) FREE_VEC((void *)thread_shard_pos);
+            if (grouped_uid) FREE_VEC((void *)grouped_uid);
+        }
+        insert_uid_batch_time = bgj_bucket_wall_time() - batch_t0;
+    }
+    if (insert_uid_erase_fail) {
+        fprintf(stderr,
+                "[Error] Pool_epi8_t<%u>::_pool_insert: %lu uid erases failed, ignored.\n",
+                nb,
+                insert_uid_erase_fail);
     }
 
     if (prof) {
@@ -4078,6 +4264,13 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
         prof->materialize_cuda_reconstruct_time += materialize_cuda_reconstruct_time;
         prof->materialize_cuda_copy_time += materialize_cuda_copy_time;
         prof->materialize_cuda_phase_chunk += materialize_cuda_phase_chunk;
+        prof->insert_scan_time += insert_scan_time;
+        prof->insert_uid_erase_time += insert_uid_erase_time;
+        prof->insert_uid_batch_time += insert_uid_batch_time;
+        prof->insert_copy_time += insert_copy_time;
+        prof->insert_uid_erase_count += insert_uid_erase_count;
+        prof->insert_uid_erase_fail += insert_uid_erase_fail;
+        prof->insert_copy_count += insert_copy_count;
         pthread_spin_unlock(&prof->profile_lock);
     }
 
@@ -4085,10 +4278,13 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
     if (staged_selected_indices) FREE_VEC((void *)staged_selected_indices);
     if (staged_selected_pos) FREE_VEC((void *)staged_selected_pos);
     if (staged_selected_vec) FREE_VEC((void *)staged_selected_vec);
+    if (deferred_uid_erase) FREE_VEC((void *)deferred_uid_erase);
+    if (deferred_shard_counts) FREE_VEC((void *)deferred_shard_counts);
     FREE_VEC((void *)vu_to_insert);
     FREE_VEC((void *)vnorm_to_insert);
     FREE_VEC((void *)vsum_to_insert);
 
+    const double compact_t0 = bgj_bucket_wall_time();
     for (long i = 0; i < num_threads - 1; i++) {
         for (long k = num_threads - 1; k > i; k--) {
             while ((empty_final_ind[i] < empty_end[i]) && (empty_final_ind[k] > empty_begin[k])) {
@@ -4102,14 +4298,22 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
                 ((uint32_t *)(cvec + (long)dst * 3LL))[0] = dst;
                 empty_final_ind[i]++;
                 empty_final_ind[k]--;
+                insert_compact_move++;
             }
         }
     }
+    insert_compact_time = bgj_bucket_wall_time() - compact_t0;
     for (long i = 0; i < num_threads; i++) {
         num_vec += empty_final_ind[i] - empty_begin[i];
         num_empty -= empty_final_ind[i] - empty_begin[i];
     }
     sorted_index = nonempty_final_ind[num_threads-1];
+    if (prof) {
+        pthread_spin_lock(&prof->profile_lock);
+        prof->insert_compact_time += insert_compact_time;
+        prof->insert_compact_move += insert_compact_move;
+        pthread_spin_unlock(&prof->profile_lock);
+    }
 
     if (profiling && prof) {
         prof->insert_inner_log(length_stat, num_linfty_failed, num_l2_failed, num_not_try);

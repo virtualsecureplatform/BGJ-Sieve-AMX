@@ -327,6 +327,21 @@ void bgj_profile_data_t<nb>::insert_log(uint64_t num_total_sol, double insert_ti
                         materialize_cuda_copy_time);
             }
         }
+        if (insert_uid_erase_count || insert_copy_count || insert_compact_move) {
+            fprintf(log_out,
+                    "insert phases: scan=%.6fs, uid_erase=%lu in %.6fs, "
+                    "uid_batch=%.6fs, copy=%lu in %.6fs, compact=%lu in %.6fs, "
+                    "uid_fail=%lu\n",
+                    insert_scan_time,
+                    insert_uid_erase_count,
+                    insert_uid_erase_time,
+                    insert_uid_batch_time,
+                    insert_copy_count,
+                    insert_copy_time,
+                    insert_compact_move,
+                    insert_compact_time,
+                    insert_uid_erase_fail);
+        }
     }
     if (log_level == 0 && p->CSD > MIN_LOG_CSD){
         fprintf(log_err, ".");
@@ -380,6 +395,21 @@ void bgj_profile_data_t<nb>::final_log(int bgj, long sieving_stucked) {
                             materialize_cuda_reconstruct_time,
                             materialize_cuda_copy_time);
                 }
+            }
+            if (insert_uid_erase_count || insert_copy_count || insert_compact_move) {
+                fprintf(log_out,
+                        "insert phases: scan=%.6fs, uid_erase=%lu in %.6fs, "
+                        "uid_batch=%.6fs, copy=%lu in %.6fs, compact=%lu in %.6fs, "
+                        "uid_fail=%lu\n",
+                        insert_scan_time,
+                        insert_uid_erase_count,
+                        insert_uid_erase_time,
+                        insert_uid_batch_time,
+                        insert_copy_count,
+                        insert_copy_time,
+                        insert_compact_move,
+                        insert_compact_time,
+                        insert_uid_erase_fail);
             }
             speed0 = p->CSD * 2 * bucket0_ndp/bucket0_time/1073741824.0;
             fprintf(log_out, "bucket0 speed: %f bucket/s, %f GFLOPS\n", num_bucket0/bucket0_time, speed0);
@@ -737,6 +767,11 @@ void bgj_profile_data_t<nb>::combine(bgj_profile_data_t<nb> *prof) {
     materialize_cuda_coeff_time += prof->materialize_cuda_coeff_time;
     materialize_cuda_reconstruct_time += prof->materialize_cuda_reconstruct_time;
     materialize_cuda_copy_time += prof->materialize_cuda_copy_time;
+    insert_scan_time += prof->insert_scan_time;
+    insert_uid_erase_time += prof->insert_uid_erase_time;
+    insert_uid_batch_time += prof->insert_uid_batch_time;
+    insert_copy_time += prof->insert_copy_time;
+    insert_compact_time += prof->insert_compact_time;
 
     bucket0_ndp += prof->bucket0_ndp;
     bucket1_ndp += prof->bucket1_ndp;
@@ -762,6 +797,10 @@ void bgj_profile_data_t<nb>::combine(bgj_profile_data_t<nb> *prof) {
     materialize_cuda_failed_call += prof->materialize_cuda_failed_call;
     materialize_cuda_failed_candidate += prof->materialize_cuda_failed_candidate;
     materialize_cuda_phase_chunk += prof->materialize_cuda_phase_chunk;
+    insert_uid_erase_count += prof->insert_uid_erase_count;
+    insert_uid_erase_fail += prof->insert_uid_erase_fail;
+    insert_copy_count += prof->insert_copy_count;
+    insert_compact_move += prof->insert_compact_move;
 
     try_add2 += prof->try_add2;
     succ_add2 += prof->succ_add2;

@@ -165,7 +165,7 @@ int bgj_cuda_materialize_requested()
 {
     const char *env = getenv("BGJ_CUDA_MATERIALIZE");
     if (env && env[0]) return env[0] != '0';
-    return 0;
+    return bgj_cuda_search_requested();
 }
 
 int bgj_cuda_bucket_requested()
@@ -174,7 +174,7 @@ int bgj_cuda_bucket_requested()
     if (env && env[0]) return env[0] != '0';
     env = getenv("BGJ_CUDA_BUCKETING");
     if (env && env[0]) return env[0] != '0';
-    return 0;
+    return bgj_cuda_search_requested();
 }
 
 uint32_t bgj_cuda_batch_size(uint32_t host_threads)

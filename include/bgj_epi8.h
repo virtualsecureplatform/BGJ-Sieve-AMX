@@ -121,6 +121,11 @@ struct bgj_profile_data_t {
     double materialize_cuda_coeff_time = 0.0;
     double materialize_cuda_reconstruct_time = 0.0;
     double materialize_cuda_copy_time = 0.0;
+    double insert_scan_time = 0.0;
+    double insert_uid_erase_time = 0.0;
+    double insert_uid_batch_time = 0.0;
+    double insert_copy_time = 0.0;
+    double insert_compact_time = 0.0;
 
     uint64_t bucket0_ndp = 0;
     uint64_t bucket1_ndp = 0;
@@ -146,6 +151,10 @@ struct bgj_profile_data_t {
     uint64_t materialize_cuda_failed_call = 0;
     uint64_t materialize_cuda_failed_candidate = 0;
     uint64_t materialize_cuda_phase_chunk = 0;
+    uint64_t insert_uid_erase_count = 0;
+    uint64_t insert_uid_erase_fail = 0;
+    uint64_t insert_copy_count = 0;
+    uint64_t insert_compact_move = 0;
 
     uint64_t try_add2 = 0;
     uint64_t succ_add2 = 0;

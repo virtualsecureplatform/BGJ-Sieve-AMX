@@ -25,9 +25,10 @@ $ git submodule update --init --recursive
 $ make
 ```
 
-CUDA support can be enabled for the exact pair-search stage of `bgj1`. The
-CPU implementation is still used by default for bucketing, lifting, insertion,
-and the other sieve variants.
+CUDA support can be enabled for `bgj1`. In CUDA BGJ1 mode the A100 tuning path
+uses GPU bucket search, GPU pool bucketing, and GPU candidate materialization
+by default. The insertion pass and the other sieve variants still use the CPU
+implementation.
 
 ```bash
 $ make clean
@@ -56,17 +57,17 @@ The seed controls the library sampler and the internal randomized choices used
 by sieving. `svp_tool -s` and `svp_solver -s` use the same sampler seed path.
 
 You can also force CUDA-assisted bucket search for a compiled-in `bgj1` run
-with `BGJ_CUDA_SEARCH=1`. If CUDA is unavailable or an internal result buffer
-overflows, the code falls back to the existing CPU search for that bucket. The
-default result buffer holds `4194304` candidates per bucket and can be changed
-with `BGJ_CUDA_MAX_RESULTS`.
+with `BGJ_CUDA_SEARCH=1`. If CUDA is unavailable, the code falls back to the
+existing CPU search. The default result buffer holds `16777216` candidates per
+bucket and can be changed with `BGJ_CUDA_MAX_RESULTS`.
 
-An experimental BGJ1 pool-bucketing offload is available with
-`BGJ_CUDA_BUCKET=1`. It preserves the current threshold-based bucket
+The CUDA BGJ1 path enables pool-bucketing offload by default. It preserves the
+current threshold-based bucket
 membership rule, writes the same positive/negative dot-product records used by
 the CPU search path, and falls back to CPU bucketing if the CUDA output buffer
 overflows. Tune the temporary output buffer with `BGJ_CUDA_BUCKET_MARGIN=<n>`
-or cap it with `BGJ_CUDA_BUCKET_MAX_ENTRIES=<n>`. On A100, CUDA bucketing
+or cap it with `BGJ_CUDA_BUCKET_MAX_ENTRIES=<n>`. Set `BGJ_CUDA_BUCKET=0` to
+force CPU bucketing. On A100, CUDA bucketing
 defaults to the append-based INT8 Tensor Core kernel for full 16x16
 center/vector tiles because it is the fastest current path on SVP100 timing
 runs. Set `BGJ_CUDA_BUCKET_TENSOR=0` to force scalar `dp4a` append kernels.
@@ -137,12 +138,13 @@ GPU result emitter that writes records in deterministic phase/rank order
 without a host sort. It is currently a profiling path rather than a default:
 the scalar A100 implementation avoids the CPU sort but also skips the Tensor
 Core search kernels.
-An experimental CUDA candidate materializer is available with
-`BGJ_CUDA_MATERIALIZE=1`. It chunks solution records, uses signed INT8 cuBLAS
-GEMM for coefficient reconstruction, and defaults to the exact CUDA
-reconstruction kernel on A100. It keeps the basis resident on the GPU across
-repeated calls when the hashed `_b_dual`/`_b_local` content is unchanged and
-copies device output directly to the insertion buffers by default. Set
+CUDA BGJ1 enables the CUDA candidate materializer by default. It chunks
+solution records, uses signed INT8 cuBLAS GEMM for coefficient reconstruction,
+and defaults to the exact CUDA reconstruction kernel on A100. It keeps the
+basis resident on the GPU across repeated calls when the hashed
+`_b_dual`/`_b_local` content is unchanged and copies device output directly to
+the insertion buffers by default. Set `BGJ_CUDA_MATERIALIZE=0` to force CPU
+candidate materialization. Set
 `BGJ_CUDA_MATERIALIZE_BASIS_CACHE=0` when isolating basis upload costs,
 `BGJ_CUDA_MATERIALIZE_PINNED_HOST=1` to re-enable the older pinned-host staging
 path, `BGJ_CUDA_MATERIALIZE_SGEMM=1` to use the SGEMM reconstruction path, or
@@ -174,6 +176,10 @@ runs. Set `BGJ_CPU_MATERIALIZE_THREADS=<n>` to tune it, or `0` to use the old
 single-thread materialization path. This remains CPU-side candidate
 materialization only; CUDA search and bucketing timings are reported
 separately.
+CUDA BGJ1 batches UID erases during insertion by default. This reduces lock
+traffic in the current A100 SVP96 timing runs and can be disabled with
+`BGJ_INSERT_BATCH_UID_ERASE=0`. Set `BGJ_INSERT_PHASE_PROFILE=1` to print the
+insert scan, UID erase, batch erase, copy, and compact phase timings.
 The default CUDA/BGJ build now instantiates `Pool_epi8_t<6>` and
 `Pool_epi8_t<7>`, allowing non-LSH BGJ/CUDA paths to use 192- and
 224-dimensional int8 pool vectors. The LSH and AMX paths remain capped by their
