@@ -55,15 +55,16 @@ materialization overheads that make low-dimensional pump stages slower than the
 CPU path.
 `app/svp_solver` also accepts `--cuda`; it enables the same
 `BGJ_SVP_CUDA=1` hook used by the solver internals.
-For BGJ2, CUDA search is enabled only for the first-level reuse buckets by
-default. The second-level subbucket search remains on CPU unless
-`BGJ_CUDA_BGJ2_SEARCH1=1` is set, because the current kernel launch and packing
-costs are slower than CPU search for those smaller buckets on the SVP-100
-profiled path. `BGJ_CUDA_BGJ2_SEARCH=0` disables BGJ2 search offload,
-`BGJ_CUDA_BGJ2_SEARCH0=0` disables only the first-level reuse buckets, and
-`BGJ_CUDA_BGJ2_MIN_DOTS` sets the BGJ2-only search threshold. BGJ2-only search
-batching can be tested with `BGJ_CUDA_BGJ2_BATCH=1` or
-`BGJ_CUDA_BGJ2_BATCH_SIZE=<n>` without changing the BGJ1 batch setting.
+For BGJ2, CUDA search is enabled for both first-level reuse buckets and
+second-level subbuckets by default. `BGJ_CUDA_BGJ2_SEARCH=0` disables BGJ2
+search offload, `BGJ_CUDA_BGJ2_SEARCH0=0` disables only the first-level reuse
+buckets, `BGJ_CUDA_BGJ2_SEARCH1=0` disables only the second-level subbucket
+search, and `BGJ_CUDA_BGJ2_MIN_DOTS` sets the BGJ2-only search threshold.
+BGJ2-only search batching can be tested with `BGJ_CUDA_BGJ2_BATCH=1` or
+`BGJ_CUDA_BGJ2_BATCH_SIZE=<n>` without changing the BGJ1 batch setting. In a
+May 2026 A100/GPU1 dim-96 direct BGJ2 run, enabling second-level CUDA search
+reduced wall time from `240.54s` to `181.81s` with the same final norm and
+approximation factor.
 For BGJ3, CUDA search is enabled by default for `search0`, `search1`, and
 `search2` buckets whose dot-product work crosses the configured threshold.
 Use `BGJ_CUDA_BGJ3_SEARCH=0` to disable all BGJ3 search offload, or

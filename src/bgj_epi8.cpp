@@ -1392,7 +1392,7 @@ int Pool_epi8_t<nb>::bgj2_Sieve(long log_level, long lps_auto_adj){
             const uint64_t cuda_batch_min_dots = bgj_epi8_env_u64("BGJ_CUDA_BGJ2_MIN_DOTS", bgj_cuda_batch_min_dots());
             const int cuda_bgj2_search = bgj_epi8_env_flag("BGJ_CUDA_BGJ2_SEARCH", 1);
             const int cuda_bgj2_search0 = cuda_bgj2_search ? bgj_epi8_env_flag("BGJ_CUDA_BGJ2_SEARCH0", 1) : 0;
-            const int cuda_bgj2_search1 = cuda_bgj2_search ? bgj_epi8_env_flag("BGJ_CUDA_BGJ2_SEARCH1", 0) : 0;
+            const int cuda_bgj2_search1 = cuda_bgj2_search ? bgj_epi8_env_flag("BGJ_CUDA_BGJ2_SEARCH1", 1) : 0;
             #endif
 
             ///////////////// search0 /////////////////
