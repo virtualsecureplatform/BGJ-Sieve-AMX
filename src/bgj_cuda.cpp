@@ -138,7 +138,7 @@ static uint32_t bgj_cuda_max_results()
         unsigned long value = strtoul(env, NULL, 10);
         if (value > 0 && value <= 0xffffffffUL) return (uint32_t)value;
     }
-    return 1u << 24;
+    return 1u << 20;
 }
 
 static int bgj_cuda_pool_cache_requested()
@@ -678,7 +678,10 @@ int Pool_epi8_t<nb>::left_progressive_bgj1sieve_cuda(long ind_l, long ind_r, lon
     }
 
     int show_lift = 0;
-    if (abs(log_level - 16384) < 10) {
+    if (abs(log_level - 32768) < 10) {
+        log_level -= 32768;
+        show_lift = 2;
+    } else if (abs(log_level - 16384) < 10) {
         log_level -= 16384;
         show_lift = 1;
     }
@@ -694,8 +697,9 @@ int Pool_epi8_t<nb>::left_progressive_bgj1sieve_cuda(long ind_l, long ind_r, lon
         long target_num_vec = (long)(pow(4. / 3., CSD * 0.5) * 3.2);
         if (target_num_vec > num_vec + num_empty) num_empty = target_num_vec - num_vec;
         bgj1_Sieve_cuda(log_level, 1);
-        if (show_lift) show_min_lift(0);
+        if (show_lift == 1) show_min_lift(0);
     }
+    if (show_lift == 2) show_min_lift(0);
     return 1;
 }
 

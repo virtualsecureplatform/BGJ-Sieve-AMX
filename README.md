@@ -136,7 +136,7 @@ insertion cost. CUDA BGJ1 runs at dimension 40 or larger default to target
 current A100 dim70/dim80 seed-42 challenge runs, this higher-density setting is
 best for dim80 and still leaves dim70 well ahead of the G6K comparison.
 Dense buckets can produce many CUDA solution records; `BGJ_CUDA_MAX_RESULTS`
-sets the per-bucket result capacity and defaults to `16777216` for the A100
+sets the per-bucket result capacity and defaults to `1048576` for the A100
 tuning path. On overflow the CUDA path now consumes the capped result prefix and
 continues, matching G6K-GPU-Tensor's bounded queue behavior; set
 `BGJ_CUDA_OVERFLOW_FALLBACK=1` to restore CPU fallback on overflow. CUDA result
@@ -148,6 +148,16 @@ GPU result emitter that writes records in deterministic phase/rank order
 without a host sort. It is currently a profiling path rather than a default:
 the scalar A100 implementation avoids the CPU sort but also skips the Tensor
 Core search kernels.
+The benchmark harness also accepts modes such as `cuda-maxres1048576` and
+`cuda-maxres4194304` and can record final vector quality with `--print-quality`.
+On the SVP-100 seed-0 challenge lattice preprocessed by `app/lattice_preprocess`
+and run on A100/GPU1 with seed 42 and a 600s per-mode timeout,
+`cuda-maxres1048576` took `214.67s` and reported Euclidean norm `2860.50415`
+with approximation factor `1.12639278`; `cuda-maxres4194304` took `239.46s`
+with norm `2895.50548` and factor `1.14017540`; the previous uncapped default
+took `297.26s` with norm `2866.45583` and factor `1.12873640`. The challenge
+bound for that run is `1.05 * GH = 2666.50267`, so none of these app-level
+SVP-100 runs is a valid SVP challenge solution yet.
 CUDA BGJ1 enables the CUDA candidate materializer by default. It chunks
 solution records, uses signed INT8 cuBLAS GEMM for coefficient reconstruction,
 and defaults to the exact CUDA reconstruction kernel on A100. It keeps the

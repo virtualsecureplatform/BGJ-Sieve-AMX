@@ -31,6 +31,10 @@ CUDA_RE = re.compile(
     r"batch=(\d+) calls/(\d+) buckets/(\d+) dp in ([0-9.]+)s, "
     r"cred=([0-9.]+)s, fallback=(\d+) buckets/(\d+) dp in ([0-9.]+)s"
 )
+QUALITY_RE = re.compile(
+    r"^length = ([0-9.eE+-]+)\(([0-9.eE+-]+)\)"
+    r"(?:, gh = ([0-9.eE+-]+), approx = ([0-9.eE+-]+))?, vec ="
+)
 
 CSV_FIELDS = [
     "kind",
@@ -69,6 +73,15 @@ CSV_FIELDS = [
     "cuda_fallback_dp",
     "cuda_fallback_sec",
     "cuda_gdot_per_sec",
+    "quality_samples",
+    "quality_euclidean_norm",
+    "quality_lift_norm",
+    "quality_gh",
+    "quality_challenge_bound",
+    "quality_challenge_pass",
+    "quality_approx_factor",
+    "quality_final_euclidean_norm",
+    "quality_final_approx_factor",
 ]
 
 PRESET_DIMS = {
@@ -357,6 +370,10 @@ def mode_command(app, lattice, mode, threads, log_level, seed):
     if same_min_match:
         env["BGJ_CUDA_TENSOR_SAME_MIN_TILES"] = same_min_match.group(1)
 
+    maxres_match = re.search(r"maxres(\d+)", mode)
+    if maxres_match:
+        env["BGJ_CUDA_MAX_RESULTS"] = maxres_match.group(1)
+
     command = [str(app), str(lattice), algo, str(threads), str(log_level), str(seed)]
     return command, env
 
@@ -384,6 +401,15 @@ def empty_app_stats():
         "cuda_fallback_dp": 0,
         "cuda_fallback_sec": 0.0,
         "cuda_gdot_per_sec": 0.0,
+        "quality_samples": 0,
+        "quality_euclidean_norm": 0.0,
+        "quality_lift_norm": 0.0,
+        "quality_gh": 0.0,
+        "quality_challenge_bound": 0.0,
+        "quality_challenge_pass": "",
+        "quality_approx_factor": 0.0,
+        "quality_final_euclidean_norm": 0.0,
+        "quality_final_approx_factor": 0.0,
     }
 
 
@@ -461,6 +487,30 @@ def parse_app_output(output):
                 int(cuda.group(10)),
                 float(cuda.group(11)),
             )
+            continue
+
+        quality = QUALITY_RE.search(line)
+        if quality:
+            euclidean_norm = float(quality.group(1))
+            lift_norm = float(quality.group(2))
+            gh = float(quality.group(3) or 0.0)
+            approx = float(quality.group(4) or 0.0)
+            if approx == 0.0 and gh > 0.0:
+                approx = euclidean_norm / gh
+            stats["quality_samples"] += 1
+            stats["quality_final_euclidean_norm"] = euclidean_norm
+            stats["quality_final_approx_factor"] = approx
+            if (
+                stats["quality_euclidean_norm"] == 0.0
+                or euclidean_norm < stats["quality_euclidean_norm"]
+            ):
+                stats["quality_euclidean_norm"] = euclidean_norm
+                stats["quality_lift_norm"] = lift_norm
+                stats["quality_gh"] = gh
+                if gh > 0.0:
+                    stats["quality_challenge_bound"] = 1.05 * gh
+                    stats["quality_challenge_pass"] = euclidean_norm <= 1.05 * gh
+                stats["quality_approx_factor"] = approx
 
     flush_cuda()
     cuda_dp = stats["cuda_single_dp"] + stats["cuda_batch_dp"]
@@ -472,6 +522,8 @@ def parse_app_output(output):
 
 def run_one(args, outdir, writer, jsonl, dim, lattice, mode, commit):
     command, mode_env = mode_command(args.app, lattice, mode, args.threads, args.log_level, args.seed)
+    if args.print_quality:
+        command.append("--print-final")
     env = os.environ.copy()
     env.update(mode_env)
     env["BGJ_SEED"] = str(args.seed)
@@ -584,7 +636,7 @@ def run_suite(args):
 def print_summary(rows, csv_path, jsonl_path):
     print(f"wrote {csv_path}")
     print(f"wrote {jsonl_path}")
-    print("kind,dim,mode,elapsed_sec,returncode,timeout,cuda_gdot_per_sec,cuda_single_dp,cuda_batch_dp")
+    print("kind,dim,mode,elapsed_sec,returncode,timeout,cuda_gdot_per_sec,cuda_single_dp,cuda_batch_dp,quality_norm,quality_bound,quality_approx,quality_pass")
     for row in rows:
         print(
             ",".join(
@@ -598,6 +650,10 @@ def print_summary(rows, csv_path, jsonl_path):
                     f"{float(row.get('cuda_gdot_per_sec') or 0.0):.6f}",
                     str(row.get("cuda_single_dp", "")),
                     str(row.get("cuda_batch_dp", "")),
+                    f"{float(row.get('quality_euclidean_norm') or 0.0):.9g}",
+                    f"{float(row.get('quality_challenge_bound') or 0.0):.9g}",
+                    f"{float(row.get('quality_approx_factor') or 0.0):.9g}",
+                    str(row.get("quality_challenge_pass", "")),
                 ]
             )
         )
@@ -637,6 +693,7 @@ def parse_args(argv):
     parser.add_argument("--preprocess-timeout-sec", type=int, default=900)
     parser.add_argument("--output-dir", type=Path, default=default_out)
     parser.add_argument("--reuse-lattices", action="store_true")
+    parser.add_argument("--print-quality", action="store_true")
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--stop-on-timeout", action="store_true")
     parser.add_argument("--stop-on-failure", action="store_true")

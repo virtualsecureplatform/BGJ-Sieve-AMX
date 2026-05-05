@@ -45,16 +45,19 @@ int main(int argc, char** argv) {
         if (!strcasecmp(argv[i], "-p") || !strcasecmp(argv[i], "--print")) {
             print_min_lift = 1;
         }
+        if (!strcasecmp(argv[i], "--print-final")) {
+            print_min_lift = 2;
+        }
     }
     if (argc < 2 || help) {
         #if defined(__AMX_INT8__) && defined(HAVE_CUDA)
-        printf("Usage: %s <lattice_file> [bgjf|bgj1|bgj2|bgj3|cuda|amx] [num_threads] [log_level] [seed]\n", argv[0]);
+        printf("Usage: %s <lattice_file> [bgjf|bgj1|bgj2|bgj3|cuda|amx] [num_threads] [log_level] [seed] [-p|--print|--print-final]\n", argv[0]);
         #elif defined(__AMX_INT8__)
-        printf("Usage: %s <lattice_file> [bgjf|bgj1|bgj2|bgj3|amx] [num_threads] [log_level] [seed]\n", argv[0]);
+        printf("Usage: %s <lattice_file> [bgjf|bgj1|bgj2|bgj3|amx] [num_threads] [log_level] [seed] [-p|--print|--print-final]\n", argv[0]);
         #elif defined(HAVE_CUDA)
-        printf("Usage: %s <lattice_file> [bgjf|bgj1|bgj2|bgj3|cuda] [num_threads] [log_level] [seed]\n", argv[0]);
+        printf("Usage: %s <lattice_file> [bgjf|bgj1|bgj2|bgj3|cuda] [num_threads] [log_level] [seed] [-p|--print|--print-final]\n", argv[0]);
         #else
-        printf("Usage: %s <lattice_file> [bgjf|bgj1|bgj2|bgj3] [num_threads] [log_level] [seed]\n", argv[0]);
+        printf("Usage: %s <lattice_file> [bgjf|bgj1|bgj2|bgj3] [num_threads] [log_level] [seed] [-p|--print|--print-final]\n", argv[0]);
         #endif
         return 0;
     }

@@ -1230,7 +1230,12 @@ int Pool_epi8_t<nb>::show_min_lift(long index) {
         }
     } while (0);
 
-    printf("\nlength = %f(%f), vec = ", sqrt(dot_avx2(v_QP.hi, v_QP.hi, basis->NumCols())), sqrt(min_norm));
+    const double euclidean_norm = sqrt(dot_avx2(v_QP.hi, v_QP.hi, basis->NumCols()));
+    const double lift_norm = sqrt(min_norm);
+    const double gh = basis->gh(index, index_r);
+    const double approx = (gh > 0.0) ? euclidean_norm / gh : 0.0;
+    printf("\nlength = %.9g(%.9g), gh = %.9g, approx = %.9g, vec = ",
+           euclidean_norm, lift_norm, gh, approx);
     PRINT_VEC(v_QP.hi, basis->NumCols());
     fflush(stdout);
     FREE_VEC_QP(v_QP);
