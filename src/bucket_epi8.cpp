@@ -3714,7 +3714,7 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
     uint64_t materialize_cuda_phase_chunk = 0;
     const int insert_phase_profile = bgj_insert_phase_profile_enabled();
     int batch_uid_erase = bgj_insert_batch_uid_erase_enabled();
-    const int collect_insert_phase = insert_phase_profile || batch_uid_erase;
+    const int collect_insert_phase = insert_phase_profile;
     uint64_t *deferred_uid_erase = NULL;
     uint64_t *deferred_shard_counts = NULL;
     long deferred_uid_count[MAX_NTHREADS] = {};
