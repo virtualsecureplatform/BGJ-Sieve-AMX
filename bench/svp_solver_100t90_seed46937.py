@@ -33,6 +33,9 @@ CSV_FIELDS = [
     "sampler_seed",
     "algo",
     "threads",
+    "bkz_pre_msd",
+    "bkz_pre_d4f",
+    "bkz_pre_minsd",
     "returncode",
     "timed_out",
     "elapsed_sec",
@@ -64,6 +67,14 @@ def parse_args(argv):
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--goal", type=float, default=2600.0)
     parser.add_argument("--timeout-sec", type=int, default=600)
+    parser.add_argument(
+        "--bkz-pre",
+        nargs=2,
+        type=int,
+        metavar=("MSD", "D4F"),
+        help="pass --bkz-pre MSD D4F to svp_solver before the selected reduction schedule",
+    )
+    parser.add_argument("--bkz-pre-minsd", type=int, default=45)
     parser.add_argument("--output-dir", type=Path, default=default_out)
     parser.add_argument("--app", type=Path, default=ROOT / "app" / "svp_solver")
     parser.add_argument("--lattice", type=Path, help="existing raw challenge lattice")
@@ -239,6 +250,10 @@ def run_solver(args, mode, lattice, gh):
         "--goal",
         str(args.goal),
     ]
+    if args.bkz_pre is not None:
+        command.extend(["--bkz-pre", str(args.bkz_pre[0]), str(args.bkz_pre[1])])
+        if args.bkz_pre_minsd != 45:
+            command.extend(["--bkz-pre-minsd", str(args.bkz_pre_minsd)])
     if mode == "cuda":
         command.append("--cuda")
         if args.cuda_visible_devices:
@@ -256,6 +271,9 @@ def run_solver(args, mode, lattice, gh):
         "sampler_seed": args.sampler_seed,
         "algo": args.algo,
         "threads": args.threads,
+        "bkz_pre_msd": args.bkz_pre[0] if args.bkz_pre is not None else "",
+        "bkz_pre_d4f": args.bkz_pre[1] if args.bkz_pre is not None else "",
+        "bkz_pre_minsd": args.bkz_pre_minsd if args.bkz_pre is not None else "",
         "gh": gh,
         "challenge_bound": 1.05 * gh,
         "command": shlex.join(command),

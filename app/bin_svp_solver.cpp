@@ -303,7 +303,7 @@ int _svp_solver_red(Lattice_QP* L, long algo) {
 }
 
 int show_help(int argc, char** argv) {
-    printf("Usage: %s <lattice_file> [--algo algorithm] [--threads num_threads] [--goal goal_length] [--cuda] [--profile]\n", argv[0]);
+    printf("Usage: %s <lattice_file> [--algo algorithm] [--threads num_threads] [--goal goal_length] [--cuda] [--profile] [--bkz-pre msd d4f]\n", argv[0]);
     printf("./red/<lattice_file> will be read and the reducted basis will be written to ./red/<lattice_file>r\n");
     printf("Options:\n");
     printf("   -s, --seed          sampler seed\n");
@@ -311,6 +311,7 @@ int show_help(int argc, char** argv) {
     printf("   -g, --goal          print possible sol only below this length\n");
     printf("   -cuda, --cuda       use CUDA-assisted BGJ sieve phases\n");
     printf("   -profile, --profile print coarse stage timings\n");
+    printf("   -bkz-pre, --bkz-pre run one pump-BKZ preprocessing tour with msd and d4f\n");
     printf("Supported algorithms:\n");
     printf( "   SVPALGO_NULL        0\n"
             "   SVPALGO_100T90      1\n"
@@ -328,6 +329,10 @@ int main(int argc, char** argv) {
     long filename_place = 0;
     long seed = time(NULL);
     long cuda = 0;
+    long bkz_pre = 0;
+    long bkz_pre_msd = 0;
+    long bkz_pre_d4f = 0;
+    long bkz_pre_minsd = 45;
     double goal_length = 0.0;
 
     for (long i = 0; i < argc; i++) {
@@ -370,6 +375,22 @@ int main(int argc, char** argv) {
         if (!strcasecmp(argv[i], "-profile") || !strcasecmp(argv[i], "--profile")) {
             profile = 1;
             continue;
+        }
+        if (!strcasecmp(argv[i], "-bkz-pre") || !strcasecmp(argv[i], "--bkz-pre")) {
+            if (i < argc - 2) {
+                bkz_pre = 1;
+                bkz_pre_msd = atol(argv[++i]);
+                bkz_pre_d4f = atol(argv[++i]);
+                continue;
+            }
+            help = 1;
+        }
+        if (!strcasecmp(argv[i], "--bkz-pre-minsd")) {
+            if (i < argc - 1) {
+                bkz_pre_minsd = atol(argv[++i]);
+                continue;
+            }
+            help = 1;
         }
         if (!strcasecmp(argv[i], "-g") || !strcasecmp(argv[i], "--goal")) {
             if (i < argc - 1) {
@@ -432,6 +453,15 @@ int main(int argc, char** argv) {
     Lattice_QP L(L_ZZ);
     solver_profile_line("lattice_init", solver_now() - profile_t0);
     SetSamplerSeed((uint64_t)seed);
+    if (bkz_pre) {
+        if (bkz_pre_msd <= 0 || bkz_pre_d4f < 0 || bkz_pre_msd + bkz_pre_d4f >= L.NumRows()) {
+            fprintf(stderr, "Error: --bkz-pre requires msd > 0, d4f >= 0, and msd + d4f < dimension.\n");
+            return 2;
+        }
+        profile_t0 = solver_now();
+        L.BKZ_tour_pump_epi8(bkz_pre_msd, bkz_pre_d4f, num_threads, 0, L.NumRows(), profile ? 1 : 0, bkz_pre_minsd);
+        solver_profile_line("bkz_pre_total", solver_now() - profile_t0);
+    }
     profile_t0 = solver_now();
     _svp_solver_red(&L, algo);
     solver_profile_line("solver_red_total", solver_now() - profile_t0);
