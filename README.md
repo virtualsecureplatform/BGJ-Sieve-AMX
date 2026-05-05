@@ -52,6 +52,8 @@ configured dot-product threshold, and disables CUDA candidate materialization
 unless `BGJ_CUDA_MATERIALIZE=1` is set. This avoids the small-bucket launch and
 materialization overheads that make low-dimensional pump stages slower than the
 CPU path.
+`app/svp_solver` also accepts `--cuda`; it enables the same
+`BGJ_SVP_CUDA=1` hook used by the solver internals.
 
 For reproducible CUDA/BGJ profiling, pass a fixed sampler seed as the fifth
 positional argument, with `-s/--seed`, or with `BGJ_SEED`:
@@ -312,6 +314,17 @@ For end-to-end A100 tuning on seed-42 SVP-challenge ladders, use:
 ```bash
 $ bench/bgj_cuda_seed42.py --preset ladder --stop-on-timeout --stop-on-failure \
     --timeout-sec 3600 --time-budget-sec 28800
+```
+
+To reproduce the official dim-100 seed-46937 solver case from
+`tmp/solutions.txt`, use the dedicated `svp_solver` target. It generates the
+raw SVP challenge basis with the old NTL-compatible official generator when the
+basis is missing, runs `SVPALGO_100T90`, and records runtime plus the SVP
+challenge quality check under `bench/results/`.
+
+```bash
+$ CUDA_VISIBLE_DEVICES=1 bench/svp_solver_100t90_seed46937.py --mode cuda
+$ CUDA_VISIBLE_DEVICES=1 bench/svp_solver_100t90_seed46937.py --mode both
 ```
 
 The harness uses the official SVP-challenge seed-0 generator when an instance

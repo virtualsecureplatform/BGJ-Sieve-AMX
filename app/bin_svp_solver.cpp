@@ -249,8 +249,13 @@ int _svp_solver_red(Lattice_QP* L, long algo) {
 }
 
 int show_help(int argc, char** argv) {
-    printf("Usage: %s <lattice_file> [--algo algorithm] [--threads num_threads] [--goal goal_length]\n", argv[0]);
+    printf("Usage: %s <lattice_file> [--algo algorithm] [--threads num_threads] [--goal goal_length] [--cuda]\n", argv[0]);
     printf("./red/<lattice_file> will be read and the reducted basis will be written to ./red/<lattice_file>r\n");
+    printf("Options:\n");
+    printf("   -s, --seed          sampler seed\n");
+    printf("   -t, --threads       number of CPU threads\n");
+    printf("   -g, --goal          print possible sol only below this length\n");
+    printf("   -cuda, --cuda       use CUDA-assisted BGJ1 phases\n");
     printf("Supported algorithms:\n");
     printf( "   SVPALGO_NULL        0\n"
             "   SVPALGO_100T90      1\n"
@@ -267,6 +272,7 @@ int main(int argc, char** argv) {
     long algo = 0;
     long filename_place = 0;
     long seed = time(NULL);
+    long cuda = 0;
     double goal_length = 0.0;
 
     for (long i = 0; i < argc; i++) {
@@ -302,6 +308,10 @@ int main(int argc, char** argv) {
                 help = 1;
             }
         }
+        if (!strcasecmp(argv[i], "-cuda") || !strcasecmp(argv[i], "--cuda")) {
+            cuda = 1;
+            continue;
+        }
         if (!strcasecmp(argv[i], "-g") || !strcasecmp(argv[i], "--goal")) {
             if (i < argc - 1) {
                 i++;
@@ -329,6 +339,15 @@ int main(int argc, char** argv) {
     if (help || argc < 3 || filename_place == 0) {
         show_help(argc, argv);
         return 0;
+    }
+
+    if (cuda) {
+        #if !defined(HAVE_CUDA)
+        fprintf(stderr, "Error: --cuda requires a CUDA build.\n");
+        return 2;
+        #else
+        setenv("BGJ_SVP_CUDA", "1", 1);
+        #endif
     }
 
     char input[256];
