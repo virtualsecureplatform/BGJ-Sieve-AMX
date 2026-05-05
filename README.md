@@ -156,7 +156,12 @@ For dimensions 96 and higher, the A100 path defaults to staged output copying:
 the GPU keeps candidate vectors resident, copies only norms and sums first, and
 then gathers host vectors only for candidates the insertion pass will keep. Set
 `BGJ_CUDA_MATERIALIZE_STAGED=0` to force the older full-copy path, or `1` to
-force staged copying at smaller dimensions.
+force staged copying at smaller dimensions. Do not merge the first insertion
+selection scan into the staged gather path without rebenchmarking: a May 2026
+A100/GPU1 SVP96 seed-42 test that cached final insertion destinations during
+staged selection regressed from `136.38s` total / `45.79s` insert to `149.50s`
+total / `57.03s` insert, so the simpler current two-scan insertion path remains
+faster.
 A fused one-kernel small-batch materializer is also available with
 `BGJ_CUDA_MATERIALIZE_FUSED=1` and capped by
 `BGJ_CUDA_MATERIALIZE_FUSED_MAX=<n>`, but it is not the default on A100 because
