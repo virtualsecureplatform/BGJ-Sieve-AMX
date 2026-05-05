@@ -53,6 +53,16 @@ static int svptool_bgj2_sieve(Pool_epi8_t<nb> &p, int use_cuda, long log_level, 
 }
 
 template <uint32_t nb>
+static int svptool_bgj3_sieve(Pool_epi8_t<nb> &p, int use_cuda, long log_level, long lps_auto_adj) {
+#if defined(HAVE_CUDA)
+    if (use_cuda) return p.bgj3_Sieve_cuda(log_level, lps_auto_adj);
+#else
+    (void)use_cuda;
+#endif
+    return p.bgj3_Sieve(log_level, lps_auto_adj);
+}
+
+template <uint32_t nb>
 static int svptool_left_progressive_bgjf(Pool_epi8_t<nb> &p, int use_cuda, long ind_l, long ind_r,
                                          long num_threads, long log_level, long ssd) {
 #if defined(HAVE_CUDA)
@@ -231,7 +241,7 @@ int main(int argc, char** argv) {
                     while (p.CSD < msd + esd) {                                                                 \
                         p.extend_left();                                                                        \
                         if (p.CSD >= 92) {                                                                      \
-                            p.bgj3_Sieve(log_level - 3, 1);                                                     \
+                            svptool_bgj3_sieve(p, cuda, log_level - 3, 1);                                      \
                         } else if (p.CSD > 80) {                                                                \
                             svptool_bgj2_sieve(p, cuda, log_level - 3, 1);                                      \
                         } else {                                                                                \

@@ -25,10 +25,11 @@ $ git submodule update --init --recursive
 $ make
 ```
 
-CUDA support can be enabled for `bgj1`. In CUDA BGJ1 mode the A100 tuning path
-uses GPU bucket search, GPU pool bucketing, and GPU candidate materialization
-by default. The insertion pass and the other sieve variants still use the CPU
-implementation.
+CUDA support can be enabled for BGJ sieve runs. In CUDA mode the A100 tuning
+path uses GPU bucket search, GPU pool bucketing, and GPU candidate
+materialization for BGJ1 by default. BGJ2 and BGJ3 reuse the same CUDA bucket
+search backend for selected search phases, while bucket construction and the
+insertion pass remain CPU-side.
 
 ```bash
 $ make clean
@@ -63,6 +64,14 @@ profiled path. `BGJ_CUDA_BGJ2_SEARCH=0` disables BGJ2 search offload,
 `BGJ_CUDA_BGJ2_MIN_DOTS` sets the BGJ2-only search threshold. BGJ2-only search
 batching can be tested with `BGJ_CUDA_BGJ2_BATCH=1` or
 `BGJ_CUDA_BGJ2_BATCH_SIZE=<n>` without changing the BGJ1 batch setting.
+For BGJ3, CUDA search is enabled by default for `search0`, `search1`, and
+`search2` buckets whose dot-product work crosses the configured threshold.
+Use `BGJ_CUDA_BGJ3_SEARCH=0` to disable all BGJ3 search offload, or
+`BGJ_CUDA_BGJ3_SEARCH0=0`, `BGJ_CUDA_BGJ3_SEARCH1=0`, and
+`BGJ_CUDA_BGJ3_SEARCH2=0` to disable individual phases.
+`BGJ_CUDA_BGJ3_MIN_DOTS` sets the BGJ3-only threshold; the default follows
+`BGJ_CUDA_BATCH_MIN_DOTS`. Very low thresholds, such as `1`, are useful for
+smoke-testing that BGJ3 calls CUDA, but are not a tuned performance setting.
 
 For reproducible CUDA/BGJ profiling, pass a fixed sampler seed as the fifth
 positional argument, with `-s/--seed`, or with `BGJ_SEED`:
@@ -135,12 +144,11 @@ challenge runs. Set `BGJ_CUDA_BATCH=1` to enable batching,
 `2` or higher, the BGJ1 profile prints CUDA single-bucket, batched, cred, and
 fallback bucket counts, dot counts, and timings.
 The `app/bgj_epi8 ... cuda` entry point now follows the stronger CPU `bgjf`
-progression: CUDA BGJ1 for the initial and low-dimensional stages, then the
-existing CPU BGJ2/BGJ3 stages above the same thresholds as `bgjf`. The old
+progression: CUDA BGJ1 for the initial and low-dimensional stages, then BGJ2
+and BGJ3 with CUDA search offload above the same thresholds as `bgjf`. The old
 BGJ1-only CUDA path is still available as `bgj1-cuda`; the benchmark harness
 selects it with modes prefixed by `cuda-bgj1`. The hybrid path keeps CUDA
-candidate materialization enabled for BGJ2/BGJ3 inserts, but their searches are
-still CPU-side.
+candidate materialization enabled for BGJ2/BGJ3 inserts.
 Do not enable search batching by default without rebenchmarking: a May 2026
 A100/GPU1 SVP100 seed-42 challenge run with a 600s timeout regressed from
 `281.15s` total / `102.80s` search in the default single-bucket mode to

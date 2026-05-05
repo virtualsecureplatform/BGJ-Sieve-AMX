@@ -674,6 +674,22 @@ int Pool_epi8_t<nb>::bgj2_Sieve_cuda(long log_level, long lps_auto_adj)
     return ret;
 }
 
+template <uint32_t nb>
+int Pool_epi8_t<nb>::bgj3_Sieve_cuda(long log_level, long lps_auto_adj)
+{
+    if (bgj_cuda_device_count() <= 0) {
+        fprintf(stderr, "[Warning] CUDA requested but no CUDA device is available: %s. Falling back to CPU bgj3.\n",
+                bgj_cuda_last_error());
+        return bgj3_Sieve(log_level, lps_auto_adj);
+    }
+
+    const int old = bgj_cuda_search_requested();
+    bgj_cuda_set_search_requested(1);
+    const int ret = bgj3_Sieve(log_level, lps_auto_adj);
+    bgj_cuda_set_search_requested(old);
+    return ret;
+}
+
 static long bgj_cuda_host_threads(long requested, long sieving_dim)
 {
     const char *env = getenv("BGJ_CUDA_HOST_THREADS");
@@ -731,7 +747,7 @@ int Pool_epi8_t<nb>::left_progressive_bgjfsieve_cuda(long ind_l, long ind_r, lon
         long target_num_vec = (long)(pow(4. / 3., CSD * 0.5) * 3.2);
         if (target_num_vec > num_vec + num_empty) num_empty = target_num_vec - num_vec;
         if (CSD >= 92) {
-            bgj3_Sieve(log_level, 1);
+            bgj3_Sieve_cuda(log_level, 1);
         } else if (CSD > 80) {
             bgj2_Sieve_cuda(log_level, 1);
         } else {
@@ -781,6 +797,7 @@ template int Pool_epi8_t<3>::_search_bgj1_cuda<0, 1>(bucket_epi8_t<0> *bkt, sol_
 template int Pool_epi8_t<3>::_search_bgj1_cuda_batch<0, 1>(bucket_epi8_t<0> **buckets, long num_bucket, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<3> *prof);
 template int Pool_epi8_t<3>::bgj1_Sieve_cuda(long log_level, long lps_auto_adj);
 template int Pool_epi8_t<3>::bgj2_Sieve_cuda(long log_level, long lps_auto_adj);
+template int Pool_epi8_t<3>::bgj3_Sieve_cuda(long log_level, long lps_auto_adj);
 template int Pool_epi8_t<3>::left_progressive_bgjfsieve_cuda(long ind_l, long ind_r, long num_threads, long log_level, long ssd);
 template int Pool_epi8_t<3>::left_progressive_bgj1sieve_cuda(long ind_l, long ind_r, long num_threads, long log_level);
 #endif
@@ -792,6 +809,7 @@ template int Pool_epi8_t<4>::_search_bgj1_cuda<0, 1>(bucket_epi8_t<0> *bkt, sol_
 template int Pool_epi8_t<4>::_search_bgj1_cuda_batch<0, 1>(bucket_epi8_t<0> **buckets, long num_bucket, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<4> *prof);
 template int Pool_epi8_t<4>::bgj1_Sieve_cuda(long log_level, long lps_auto_adj);
 template int Pool_epi8_t<4>::bgj2_Sieve_cuda(long log_level, long lps_auto_adj);
+template int Pool_epi8_t<4>::bgj3_Sieve_cuda(long log_level, long lps_auto_adj);
 template int Pool_epi8_t<4>::left_progressive_bgjfsieve_cuda(long ind_l, long ind_r, long num_threads, long log_level, long ssd);
 template int Pool_epi8_t<4>::left_progressive_bgj1sieve_cuda(long ind_l, long ind_r, long num_threads, long log_level);
 #endif
@@ -803,6 +821,7 @@ template int Pool_epi8_t<5>::_search_bgj1_cuda<0, 1>(bucket_epi8_t<0> *bkt, sol_
 template int Pool_epi8_t<5>::_search_bgj1_cuda_batch<0, 1>(bucket_epi8_t<0> **buckets, long num_bucket, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<5> *prof);
 template int Pool_epi8_t<5>::bgj1_Sieve_cuda(long log_level, long lps_auto_adj);
 template int Pool_epi8_t<5>::bgj2_Sieve_cuda(long log_level, long lps_auto_adj);
+template int Pool_epi8_t<5>::bgj3_Sieve_cuda(long log_level, long lps_auto_adj);
 template int Pool_epi8_t<5>::left_progressive_bgjfsieve_cuda(long ind_l, long ind_r, long num_threads, long log_level, long ssd);
 template int Pool_epi8_t<5>::left_progressive_bgj1sieve_cuda(long ind_l, long ind_r, long num_threads, long log_level);
 #endif
@@ -814,6 +833,7 @@ template int Pool_epi8_t<6>::_search_bgj1_cuda<0, 1>(bucket_epi8_t<0> *bkt, sol_
 template int Pool_epi8_t<6>::_search_bgj1_cuda_batch<0, 1>(bucket_epi8_t<0> **buckets, long num_bucket, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<6> *prof);
 template int Pool_epi8_t<6>::bgj1_Sieve_cuda(long log_level, long lps_auto_adj);
 template int Pool_epi8_t<6>::bgj2_Sieve_cuda(long log_level, long lps_auto_adj);
+template int Pool_epi8_t<6>::bgj3_Sieve_cuda(long log_level, long lps_auto_adj);
 template int Pool_epi8_t<6>::left_progressive_bgjfsieve_cuda(long ind_l, long ind_r, long num_threads, long log_level, long ssd);
 template int Pool_epi8_t<6>::left_progressive_bgj1sieve_cuda(long ind_l, long ind_r, long num_threads, long log_level);
 #endif
@@ -825,6 +845,7 @@ template int Pool_epi8_t<7>::_search_bgj1_cuda<0, 1>(bucket_epi8_t<0> *bkt, sol_
 template int Pool_epi8_t<7>::_search_bgj1_cuda_batch<0, 1>(bucket_epi8_t<0> **buckets, long num_bucket, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<7> *prof);
 template int Pool_epi8_t<7>::bgj1_Sieve_cuda(long log_level, long lps_auto_adj);
 template int Pool_epi8_t<7>::bgj2_Sieve_cuda(long log_level, long lps_auto_adj);
+template int Pool_epi8_t<7>::bgj3_Sieve_cuda(long log_level, long lps_auto_adj);
 template int Pool_epi8_t<7>::left_progressive_bgjfsieve_cuda(long ind_l, long ind_r, long num_threads, long log_level, long ssd);
 template int Pool_epi8_t<7>::left_progressive_bgj1sieve_cuda(long ind_l, long ind_r, long num_threads, long log_level);
 #endif

@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <sys/time.h>
 #include <malloc.h>
+#include <type_traits>
 
 
 #if 1
@@ -348,6 +349,24 @@ void bgj_profile_data_t<nb>::one_epoch_log(int bgj) {
                                 (long) ((search0_ndp + search1_ndp + search2_ndp) / (0.000001 + succ_add2 + succ_add3)));
                 fprintf(log_out, "try_add2 = %ld, try_add3 = %ld, succ_add2 = %ld(1/%.2f), succ_add3 = %ld(1/%.2f)\n",
                         try_add2, try_add3, succ_add2, (try_add2+1e-20)/succ_add2, succ_add3, (try_add3+1e-20)/succ_add3);
+                if (cuda_single_bucket0 || cuda_batch_bucket0 || cuda_fallback_bucket0) {
+                    fprintf(log_out, "cuda search0: single=%lu buckets/%lu dp in %.6fs, batch=%lu calls/%lu buckets/%lu dp in %.6fs, cred=%.6fs, fallback=%lu buckets/%lu dp in %.6fs\n",
+                            cuda_single_bucket0, cuda_single_ndp0, cuda_single_time0,
+                            cuda_batch_call0, cuda_batch_bucket0, cuda_batch_ndp0, cuda_batch_time0,
+                            cuda_cred_time0, cuda_fallback_bucket0, cuda_fallback_ndp0, cuda_fallback_time0);
+                }
+                if (cuda_single_bucket1 || cuda_batch_bucket1 || cuda_fallback_bucket1) {
+                    fprintf(log_out, "cuda search1: single=%lu buckets/%lu dp in %.6fs, batch=%lu calls/%lu buckets/%lu dp in %.6fs, cred=%.6fs, fallback=%lu buckets/%lu dp in %.6fs\n",
+                            cuda_single_bucket1, cuda_single_ndp1, cuda_single_time1,
+                            cuda_batch_call1, cuda_batch_bucket1, cuda_batch_ndp1, cuda_batch_time1,
+                            cuda_cred_time1, cuda_fallback_bucket1, cuda_fallback_ndp1, cuda_fallback_time1);
+                }
+                if (cuda_single_bucket2 || cuda_batch_bucket2 || cuda_fallback_bucket2) {
+                    fprintf(log_out, "cuda search2: single=%lu buckets/%lu dp in %.6fs, batch=%lu calls/%lu buckets/%lu dp in %.6fs, cred=%.6fs, fallback=%lu buckets/%lu dp in %.6fs\n",
+                            cuda_single_bucket2, cuda_single_ndp2, cuda_single_time2,
+                            cuda_batch_call2, cuda_batch_bucket2, cuda_batch_ndp2, cuda_batch_time2,
+                            cuda_cred_time2, cuda_fallback_bucket2, cuda_fallback_ndp2, cuda_fallback_time2);
+                }
             }
         }
     }
@@ -545,6 +564,24 @@ void bgj_profile_data_t<nb>::final_log(int bgj, long sieving_stucked) {
                     (long)((search0_ndp+search1_ndp+search2_ndp) / (succ_add2 + succ_add3 + 0.000001)));
             fprintf(log_out, "try_add2 = %ld, try_add3 = %ld, succ_add2 = %ld(1/%.2f), succ_add3 = %ld(1/%.2f)\n\n\n",
                     try_add2, try_add3, succ_add2, (try_add2+1e-20)/succ_add2, succ_add3, (try_add3+1e-20)/succ_add3);
+            if (cuda_single_bucket0 || cuda_batch_bucket0 || cuda_fallback_bucket0) {
+                fprintf(log_out, "cuda search0: single=%lu buckets/%lu dp in %.6fs, batch=%lu calls/%lu buckets/%lu dp in %.6fs, cred=%.6fs, fallback=%lu buckets/%lu dp in %.6fs\n",
+                        cuda_single_bucket0, cuda_single_ndp0, cuda_single_time0,
+                        cuda_batch_call0, cuda_batch_bucket0, cuda_batch_ndp0, cuda_batch_time0,
+                        cuda_cred_time0, cuda_fallback_bucket0, cuda_fallback_ndp0, cuda_fallback_time0);
+            }
+            if (cuda_single_bucket1 || cuda_batch_bucket1 || cuda_fallback_bucket1) {
+                fprintf(log_out, "cuda search1: single=%lu buckets/%lu dp in %.6fs, batch=%lu calls/%lu buckets/%lu dp in %.6fs, cred=%.6fs, fallback=%lu buckets/%lu dp in %.6fs\n",
+                        cuda_single_bucket1, cuda_single_ndp1, cuda_single_time1,
+                        cuda_batch_call1, cuda_batch_bucket1, cuda_batch_ndp1, cuda_batch_time1,
+                        cuda_cred_time1, cuda_fallback_bucket1, cuda_fallback_ndp1, cuda_fallback_time1);
+            }
+            if (cuda_single_bucket2 || cuda_batch_bucket2 || cuda_fallback_bucket2) {
+                fprintf(log_out, "cuda search2: single=%lu buckets/%lu dp in %.6fs, batch=%lu calls/%lu buckets/%lu dp in %.6fs, cred=%.6fs, fallback=%lu buckets/%lu dp in %.6fs\n",
+                        cuda_single_bucket2, cuda_single_ndp2, cuda_single_time2,
+                        cuda_batch_call2, cuda_batch_bucket2, cuda_batch_ndp2, cuda_batch_time2,
+                        cuda_cred_time2, cuda_fallback_bucket2, cuda_fallback_ndp2, cuda_fallback_time2);
+            }
         }
     }
     if (log_level == 0 && p->CSD > MIN_LOG_CSD){
@@ -827,6 +864,10 @@ void bgj_profile_data_t<nb>::combine(bgj_profile_data_t<nb> *prof) {
     cuda_single_time1 += prof->cuda_single_time1;
     cuda_batch_time1 += prof->cuda_batch_time1;
     cuda_fallback_time1 += prof->cuda_fallback_time1;
+    cuda_cred_time2 += prof->cuda_cred_time2;
+    cuda_single_time2 += prof->cuda_single_time2;
+    cuda_batch_time2 += prof->cuda_batch_time2;
+    cuda_fallback_time2 += prof->cuda_fallback_time2;
     materialize_time += prof->materialize_time;
     materialize_gpu_time += prof->materialize_gpu_time;
     materialize_cpu_time += prof->materialize_cpu_time;
@@ -866,6 +907,13 @@ void bgj_profile_data_t<nb>::combine(bgj_profile_data_t<nb> *prof) {
     cuda_batch_bucket1 += prof->cuda_batch_bucket1;
     cuda_batch_call1 += prof->cuda_batch_call1;
     cuda_fallback_bucket1 += prof->cuda_fallback_bucket1;
+    cuda_single_ndp2 += prof->cuda_single_ndp2;
+    cuda_batch_ndp2 += prof->cuda_batch_ndp2;
+    cuda_fallback_ndp2 += prof->cuda_fallback_ndp2;
+    cuda_single_bucket2 += prof->cuda_single_bucket2;
+    cuda_batch_bucket2 += prof->cuda_batch_bucket2;
+    cuda_batch_call2 += prof->cuda_batch_call2;
+    cuda_fallback_bucket2 += prof->cuda_fallback_bucket2;
     materialize_call += prof->materialize_call;
     materialize_candidate += prof->materialize_candidate;
     materialize_gpu_call += prof->materialize_gpu_call;
@@ -1909,8 +1957,74 @@ int Pool_epi8_t<nb>::bgj3_Sieve(long log_level, long lps_auto_adj){
             for (long i = 0; i < BGJ3_EPI8_BUCKET0_BATCHSIZE; i++) rbucket1_nrem[i] = -1;
             pthread_spinlock_t bucket_list_lock;
             pthread_spin_init(&bucket_list_lock, PTHREAD_PROCESS_SHARED);
+            #if defined(HAVE_CUDA)
+            const uint64_t cuda_bgj3_min_dots = bgj_epi8_env_u64("BGJ_CUDA_BGJ3_MIN_DOTS", bgj_cuda_batch_min_dots());
+            const int cuda_bgj3_search = bgj_epi8_env_flag("BGJ_CUDA_BGJ3_SEARCH", 1);
+            const int cuda_bgj3_search0 = cuda_bgj3_search ? bgj_epi8_env_flag("BGJ_CUDA_BGJ3_SEARCH0", 1) : 0;
+            const int cuda_bgj3_search1 = cuda_bgj3_search ? bgj_epi8_env_flag("BGJ_CUDA_BGJ3_SEARCH1", 1) : 0;
+            const int cuda_bgj3_search2 = cuda_bgj3_search ? bgj_epi8_env_flag("BGJ_CUDA_BGJ3_SEARCH2", 1) : 0;
+            #else
+            const int cuda_bgj3_search0 = 0;
+            const int cuda_bgj3_search1 = 0;
+            const int cuda_bgj3_search2 = 0;
+            #endif
             #pragma omp parallel for
             for (long thread = 0; thread < num_threads; thread++) {
+                auto bgj3_search_bucket = [&](auto *search_bkt,
+                                              auto record_tag,
+                                              sol_list_epi8_t *sol,
+                                              int cuda_enabled,
+                                              long &search_ndp,
+                                              double &cuda_cred_time,
+                                              double &cuda_single_time,
+                                              double &cuda_fallback_time,
+                                              uint64_t &cuda_single_ndp,
+                                              uint64_t &cuda_fallback_ndp,
+                                              uint64_t &cuda_single_bucket,
+                                              uint64_t &cuda_fallback_bucket) {
+                    constexpr bool record_dp = decltype(record_tag)::value;
+                    const long ndp_long = bgj_epi8_search0_profile_ndp(search_bkt->num_pvec, search_bkt->num_nvec);
+                    const uint64_t ndp = ndp_long > 0 ? (uint64_t)ndp_long : 0;
+                    bool cred_done = false;
+                    bool cuda_done = false;
+                    #if defined(HAVE_CUDA)
+                    if (bgj_cuda_search_requested() && cuda_enabled &&
+                        bgj_epi8_bucket_pair_dots(search_bkt->num_pvec, search_bkt->num_nvec) >= cuda_bgj3_min_dots) {
+                        double t0 = bgj_epi8_wall_time();
+                        _search_cred<record_dp, 1>(search_bkt, sol, goal_norm, &local_profile);
+                        cuda_cred_time += bgj_epi8_wall_time() - t0;
+                        cred_done = true;
+                        t0 = bgj_epi8_wall_time();
+                        cuda_done = _search_bgj1_cuda<record_dp, 1>(search_bkt, sol, goal_norm, &local_profile) > 0;
+                        cuda_single_time += bgj_epi8_wall_time() - t0;
+                        if (cuda_done) {
+                            cuda_single_bucket++;
+                            cuda_single_ndp += ndp;
+                        }
+                    }
+                    #endif
+                    if (!cuda_done) {
+                        if (!cred_done) {
+                            const double t0 = bgj_epi8_wall_time();
+                            _search_cred<record_dp, 1>(search_bkt, sol, goal_norm, &local_profile);
+                            #if defined(HAVE_CUDA)
+                            if (bgj_cuda_search_requested() && cuda_enabled) cuda_cred_time += bgj_epi8_wall_time() - t0;
+                            #endif
+                        }
+                        const double t0 = bgj_epi8_wall_time();
+                        _search_np<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, record_dp, 1>(search_bkt, sol, goal_norm, &local_profile);
+                        _search_pp<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, record_dp, 1>(search_bkt, sol, goal_norm, &local_profile);
+                        _search_nn<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, record_dp, 1>(search_bkt, sol, goal_norm, &local_profile);
+                        #if defined(HAVE_CUDA)
+                        if (bgj_cuda_search_requested() && cuda_enabled) {
+                            cuda_fallback_time += bgj_epi8_wall_time() - t0;
+                            cuda_fallback_bucket++;
+                            cuda_fallback_ndp += ndp;
+                        }
+                        #endif
+                    }
+                    search_ndp += ndp_long;
+                };
                 // bucket1
                 do {
                     const long begin_ind = (thread * BGJ3_EPI8_BUCKET0_BATCHSIZE) / num_threads;
@@ -2009,19 +2123,37 @@ int Pool_epi8_t<nb>::bgj3_Sieve(long log_level, long lps_auto_adj){
                     pthread_spin_unlock(&bucket_list_lock);
                     if (type == -1) continue;
                     if (type == 0) {
-                        TIMER_START;
+                        const double __search0_t0 = bgj_epi8_wall_time();
                         long __search0_ndp = 0;
-                        _search_cred<BGJ2_EPI8_REUSE_USE_3RED, 1>(bkt3, sol_list[thread], goal_norm, &local_profile);
-                        _search_np<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, BGJ2_EPI8_REUSE_USE_3RED, 1>(bkt3, sol_list[thread], goal_norm, &local_profile);
-                        _search_pp<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, BGJ2_EPI8_REUSE_USE_3RED, 1>(bkt3, sol_list[thread], goal_norm, &local_profile);
-                        _search_nn<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, BGJ2_EPI8_REUSE_USE_3RED, 1>(bkt3, sol_list[thread], goal_norm, &local_profile);
-                        __search0_ndp += bkt3->num_pvec * bkt3->num_nvec;
-                        __search0_ndp += (bkt3->num_pvec - 8) * bkt3->num_pvec / 2;
-                        __search0_ndp += (bkt3->num_nvec - 8) * bkt3->num_nvec / 2;
-                        TIMER_END;
+                        double __cuda_cred_time0 = 0.0;
+                        double __cuda_single_time0 = 0.0;
+                        double __cuda_fallback_time0 = 0.0;
+                        uint64_t __cuda_single_ndp0 = 0;
+                        uint64_t __cuda_fallback_ndp0 = 0;
+                        uint64_t __cuda_single_bucket0 = 0;
+                        uint64_t __cuda_fallback_bucket0 = 0;
+                        bgj3_search_bucket(bkt3,
+                                           std::integral_constant<bool, BGJ3_EPI8_REUSE0_USE_3RED>(),
+                                           sol_list[thread],
+                                           cuda_bgj3_search0,
+                                           __search0_ndp,
+                                           __cuda_cred_time0,
+                                           __cuda_single_time0,
+                                           __cuda_fallback_time0,
+                                           __cuda_single_ndp0,
+                                           __cuda_fallback_ndp0,
+                                           __cuda_single_bucket0,
+                                           __cuda_fallback_bucket0);
                         pthread_spin_lock(&local_profile.profile_lock);
-                        local_profile.search0_time += CURRENT_TIME;
+                        local_profile.search0_time += bgj_epi8_wall_time() - __search0_t0;
                         local_profile.search0_ndp += __search0_ndp;
+                        local_profile.cuda_cred_time0 += __cuda_cred_time0;
+                        local_profile.cuda_single_time0 += __cuda_single_time0;
+                        local_profile.cuda_fallback_time0 += __cuda_fallback_time0;
+                        local_profile.cuda_single_ndp0 += __cuda_single_ndp0;
+                        local_profile.cuda_fallback_ndp0 += __cuda_fallback_ndp0;
+                        local_profile.cuda_single_bucket0 += __cuda_single_bucket0;
+                        local_profile.cuda_fallback_bucket0 += __cuda_fallback_bucket0;
                         pthread_spin_unlock(&local_profile.profile_lock);
                         delete bkt3;
                     } else {
@@ -2034,17 +2166,35 @@ int Pool_epi8_t<nb>::bgj3_Sieve(long log_level, long lps_auto_adj){
                         long __num_bucket2 = 0;
                         long __search2_ndp = 0;
                         double __search2_time = 0.0;
+                        double __cuda_cred_time2 = 0.0;
+                        double __cuda_single_time2 = 0.0;
+                        double __cuda_fallback_time2 = 0.0;
+                        uint64_t __cuda_single_ndp2 = 0;
+                        uint64_t __cuda_fallback_ndp2 = 0;
+                        uint64_t __cuda_single_bucket2 = 0;
+                        uint64_t __cuda_fallback_bucket2 = 0;
                         
-                        TIMER_START;
-                        _search_cred<0, 1>(bkt2, sol_list[thread], goal_norm, &local_profile);
-                        _search_np<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, 0, 1>(bkt2, sol_list[thread], goal_norm, &local_profile);
-                        _search_pp<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, 0, 1>(bkt2, sol_list[thread], goal_norm, &local_profile);
-                        _search_nn<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, 0, 1>(bkt2, sol_list[thread], goal_norm, &local_profile);
-                        __search1_ndp += bkt2->num_pvec * bkt2->num_nvec;
-                        __search1_ndp += (bkt2->num_pvec - 8) * bkt2->num_pvec / 2;
-                        __search1_ndp += (bkt2->num_nvec - 8) * bkt2->num_nvec / 2;
-                        TIMER_END;
-                        __search1_time += CURRENT_TIME;
+                        double __cuda_cred_time1 = 0.0;
+                        double __cuda_single_time1 = 0.0;
+                        double __cuda_fallback_time1 = 0.0;
+                        uint64_t __cuda_single_ndp1 = 0;
+                        uint64_t __cuda_fallback_ndp1 = 0;
+                        uint64_t __cuda_single_bucket1 = 0;
+                        uint64_t __cuda_fallback_bucket1 = 0;
+                        const double __search1_t0 = bgj_epi8_wall_time();
+                        bgj3_search_bucket(bkt2,
+                                           std::integral_constant<bool, false>(),
+                                           sol_list[thread],
+                                           cuda_bgj3_search1,
+                                           __search1_ndp,
+                                           __cuda_cred_time1,
+                                           __cuda_single_time1,
+                                           __cuda_fallback_time1,
+                                           __cuda_single_ndp1,
+                                           __cuda_fallback_ndp1,
+                                           __cuda_single_bucket1,
+                                           __cuda_fallback_bucket1);
+                        __search1_time += bgj_epi8_wall_time() - __search1_t0;
                         delete bkt2;
 
                         TIMER_START;
@@ -2064,20 +2214,24 @@ int Pool_epi8_t<nb>::bgj3_Sieve(long log_level, long lps_auto_adj){
                                 __num_bucket2++;
                             }
                         }
-                        TIMER_START;
+                        const double __search2_t0 = bgj_epi8_wall_time();
                         for (long i = 0; i < BGJ3_EPI8_BUCKET2_BATCHSIZE; i++) {
                             bucket_epi8_t<0> *_bkt = bucket2[thread * BGJ3_EPI8_BUCKET2_BATCHSIZE + i];
                             if (_bkt == NULL) continue;
-                            _search_cred<0, 1>(_bkt, sol_list[thread], goal_norm, &local_profile);
-                            _search_np<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, 0, 1>(_bkt, sol_list[thread], goal_norm, &local_profile);
-                            _search_pp<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, 0, 1>(_bkt, sol_list[thread], goal_norm, &local_profile);
-                            _search_nn<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, 0, 1>(_bkt, sol_list[thread], goal_norm, &local_profile);
-                            __search2_ndp += _bkt->num_pvec * _bkt->num_nvec;
-                            __search2_ndp += (_bkt->num_pvec - 8) * _bkt->num_pvec / 2;
-                            __search2_ndp += (_bkt->num_nvec - 8) * _bkt->num_nvec / 2;
+                            bgj3_search_bucket(_bkt,
+                                               std::integral_constant<bool, false>(),
+                                               sol_list[thread],
+                                               cuda_bgj3_search2,
+                                               __search2_ndp,
+                                               __cuda_cred_time2,
+                                               __cuda_single_time2,
+                                               __cuda_fallback_time2,
+                                               __cuda_single_ndp2,
+                                               __cuda_fallback_ndp2,
+                                               __cuda_single_bucket2,
+                                               __cuda_fallback_bucket2);
                         }
-                        TIMER_END;
-                        __search2_time += CURRENT_TIME;
+                        __search2_time += bgj_epi8_wall_time() - __search2_t0;
 
                         pthread_spin_lock(&local_profile.profile_lock);
                         local_profile.search1_time += __search1_time;
@@ -2088,6 +2242,20 @@ int Pool_epi8_t<nb>::bgj3_Sieve(long log_level, long lps_auto_adj){
                         local_profile.bucket2_ndp += __bucket2_ndp;
                         local_profile.sum_bucket2_size += __sum_bucket2_size;
                         local_profile.num_bucket2 += __num_bucket2;
+                        local_profile.cuda_cred_time1 += __cuda_cred_time1;
+                        local_profile.cuda_single_time1 += __cuda_single_time1;
+                        local_profile.cuda_fallback_time1 += __cuda_fallback_time1;
+                        local_profile.cuda_single_ndp1 += __cuda_single_ndp1;
+                        local_profile.cuda_fallback_ndp1 += __cuda_fallback_ndp1;
+                        local_profile.cuda_single_bucket1 += __cuda_single_bucket1;
+                        local_profile.cuda_fallback_bucket1 += __cuda_fallback_bucket1;
+                        local_profile.cuda_cred_time2 += __cuda_cred_time2;
+                        local_profile.cuda_single_time2 += __cuda_single_time2;
+                        local_profile.cuda_fallback_time2 += __cuda_fallback_time2;
+                        local_profile.cuda_single_ndp2 += __cuda_single_ndp2;
+                        local_profile.cuda_fallback_ndp2 += __cuda_fallback_ndp2;
+                        local_profile.cuda_single_bucket2 += __cuda_single_bucket2;
+                        local_profile.cuda_fallback_bucket2 += __cuda_fallback_bucket2;
                         pthread_spin_unlock(&local_profile.profile_lock);
                         delete bkt;
                     }

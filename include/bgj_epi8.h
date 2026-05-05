@@ -50,7 +50,7 @@
 #define SBUCKET_BUFFER_INIT_SIZE 65536
 #define SEARCH_L1_BLOCK 64
 #define SEARCH_L2_BLOCK 512
-#define BGJ_NEED_SEARCH_3RED (BGJ1_EPI8_USE_3RED || BGJ2_EPI8_REUSE_USE_3RED)
+#define BGJ_NEED_SEARCH_3RED (BGJ1_EPI8_USE_3RED || BGJ2_EPI8_REUSE_USE_3RED || BGJ3_EPI8_REUSE0_USE_3RED)
 #if SEARCH_L1_BLOCK % 8
 #error search l1 block must divided by 8
 #endif
@@ -112,6 +112,10 @@ struct bgj_profile_data_t {
     double cuda_single_time1 = 0.0;
     double cuda_batch_time1 = 0.0;
     double cuda_fallback_time1 = 0.0;
+    double cuda_cred_time2 = 0.0;
+    double cuda_single_time2 = 0.0;
+    double cuda_batch_time2 = 0.0;
+    double cuda_fallback_time2 = 0.0;
     double materialize_time = 0.0;
     double materialize_gpu_time = 0.0;
     double materialize_cpu_time = 0.0;
@@ -151,6 +155,13 @@ struct bgj_profile_data_t {
     uint64_t cuda_batch_bucket1 = 0;
     uint64_t cuda_batch_call1 = 0;
     uint64_t cuda_fallback_bucket1 = 0;
+    uint64_t cuda_single_ndp2 = 0;
+    uint64_t cuda_batch_ndp2 = 0;
+    uint64_t cuda_fallback_ndp2 = 0;
+    uint64_t cuda_single_bucket2 = 0;
+    uint64_t cuda_batch_bucket2 = 0;
+    uint64_t cuda_batch_call2 = 0;
+    uint64_t cuda_fallback_bucket2 = 0;
     uint64_t materialize_call = 0;
     uint64_t materialize_candidate = 0;
     uint64_t materialize_gpu_call = 0;
