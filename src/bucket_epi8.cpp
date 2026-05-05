@@ -3791,7 +3791,7 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
                 }
             }
         }
-        if (!materialized) {
+        if (try_cuda_materialize && !materialized) {
             const double t0 = bgj_bucket_wall_time();
             const int cuda_ok =
                 ensure_vec_to_insert() &&

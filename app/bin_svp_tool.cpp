@@ -5,6 +5,7 @@
 
 #include <sys/time.h>
 #include <unistd.h>
+#include <cstdlib>
 
 #include "../include/svp.h"
 #include "../include/utils.h"
@@ -31,6 +32,27 @@ double _svptool_time_curr;
 #define CURRENT_TIME (_svptool_time_curr)
 #endif
 
+template <uint32_t nb>
+static int svptool_bgj1_sieve(Pool_epi8_t<nb> &p, int use_cuda, long log_level, long lps_auto_adj) {
+#if defined(HAVE_CUDA)
+    if (use_cuda) return p.bgj1_Sieve_cuda(log_level, lps_auto_adj);
+#else
+    (void)use_cuda;
+#endif
+    return p.bgj1_Sieve(log_level, lps_auto_adj);
+}
+
+template <uint32_t nb>
+static int svptool_left_progressive_bgjf(Pool_epi8_t<nb> &p, int use_cuda, long ind_l, long ind_r,
+                                         long num_threads, long log_level, long ssd) {
+#if defined(HAVE_CUDA)
+    if (use_cuda) return p.left_progressive_bgjfsieve_cuda(ind_l, ind_r, num_threads, log_level, ssd);
+#else
+    (void)use_cuda;
+#endif
+    return p.left_progressive_bgjfsieve(ind_l, ind_r, num_threads, log_level, ssd);
+}
+
 int show_help(int argc, char **argv) {
     std::cout << "Usage: " << argv[0] << " <inputfile> [options]" << std::endl;
     std::cout << "Options:" << std::endl;
@@ -46,6 +68,7 @@ int show_help(int argc, char **argv) {
     std::cout << "  -msd, --msd\t\t\tMaximal sieving dimension" << std::endl;
     std::cout << "  -esd, --esd\t\t\tExtended sieving dimension" << std::endl;
     std::cout << "  -ds, --down_sieve\t\tDown sieve" << std::endl;
+    std::cout << "  -cuda, --cuda\t\t\tUse CUDA for BGJ1 phases where available" << std::endl;
     #if defined(__AMX_INT8__)
     std::cout << "  -amx, --amx\t\t\tUse amx" << std::endl;
     #endif
@@ -71,6 +94,7 @@ int main(int argc, char** argv) {
     long seed = time(NULL);
     double lsh_qr = 0.0;
     double lsh_er = 0.0;
+    int cuda = 0;
     int amx = 0;
 
     for (long i = 1; i < argc; i++) {
@@ -104,11 +128,19 @@ int main(int argc, char** argv) {
             sr = 1;
         } else if (!strcasecmp(argv[i], "-shuf") || !strcasecmp(argv[i], "--shuf")) {
             shuf = 1;
+        } else if (!strcasecmp(argv[i], "-cuda") || !strcasecmp(argv[i], "--cuda")) {
+            cuda = 1;
         } else if (!strcasecmp(argv[i], "-amx") || !strcasecmp(argv[i], "--amx")) {
             amx = 1;
         }
     }
 
+    if (cuda) {
+        #if !defined(HAVE_CUDA)
+        printf("Error: CUDA is not supported, disabled.\n");
+        cuda = 0;
+        #endif
+    }
     if (amx) {
         #if !defined(__AMX_INT8__)
         printf("Error: AMX is not supported, disabled.\n");
@@ -119,6 +151,22 @@ int main(int argc, char** argv) {
     if (lsh && lsh_qr == 0.0 && !fin) lsh_qr = amx ? 0.1 : 0.2;
     if (lsh && lsh_er == 0.0 && !fin) lsh_er = amx ? 0.1 : 0.2;
     if (help) { show_help(argc, argv); return 0; }
+    int suppress_cuda_bucket_target = 0;
+    if (cuda) {
+        setenv("BGJ_SVP_CUDA", "1", 1);
+        if (getenv("BGJ_CUDA_MIN_CSD") == NULL) setenv("BGJ_CUDA_MIN_CSD", "80", 0);
+        if (getenv("BGJ_CUDA_BUCKET_TARGET_SIZE") == NULL &&
+            getenv("BGJ1_EPI8_BUCKET_TARGET_SIZE") == NULL &&
+            getenv("BGJ_EPI8_BUCKET_TARGET_SIZE") == NULL &&
+            getenv("BGJ1_EPI8_BUCKET_ALPHA") == NULL &&
+            getenv("BGJ_EPI8_BUCKET_ALPHA") == NULL) {
+            setenv("BGJ_CUDA_BUCKET_TARGET_SIZE", "0", 0);
+            suppress_cuda_bucket_target = 1;
+        }
+        if (suppress_cuda_bucket_target && getenv("BGJ_CUDA_MATERIALIZE") == NULL) {
+            setenv("BGJ_CUDA_MATERIALIZE", "0", 0);
+        }
+    }
     
     SetSamplerSeed((uint64_t)seed);
     
@@ -169,7 +217,7 @@ int main(int argc, char** argv) {
                 }
             } else {
 #define FINAL_PUMP do {                                                                             \
-                    p.left_progressive_bgjfsieve(L.NumRows() - msd, L.NumRows(), num_threads, 16384+log_level - 3, ssd); \
+                    svptool_left_progressive_bgjf(p, cuda, L.NumRows() - msd, L.NumRows(), num_threads, 16384+log_level - 3, ssd); \
                     while (p.CSD < msd + esd) {                                                                 \
                         p.extend_left();                                                                        \
                         if (p.CSD >= 92) {                                                                      \
@@ -177,7 +225,7 @@ int main(int argc, char** argv) {
                         } else if (p.CSD > 80) {                                                                \
                             p.bgj2_Sieve(log_level - 3, 1);                                                     \
                         } else {                                                                                \
-                            p.bgj1_Sieve(log_level - 3, 1);                                                     \
+                            svptool_bgj1_sieve(p, cuda, log_level - 3, 1);                                      \
                         }                                                                                       \
                         p.show_min_lift(0);                                                                     \
                     }                                                                                           \

@@ -3,7 +3,11 @@
 #include "../include/lattice.h"
 #include "../include/pool_epi8.h"
 #include "../include/config.h"
+#if defined(HAVE_CUDA)
+#include "../include/bgj_cuda.h"
+#endif
 #include <sys/time.h>
+#include <cstdlib>
 #include <string>
 #include <iostream>
 #include <unistd.h>
@@ -13,6 +17,23 @@
 #endif
 
 /* svp kernels of bkz algorithm. */
+
+static int svp_cuda_bgj1_enabled() {
+#if defined(HAVE_CUDA)
+    const char *env = std::getenv("BGJ_SVP_CUDA");
+    return env && env[0] && env[0] != '0';
+#else
+    return 0;
+#endif
+}
+
+template <uint32_t nb>
+static int svp_bgj1_sieve(Pool_epi8_t<nb> &p, long log_level, long lps_auto_adj) {
+#if defined(HAVE_CUDA)
+    if (svp_cuda_bgj1_enabled()) return p.bgj1_Sieve_cuda(log_level, lps_auto_adj);
+#endif
+    return p.bgj1_Sieve(log_level, lps_auto_adj);
+}
 
 
 /** svp kernel based on 3-Sieve.
@@ -230,7 +251,7 @@ void __pump_red_epi8(Lattice_QP *L, long num_threads, double eta, long msd, long
                 p.set_sieving_context(n-minsd, n);                                                              \
                 if (p.sampling(minps) == -1) return;                                                            \
                                                                                                                 \
-                int ret = p.bgj1_Sieve(log_level - 3, 1);                                                       \
+                int ret = svp_bgj1_sieve(p, log_level - 3, 1); \
                 num_stuck = ret;                                                                                \
                 while ((p.CSD < msd) && (p.CSD < n)) {                                                          \
                     p.extend_left();                                                                            \
@@ -241,7 +262,7 @@ void __pump_red_epi8(Lattice_QP *L, long num_threads, double eta, long msd, long
                     } else if (p.CSD > 80) {                                                                    \
                         ret = p.bgj2_Sieve(log_level-3, 1);                                                     \
                     } else {                                                                                    \
-                        ret = p.bgj1_Sieve(log_level-3, 1);                                                     \
+                        ret = svp_bgj1_sieve(p, log_level-3, 1); \
                     }                                                                                           \
                     if (ret) {                                                                                  \
                         num_stuck++;                                                                            \
@@ -280,7 +301,7 @@ void __pump_red_epi8(Lattice_QP *L, long num_threads, double eta, long msd, long
                         } else if (p.CSD > 90) {                                                                \
                             ret = p.bgj2_Sieve(log_level-3, 1);                                                 \
                         } else {                                                                                \
-                            ret = p.bgj1_Sieve(log_level-3, 1);                                                 \
+                            ret = svp_bgj1_sieve(p, log_level-3, 1); \
                         }                                                                                       \
                         if (ret) {                                                                              \
                             num_stuck++;                                                                        \
@@ -389,7 +410,7 @@ void __lsh_pump_red_epi8(Lattice_QP *L, long num_threads, double eta, double qra
                 p.set_sieving_context(n-minsd, n);                                                              \
                 p.sampling(minps);                                                                              \
                                                                                                                 \
-                int ret = p.bgj1_Sieve(log_level - 3, 1);                                                       \
+                int ret = svp_bgj1_sieve(p, log_level - 3, 1); \
                 num_stuck = ret;                                                                                \
                 while ((p.CSD < msd) && (p.CSD < n)) {                                                          \
                     p.extend_left();                                                                            \
@@ -400,7 +421,7 @@ void __lsh_pump_red_epi8(Lattice_QP *L, long num_threads, double eta, double qra
                     } else if (p.CSD > 80) {                                                                    \
                         ret = p.bgj2_Sieve(log_level-3, 1);                                                     \
                     } else {                                                                                    \
-                        ret = p.bgj1_Sieve(log_level-3, 1);                                                     \
+                        ret = svp_bgj1_sieve(p, log_level-3, 1); \
                     }                                                                                           \
                     if (ret) {                                                                                  \
                         num_stuck++;                                                                            \
@@ -439,7 +460,7 @@ void __lsh_pump_red_epi8(Lattice_QP *L, long num_threads, double eta, double qra
                         } else if (p.CSD > 90) {                                                                \
                             ret = p.bgj2_Sieve(log_level-3, 1);                                                 \
                         } else {                                                                                \
-                            ret = p.bgj1_Sieve(log_level-3, 1);                                                 \
+                            ret = svp_bgj1_sieve(p, log_level-3, 1); \
                         }                                                                                       \
                         if (ret) {                                                                              \
                             num_stuck++;                                                                        \
@@ -529,7 +550,7 @@ void __last_lsh_pump_epi8(Lattice_QP *L, long num_threads, double qratio, double
             p.set_sieving_context(n-minsd, n);                                                              \
             p.sampling(minps);                                                                              \
                                                                                                             \
-            int ret = p.bgj1_Sieve(log_level - 3, 1);                                                       \
+            int ret = svp_bgj1_sieve(p, log_level - 3, 1); \
             num_stuck = ret;                                                                                \
             while (p.CSD < msd + ext_d) {                                                                   \
                 p.extend_left();                                                                            \
@@ -541,7 +562,7 @@ void __last_lsh_pump_epi8(Lattice_QP *L, long num_threads, double qratio, double
                 } else if (p.CSD > 80) {                                                                    \
                     ret = p.bgj2_Sieve(log_level-3, 1);                                                     \
                 } else {                                                                                    \
-                    ret = p.bgj1_Sieve(log_level-3, 1);                                                     \
+                    ret = svp_bgj1_sieve(p, log_level-3, 1); \
                 }                                                                                           \
                 if (p.CSD >= msd - 12) {                                                                    \
                     if (p.CSD < n - 24 && (((p.CSD >= msd) && ext_qratio != 0.0) || ((p.CSD < msd) && qratio != 0.0))) {     \
@@ -643,7 +664,7 @@ void __pump_red_amx(Lattice_QP *L, long num_threads, double eta, long msd, long 
             p.set_sieving_context(n-minsd, n);                                                              
             if (p.sampling(minps) == -1) return;
                                                                                                             
-            int ret = p.bgj1_Sieve(log_level - 3, 1);    
+            int ret = svp_bgj1_sieve(p, log_level - 3, 1);
             if (ret) {
                 num_stuck++;
                 GET_STUCKED = true;
@@ -766,7 +787,7 @@ void __lsh_pump_red_amx(Lattice_QP *L, long num_threads, double eta, double qrat
             p.set_sieving_context(n-minsd, n);                                                              
             p.sampling(minps);                                                                              
                                                                                                             
-            int ret = p.bgj1_Sieve(log_level - 3, 1);                                                       
+            int ret = svp_bgj1_sieve(p, log_level - 3, 1);
             num_stuck = ret;                                                                                
             while ((p.CSD < msd) && (p.CSD < n)) {                                                          
                 p.extend_left();                                                                            
@@ -879,7 +900,7 @@ void __last_lsh_pump_amx(Lattice_QP *L, long num_threads, double qratio, double 
             p.set_sieving_context(n-minsd, n);                                                              
             p.sampling(minps);                                                                              
                                                                                                             
-            int ret = p.bgj1_Sieve(log_level - 3, 1);                                                       
+            int ret = svp_bgj1_sieve(p, log_level - 3, 1);
             num_stuck = ret;                                                                                
             while (p.CSD < msd + ext_d) {                                                                   
                 p.extend_left();                                                                            
@@ -1012,7 +1033,7 @@ void __hkz_red_epi8(Lattice_QP *L, long num_threads, long log_level) {
         p.set_max_pool_size((max_pool_size > 2071) ? max_pool_size : 2071);                             \
         p.set_sieving_context(max(0, n-40), n);                                                         \
         p.sampling(2071);                                                                               \
-        p.bgj1_Sieve(log_level - 3, 1);                                                                 \
+        svp_bgj1_sieve(p, log_level - 3, 1); \
         while (p.CSD < n - 1){                                                                          \
             p.extend_left();                                                                            \
             long target_num_vec = (long) (pow(4./3., p.CSD * 0.5) * 3.2);                               \
@@ -1022,7 +1043,7 @@ void __hkz_red_epi8(Lattice_QP *L, long num_threads, long log_level) {
             } else if (p.CSD > 80) {                                                                    \
                 p.bgj2_Sieve(log_level-3, 1);                                                           \
             } else {                                                                                    \
-                p.bgj1_Sieve(log_level-3, 1);                                                           \
+                svp_bgj1_sieve(p, log_level-3, 1); \
             }                                                                                           \
         }                                                                                               \
         long ind = 0;                                                                                   \
@@ -1036,7 +1057,7 @@ void __hkz_red_epi8(Lattice_QP *L, long num_threads, long log_level) {
             } else if (p.CSD > 80) {                                                                    \
                 p.bgj2_Sieve(log_level-3, 1);                                                           \
             } else {                                                                                    \
-                p.bgj1_Sieve(log_level-3, 1);                                                           \
+                svp_bgj1_sieve(p, log_level-3, 1); \
             }                                                                                           \
         }                                                                                               \
     } while (0);

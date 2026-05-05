@@ -45,6 +45,14 @@ BGJ1 path:
 $ ./bgj_epi8 L_100 cuda
 ```
 
+`app/svp_tool` accepts `--cuda` for the BGJ1 phases inside the SVP pump flow.
+That mode is conservative by default: it keeps the CPU bucket density unless a
+bucket target/alpha is explicitly provided, skips CUDA search below the
+configured dot-product threshold, and disables CUDA candidate materialization
+unless `BGJ_CUDA_MATERIALIZE=1` is set. This avoids the small-bucket launch and
+materialization overheads that make low-dimensional pump stages slower than the
+CPU path.
+
 For reproducible CUDA/BGJ profiling, pass a fixed sampler seed as the fifth
 positional argument, with `-s/--seed`, or with `BGJ_SEED`:
 
@@ -216,6 +224,12 @@ runs. Set `BGJ_CPU_MATERIALIZE_THREADS=<n>` to tune it, or `0` to use the old
 single-thread materialization path. This remains CPU-side candidate
 materialization only; CUDA search and bucketing timings are reported
 separately.
+Current A100/GPU1 seed-42 smoke checks against SVP challenge seed-0 inputs show
+the expected crossover: dim50 and dim60 are still CPU-faster because launch and
+setup costs dominate, dim70 is faster with CUDA (`2.07s` vs `2.62s`), and dim80
+is substantially faster with CUDA (about `7-9s` vs `29.68s`). In those
+dim70/dim80 runs the final Euclidean norm and approximation factor matched the
+CPU result.
 CUDA BGJ1 batches UID erases during insertion by default. This reduces lock
 traffic in the current A100 SVP96 timing runs and can be disabled with
 `BGJ_INSERT_BATCH_UID_ERASE=0`. Set `BGJ_INSERT_PHASE_PROFILE=1` to print the

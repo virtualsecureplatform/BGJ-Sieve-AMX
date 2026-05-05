@@ -636,6 +636,15 @@ int Pool_epi8_t<nb>::_search_bgj1_cuda_batch(bucket_epi8_t<record_dp> **buckets,
 template <uint32_t nb>
 int Pool_epi8_t<nb>::bgj1_Sieve_cuda(long log_level, long lps_auto_adj)
 {
+    const char *min_csd_env = getenv("BGJ_CUDA_MIN_CSD");
+    if (min_csd_env && min_csd_env[0]) {
+        char *end = NULL;
+        const long min_csd = strtol(min_csd_env, &end, 10);
+        if (end != min_csd_env && min_csd > 0 && CSD < min_csd) {
+            return bgj1_Sieve(log_level, lps_auto_adj);
+        }
+    }
+
     if (bgj_cuda_device_count() <= 0) {
         fprintf(stderr, "[Warning] CUDA requested but no CUDA device is available: %s. Falling back to CPU bgj1.\n",
                 bgj_cuda_last_error());
@@ -700,8 +709,6 @@ int Pool_epi8_t<nb>::left_progressive_bgjfsieve_cuda(long ind_l, long ind_r, lon
     if (sample_size > _pool_size) sample_size = _pool_size;
     sampling(sample_size);
 
-    const int old = bgj_cuda_search_requested();
-    bgj_cuda_set_search_requested(1);
     bgj1_Sieve_cuda(log_level, 1);
     while (index_l > ind_l) {
         extend_left();
@@ -717,7 +724,6 @@ int Pool_epi8_t<nb>::left_progressive_bgjfsieve_cuda(long ind_l, long ind_r, lon
         if (show_lift == 1) show_min_lift(0);
     }
     if (show_lift == 2) show_min_lift(0);
-    bgj_cuda_set_search_requested(old);
     return 1;
 }
 
