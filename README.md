@@ -157,6 +157,11 @@ the scalar A100 implementation avoids the CPU sort but also skips the Tensor
 Core search kernels.
 The benchmark harness also accepts modes such as `cuda-maxres1048576` and
 `cuda-maxres4194304` and can record final vector quality with `--print-quality`.
+Use `--require-quality` on `app/bgj_epi8` or `bench/bgj_cuda_seed42.py` to make
+the final lifted vector a hard SVP challenge gate: the app exits with code `3`
+unless `norm <= gamma * GH`. The default is the SVP challenge factor
+`gamma = 1.05`; override it with `--quality-gamma <gamma>` when testing tighter
+or looser criteria.
 Before the hybrid `bgjf` CUDA entry point, the BGJ1-only SVP-100 seed-0
 challenge lattice preprocessed by `app/lattice_preprocess` and run on A100/GPU1
 with seed 42 and a 600s per-mode timeout had these results:

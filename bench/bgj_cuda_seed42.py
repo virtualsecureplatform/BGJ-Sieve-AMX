@@ -552,7 +552,11 @@ def parse_app_output(output):
 
 def run_one(args, outdir, writer, jsonl, dim, lattice, mode, commit):
     command, mode_env = mode_command(args.app, lattice, mode, args.threads, args.log_level, args.seed)
-    if args.print_quality:
+    if args.require_quality:
+        command.append("--require-quality")
+        if args.quality_gamma != 1.05:
+            command.extend(["--quality-gamma", str(args.quality_gamma)])
+    elif args.print_quality:
         command.append("--print-final")
     env = os.environ.copy()
     env.update(mode_env)
@@ -724,6 +728,8 @@ def parse_args(argv):
     parser.add_argument("--output-dir", type=Path, default=default_out)
     parser.add_argument("--reuse-lattices", action="store_true")
     parser.add_argument("--print-quality", action="store_true")
+    parser.add_argument("--require-quality", action="store_true")
+    parser.add_argument("--quality-gamma", type=float, default=1.05)
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--stop-on-timeout", action="store_true")
     parser.add_argument("--stop-on-failure", action="store_true")

@@ -1064,6 +1064,12 @@ int Pool_epi8_t<nb>::insert(long index, double eta) {
 
 template<uint32_t nb>
 int Pool_epi8_t<nb>::show_min_lift(long index) {
+    last_lift_valid = 0;
+    last_lift_euclidean_norm = 0.0;
+    last_lift_lift_norm = 0.0;
+    last_lift_gh = 0.0;
+    last_lift_approx_factor = 0.0;
+
     if (index > index_l) {
         fprintf(stderr, "[Warning] Pool_epi8_t<%u>::show_min_lift: index(%ld) > index_l(%ld), nothing done.\n", nb, index, index_l);
         return -1;
@@ -1234,6 +1240,11 @@ int Pool_epi8_t<nb>::show_min_lift(long index) {
     const double lift_norm = sqrt(min_norm);
     const double gh = basis->gh(index, index_r);
     const double approx = (gh > 0.0) ? euclidean_norm / gh : 0.0;
+    last_lift_valid = 1;
+    last_lift_euclidean_norm = euclidean_norm;
+    last_lift_lift_norm = lift_norm;
+    last_lift_gh = gh;
+    last_lift_approx_factor = approx;
     printf("\nlength = %.9g(%.9g), gh = %.9g, approx = %.9g, vec = ",
            euclidean_norm, lift_norm, gh, approx);
     PRINT_VEC(v_QP.hi, basis->NumCols());

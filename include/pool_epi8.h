@@ -418,6 +418,11 @@ struct Pool_epi8_t {
         int32_t *vnorm = NULL;      // we store round(1/2 * ||v||^2) here
         int32_t *vsum = NULL;       // we store 128 * sum(round(v)) here
         uint64_t *vu = NULL;
+        int last_lift_valid = 0;
+        double last_lift_euclidean_norm = 0.0;
+        double last_lift_lift_norm = 0.0;
+        double last_lift_gh = 0.0;
+        double last_lift_approx_factor = 0.0;
 
     // construction and distructions
         Pool_epi8_t();

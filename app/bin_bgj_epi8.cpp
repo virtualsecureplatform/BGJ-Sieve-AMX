@@ -16,6 +16,8 @@ int main(int argc, char** argv) {
     long log_level = -2;
     long seed = -2;
     long print_min_lift = 0;
+    long require_quality = 0;
+    double quality_gamma = 1.05;
 
     for (long i = 0; i < argc; i++) {
         if (!strcasecmp(argv[i], "-h") || !strcasecmp(argv[i], "--help")) help = 1;
@@ -53,16 +55,28 @@ int main(int argc, char** argv) {
         if (!strcasecmp(argv[i], "--print-final")) {
             print_min_lift = 2;
         }
+        if (!strcasecmp(argv[i], "--require-quality") ||
+            !strcasecmp(argv[i], "--require-svp-quality") ||
+            !strcasecmp(argv[i], "--svp-challenge")) {
+            require_quality = 1;
+        }
+        if (!strcasecmp(argv[i], "--quality-gamma") || !strcasecmp(argv[i], "--gamma")) {
+            if (i >= argc - 1) {
+                fprintf(stderr, "Error: --quality-gamma requires a value.\n");
+                return 2;
+            }
+            quality_gamma = atof(argv[++i]);
+        }
     }
     if (argc < 2 || help) {
         #if defined(__AMX_INT8__) && defined(HAVE_CUDA)
-        printf("Usage: %s <lattice_file> [bgjf|bgj1|bgj2|bgj3|cuda|bgj1-cuda|amx] [num_threads] [log_level] [seed] [-p|--print|--print-final]\n", argv[0]);
+        printf("Usage: %s <lattice_file> [bgjf|bgj1|bgj2|bgj3|cuda|bgj1-cuda|amx] [num_threads] [log_level] [seed] [-p|--print|--print-final] [--require-quality] [--quality-gamma gamma]\n", argv[0]);
         #elif defined(__AMX_INT8__)
-        printf("Usage: %s <lattice_file> [bgjf|bgj1|bgj2|bgj3|amx] [num_threads] [log_level] [seed] [-p|--print|--print-final]\n", argv[0]);
+        printf("Usage: %s <lattice_file> [bgjf|bgj1|bgj2|bgj3|amx] [num_threads] [log_level] [seed] [-p|--print|--print-final] [--require-quality] [--quality-gamma gamma]\n", argv[0]);
         #elif defined(HAVE_CUDA)
-        printf("Usage: %s <lattice_file> [bgjf|bgj1|bgj2|bgj3|cuda|bgj1-cuda] [num_threads] [log_level] [seed] [-p|--print|--print-final]\n", argv[0]);
+        printf("Usage: %s <lattice_file> [bgjf|bgj1|bgj2|bgj3|cuda|bgj1-cuda] [num_threads] [log_level] [seed] [-p|--print|--print-final] [--require-quality] [--quality-gamma gamma]\n", argv[0]);
         #else
-        printf("Usage: %s <lattice_file> [bgjf|bgj1|bgj2|bgj3] [num_threads] [log_level] [seed] [-p|--print|--print-final]\n", argv[0]);
+        printf("Usage: %s <lattice_file> [bgjf|bgj1|bgj2|bgj3] [num_threads] [log_level] [seed] [-p|--print|--print-final] [--require-quality] [--quality-gamma gamma]\n", argv[0]);
         #endif
         return 0;
     }
@@ -94,7 +108,16 @@ int main(int argc, char** argv) {
     }
     if (seed == -2 && argc > 5) seed = atol(argv[5]);
     if (seed != -2) SetSamplerSeed((uint64_t)seed);
-    log_level += print_min_lift * 16384;
+    if (require_quality && print_min_lift == 0) print_min_lift = 2;
+    if (quality_gamma <= 0.0) {
+        fprintf(stderr, "Error: quality gamma must be positive.\n");
+        return 2;
+    }
+    if (print_min_lift == 1) {
+        log_level += 16384;
+    } else if (print_min_lift == 2 && (algo == 7 || algo == 8)) {
+        log_level += 32768;
+    }
 
     Lattice_QP L(argv[1]);
     Pool_epi8_t<3> p3(&L);
@@ -111,58 +134,131 @@ int main(int argc, char** argv) {
     Pool_epi8_t<7> p7(&L);
     #endif
 
+    int quality_valid = 0;
+    double quality_norm = 0.0;
+    double quality_gh = 0.0;
+    double quality_approx = 0.0;
+
+#define CAPTURE_QUALITY(POOL) do {                                             \
+        if ((print_min_lift == 2 || require_quality) && !(POOL).last_lift_valid) { \
+            (POOL).show_min_lift(0);                                           \
+        }                                                                      \
+        quality_valid = (POOL).last_lift_valid;                                \
+        quality_norm = (POOL).last_lift_euclidean_norm;                        \
+        quality_gh = (POOL).last_lift_gh;                                      \
+        quality_approx = (POOL).last_lift_approx_factor;                       \
+    } while (0)
+
 #if COMPILE_POOL_EPI8_128
-#define RUN_EPI8_128_OR_FALLBACK(METHOD, DIM) p4.METHOD(0, (DIM), num_threads, log_level)
+#define RUN_EPI8_128_OR_FALLBACK(METHOD, DIM) do {                             \
+        p4.METHOD(0, (DIM), num_threads, log_level);                           \
+        CAPTURE_QUALITY(p4);                                                   \
+    } while (0)
 #else
-#define RUN_EPI8_128_OR_FALLBACK(METHOD, DIM) p3.METHOD((DIM) - 96, (DIM), num_threads, log_level)
+#define RUN_EPI8_128_OR_FALLBACK(METHOD, DIM) do {                             \
+        p3.METHOD((DIM) - 96, (DIM), num_threads, log_level);                  \
+        CAPTURE_QUALITY(p3);                                                   \
+    } while (0)
 #endif
 
 #if COMPILE_POOL_EPI8_160
-#define RUN_EPI8_160_OR_FALLBACK(METHOD, DIM) p5.METHOD(0, (DIM), num_threads, log_level)
+#define RUN_EPI8_160_OR_FALLBACK(METHOD, DIM) do {                             \
+        p5.METHOD(0, (DIM), num_threads, log_level);                           \
+        CAPTURE_QUALITY(p5);                                                   \
+    } while (0)
 #elif COMPILE_POOL_EPI8_128
-#define RUN_EPI8_160_OR_FALLBACK(METHOD, DIM) p4.METHOD((DIM) - 128, (DIM), num_threads, log_level)
+#define RUN_EPI8_160_OR_FALLBACK(METHOD, DIM) do {                             \
+        p4.METHOD((DIM) - 128, (DIM), num_threads, log_level);                 \
+        CAPTURE_QUALITY(p4);                                                   \
+    } while (0)
 #else
-#define RUN_EPI8_160_OR_FALLBACK(METHOD, DIM) p3.METHOD((DIM) - 96, (DIM), num_threads, log_level)
+#define RUN_EPI8_160_OR_FALLBACK(METHOD, DIM) do {                             \
+        p3.METHOD((DIM) - 96, (DIM), num_threads, log_level);                  \
+        CAPTURE_QUALITY(p3);                                                   \
+    } while (0)
 #endif
 
 #if COMPILE_POOL_EPI8_192
-#define RUN_EPI8_192_OR_FALLBACK(METHOD, DIM) p6.METHOD(0, (DIM), num_threads, log_level)
+#define RUN_EPI8_192_OR_FALLBACK(METHOD, DIM) do {                             \
+        p6.METHOD(0, (DIM), num_threads, log_level);                           \
+        CAPTURE_QUALITY(p6);                                                   \
+    } while (0)
 #elif COMPILE_POOL_EPI8_160
-#define RUN_EPI8_192_OR_FALLBACK(METHOD, DIM) p5.METHOD((DIM) - 160, (DIM), num_threads, log_level)
+#define RUN_EPI8_192_OR_FALLBACK(METHOD, DIM) do {                             \
+        p5.METHOD((DIM) - 160, (DIM), num_threads, log_level);                 \
+        CAPTURE_QUALITY(p5);                                                   \
+    } while (0)
 #elif COMPILE_POOL_EPI8_128
-#define RUN_EPI8_192_OR_FALLBACK(METHOD, DIM) p4.METHOD((DIM) - 128, (DIM), num_threads, log_level)
+#define RUN_EPI8_192_OR_FALLBACK(METHOD, DIM) do {                             \
+        p4.METHOD((DIM) - 128, (DIM), num_threads, log_level);                 \
+        CAPTURE_QUALITY(p4);                                                   \
+    } while (0)
 #else
-#define RUN_EPI8_192_OR_FALLBACK(METHOD, DIM) p3.METHOD((DIM) - 96, (DIM), num_threads, log_level)
+#define RUN_EPI8_192_OR_FALLBACK(METHOD, DIM) do {                             \
+        p3.METHOD((DIM) - 96, (DIM), num_threads, log_level);                  \
+        CAPTURE_QUALITY(p3);                                                   \
+    } while (0)
 #endif
 
 #if COMPILE_POOL_EPI8_224
-#define RUN_EPI8_224_OR_FALLBACK(METHOD, DIM) p7.METHOD(0, (DIM), num_threads, log_level)
+#define RUN_EPI8_224_OR_FALLBACK(METHOD, DIM) do {                             \
+        p7.METHOD(0, (DIM), num_threads, log_level);                           \
+        CAPTURE_QUALITY(p7);                                                   \
+    } while (0)
 #elif COMPILE_POOL_EPI8_192
-#define RUN_EPI8_224_OR_FALLBACK(METHOD, DIM) p6.METHOD((DIM) - 192, (DIM), num_threads, log_level)
+#define RUN_EPI8_224_OR_FALLBACK(METHOD, DIM) do {                             \
+        p6.METHOD((DIM) - 192, (DIM), num_threads, log_level);                 \
+        CAPTURE_QUALITY(p6);                                                   \
+    } while (0)
 #elif COMPILE_POOL_EPI8_160
-#define RUN_EPI8_224_OR_FALLBACK(METHOD, DIM) p5.METHOD((DIM) - 160, (DIM), num_threads, log_level)
+#define RUN_EPI8_224_OR_FALLBACK(METHOD, DIM) do {                             \
+        p5.METHOD((DIM) - 160, (DIM), num_threads, log_level);                 \
+        CAPTURE_QUALITY(p5);                                                   \
+    } while (0)
 #elif COMPILE_POOL_EPI8_128
-#define RUN_EPI8_224_OR_FALLBACK(METHOD, DIM) p4.METHOD((DIM) - 128, (DIM), num_threads, log_level)
+#define RUN_EPI8_224_OR_FALLBACK(METHOD, DIM) do {                             \
+        p4.METHOD((DIM) - 128, (DIM), num_threads, log_level);                 \
+        CAPTURE_QUALITY(p4);                                                   \
+    } while (0)
 #else
-#define RUN_EPI8_224_OR_FALLBACK(METHOD, DIM) p3.METHOD((DIM) - 96, (DIM), num_threads, log_level)
+#define RUN_EPI8_224_OR_FALLBACK(METHOD, DIM) do {                             \
+        p3.METHOD((DIM) - 96, (DIM), num_threads, log_level);                  \
+        CAPTURE_QUALITY(p3);                                                   \
+    } while (0)
 #endif
 
 #if COMPILE_POOL_EPI8_224
-#define RUN_EPI8_MAX_OR_FALLBACK(METHOD, DIM) p7.METHOD((DIM) - 224, (DIM), num_threads, log_level)
+#define RUN_EPI8_MAX_OR_FALLBACK(METHOD, DIM) do {                             \
+        p7.METHOD((DIM) - 224, (DIM), num_threads, log_level);                 \
+        CAPTURE_QUALITY(p7);                                                   \
+    } while (0)
 #elif COMPILE_POOL_EPI8_192
-#define RUN_EPI8_MAX_OR_FALLBACK(METHOD, DIM) p6.METHOD((DIM) - 192, (DIM), num_threads, log_level)
+#define RUN_EPI8_MAX_OR_FALLBACK(METHOD, DIM) do {                             \
+        p6.METHOD((DIM) - 192, (DIM), num_threads, log_level);                 \
+        CAPTURE_QUALITY(p6);                                                   \
+    } while (0)
 #elif COMPILE_POOL_EPI8_160
-#define RUN_EPI8_MAX_OR_FALLBACK(METHOD, DIM) p5.METHOD((DIM) - 160, (DIM), num_threads, log_level)
+#define RUN_EPI8_MAX_OR_FALLBACK(METHOD, DIM) do {                             \
+        p5.METHOD((DIM) - 160, (DIM), num_threads, log_level);                 \
+        CAPTURE_QUALITY(p5);                                                   \
+    } while (0)
 #elif COMPILE_POOL_EPI8_128
-#define RUN_EPI8_MAX_OR_FALLBACK(METHOD, DIM) p4.METHOD((DIM) - 128, (DIM), num_threads, log_level)
+#define RUN_EPI8_MAX_OR_FALLBACK(METHOD, DIM) do {                             \
+        p4.METHOD((DIM) - 128, (DIM), num_threads, log_level);                 \
+        CAPTURE_QUALITY(p4);                                                   \
+    } while (0)
 #else
-#define RUN_EPI8_MAX_OR_FALLBACK(METHOD, DIM) p3.METHOD((DIM) - 96, (DIM), num_threads, log_level)
+#define RUN_EPI8_MAX_OR_FALLBACK(METHOD, DIM) do {                             \
+        p3.METHOD((DIM) - 96, (DIM), num_threads, log_level);                  \
+        CAPTURE_QUALITY(p3);                                                   \
+    } while (0)
 #endif
 
 #define RUN_EPI8_PROGRESSIVE(METHOD) do {                                      \
         const long dim__ = L.NumRows();                                        \
         if (dim__ <= 96) {                                                     \
             p3.METHOD(0, dim__, num_threads, log_level);                       \
+            CAPTURE_QUALITY(p3);                                               \
         } else if (dim__ <= 128) {                                             \
             RUN_EPI8_128_OR_FALLBACK(METHOD, dim__);                          \
         } else if (dim__ <= 160) {                                             \
@@ -201,6 +297,7 @@ int main(int argc, char** argv) {
     } else if (algo == 9) {
         #if defined(__AMX_INT8__)
         p5.left_progressive_amx(0, L.NumRows(), num_threads, log_level);
+        CAPTURE_QUALITY(p5);
         #endif
     }
 #undef RUN_EPI8_PROGRESSIVE
@@ -209,5 +306,22 @@ int main(int argc, char** argv) {
 #undef RUN_EPI8_192_OR_FALLBACK
 #undef RUN_EPI8_160_OR_FALLBACK
 #undef RUN_EPI8_128_OR_FALLBACK
+#undef CAPTURE_QUALITY
+    if (require_quality) {
+        if (!quality_valid || quality_gh <= 0.0) {
+            fprintf(stderr, "quality check failed: final lifted quality is unavailable\n");
+            return 3;
+        }
+        const double quality_bound = quality_gamma * quality_gh;
+        if (quality_norm > quality_bound) {
+            fprintf(stderr,
+                    "quality check failed: norm=%.9g bound=%.9g gh=%.9g approx=%.9g gamma=%.9g\n",
+                    quality_norm, quality_bound, quality_gh, quality_approx, quality_gamma);
+            return 3;
+        }
+        fprintf(stderr,
+                "quality check passed: norm=%.9g bound=%.9g gh=%.9g approx=%.9g gamma=%.9g\n",
+                quality_norm, quality_bound, quality_gh, quality_approx, quality_gamma);
+    }
     return 0;
 }
