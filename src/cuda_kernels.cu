@@ -23,6 +23,8 @@ static char bgj_cuda_error[512] = "no CUDA error";
 #define BGJ_CUDA_TENSOR_NP_MULTI_N_TILES (BGJ_CUDA_TENSOR_WARPS_PER_BLOCK * BGJ_CUDA_TENSOR_NP_MULTI_N_TILES_PER_WARP)
 #define BGJ_CUDA_BUCKET_DET_THREADS 256u
 #define BGJ_CUDA_SEARCH_DET_THREADS 256u
+#define BGJ_CUDA_LSH_TILE 16u
+#define BGJ_CUDA_LSH_THREADS (BGJ_CUDA_LSH_TILE * BGJ_CUDA_LSH_TILE)
 
 typedef wmma::fragment<wmma::matrix_a, 16, 16, 16, signed char, wmma::row_major> bgj_cuda_i8_a_frag_t;
 typedef wmma::fragment<wmma::matrix_b, 16, 16, 16, signed char, wmma::col_major> bgj_cuda_i8_b_frag_t;
@@ -379,6 +381,81 @@ __device__ void bgj_cuda_push_result(bgj_cuda_result_t *results,
         results[out].y = y;
     } else {
         *overflow = 1;
+    }
+}
+
+__device__ __forceinline__ uint64_t bgj_cuda_lsh_tile_prefix(uint64_t row, uint32_t num_tiles)
+{
+    return row * (uint64_t)num_tiles - (row * (row - 1u)) / 2u;
+}
+
+__device__ __forceinline__ void bgj_cuda_lsh_tile_pair(uint64_t slot,
+                                                       uint32_t num_tiles,
+                                                       uint32_t *tile_i,
+                                                       uint32_t *tile_j)
+{
+    const double m = (double)(2u * num_tiles + 1u);
+    const double d = m * m - 8.0 * (double)slot;
+    uint64_t row = (uint64_t)((m - sqrt(d > 0.0 ? d : 0.0)) * 0.5);
+    while (row + 1u < (uint64_t)num_tiles &&
+           bgj_cuda_lsh_tile_prefix(row + 1u, num_tiles) <= slot) {
+        row++;
+    }
+    while (row > 0u && bgj_cuda_lsh_tile_prefix(row, num_tiles) > slot) {
+        row--;
+    }
+    const uint64_t col = row + slot - bgj_cuda_lsh_tile_prefix(row, num_tiles);
+    *tile_i = (uint32_t)row;
+    *tile_j = (uint32_t)col;
+}
+
+__global__ __launch_bounds__(BGJ_CUDA_LSH_THREADS, 2)
+void bgj_cuda_lsh_search_kernel(const uint64_t *sh,
+                                uint32_t mbound,
+                                int32_t threshold,
+                                uint64_t tile_slots,
+                                bgj_cuda_result_t *results,
+                                uint32_t result_capacity,
+                                uint32_t *result_count,
+                                int *overflow)
+{
+    __shared__ uint64_t tile_a[BGJ_CUDA_LSH_TILE][8];
+    __shared__ uint64_t tile_b[BGJ_CUDA_LSH_TILE][8];
+    const uint32_t num_tiles = (mbound + BGJ_CUDA_LSH_TILE - 1u) / BGJ_CUDA_LSH_TILE;
+    const int32_t upper_threshold = 512 - threshold;
+
+    for (uint64_t tile_slot = blockIdx.x; tile_slot < tile_slots; tile_slot += gridDim.x) {
+        uint32_t tile_i = 0;
+        uint32_t tile_j = 0;
+        bgj_cuda_lsh_tile_pair(tile_slot, num_tiles, &tile_i, &tile_j);
+
+        for (uint32_t k = threadIdx.x; k < BGJ_CUDA_LSH_TILE * 8u; k += blockDim.x) {
+            const uint32_t row = k >> 3;
+            const uint32_t word = k & 7u;
+            const uint32_t ai = tile_i * BGJ_CUDA_LSH_TILE + row;
+            const uint32_t bj = tile_j * BGJ_CUDA_LSH_TILE + row;
+            tile_a[row][word] = ai < mbound ? sh[(uint64_t)ai * 8u + word] : 0u;
+            tile_b[row][word] = bj < mbound ? sh[(uint64_t)bj * 8u + word] : 0u;
+        }
+        __syncthreads();
+
+        const uint32_t ai_local = threadIdx.x >> 4;
+        const uint32_t bj_local = threadIdx.x & 15u;
+        const uint32_t i = tile_i * BGJ_CUDA_LSH_TILE + ai_local;
+        const uint32_t j = tile_j * BGJ_CUDA_LSH_TILE + bj_local;
+        if (i < mbound && j < mbound && (tile_i != tile_j || ai_local < bj_local)) {
+            uint32_t dist = 0;
+            #pragma unroll
+            for (uint32_t word = 0; word < 8u; word++) {
+                dist += __popcll(tile_a[ai_local][word] ^ tile_b[bj_local][word]);
+            }
+            if ((int32_t)dist <= threshold) {
+                bgj_cuda_push_result(results, result_count, overflow, result_capacity, BGJ_CUDA_SOL_S, i, j);
+            } else if ((int32_t)dist >= upper_threshold) {
+                bgj_cuda_push_result(results, result_count, overflow, result_capacity, BGJ_CUDA_SOL_A, i, j);
+            }
+        }
+        __syncthreads();
     }
 }
 
@@ -2255,6 +2332,85 @@ static int bgj_cuda_prepare_bucket_stream(bgj_cuda_bucket_scratch_t *scratch)
     do {                                                              \
         if (!ensure_cuda_capacity((void **)&(ptr), &(capacity), requested)) goto fail; \
     } while (0)
+
+extern "C" int bgj_cuda_lsh_search_raw(const uint8_t *sh,
+                                        uint32_t mbound,
+                                        uint32_t shsize,
+                                        int32_t threshold,
+                                        bgj_cuda_result_t *results,
+                                        uint32_t result_capacity,
+                                        uint32_t *result_count,
+                                        int *overflow)
+{
+    bgj_cuda_raw_scratch_t *scratch = &bgj_cuda_raw_scratch;
+    if (shsize != 64u) {
+        set_plain_error("CUDA LSH search only supports 64-byte signatures");
+        return 0;
+    }
+    if (result_capacity == 0) {
+        set_plain_error("result capacity is zero");
+        return 0;
+    }
+    if (mbound < 2u) {
+        *result_count = 0;
+        *overflow = 0;
+        set_plain_error("no CUDA error");
+        return 1;
+    }
+    if (!bgj_cuda_prepare_stream(scratch)) return 0;
+
+    cudaStream_t stream = scratch->stream;
+    const size_t sh_bytes = (size_t)mbound * (size_t)shsize;
+    CUDA_ENSURE(scratch->p_vecs, scratch->p_vec_capacity, sh_bytes);
+    CUDA_ENSURE(scratch->results, scratch->result_capacity, (size_t)result_capacity * sizeof(bgj_cuda_result_t));
+    CUDA_ENSURE(scratch->result_count, scratch->result_count_capacity, sizeof(uint32_t));
+    CUDA_ENSURE(scratch->overflow, scratch->overflow_capacity, sizeof(int));
+
+    CUDA_TRY(cudaMemcpyAsync(scratch->p_vecs, sh, sh_bytes, cudaMemcpyHostToDevice, stream));
+    CUDA_TRY(cudaMemsetAsync(scratch->result_count, 0, sizeof(uint32_t), stream));
+    CUDA_TRY(cudaMemsetAsync(scratch->overflow, 0, sizeof(int), stream));
+
+    {
+        const uint32_t num_tiles = (mbound + BGJ_CUDA_LSH_TILE - 1u) / BGJ_CUDA_LSH_TILE;
+        const uint64_t tile_slots = (uint64_t)num_tiles * (uint64_t)(num_tiles + 1u) / 2u;
+        uint32_t grid = tile_slots > 65535ull ? 65535u : (uint32_t)tile_slots;
+        if (grid == 0) grid = 1;
+        bgj_cuda_lsh_search_kernel<<<grid,
+                                      BGJ_CUDA_LSH_THREADS,
+                                      0,
+                                      stream>>>((const uint64_t *)scratch->p_vecs,
+                                                mbound,
+                                                threshold,
+                                                tile_slots,
+                                                scratch->results,
+                                                result_capacity,
+                                                scratch->result_count,
+                                                scratch->overflow);
+        CUDA_TRY(cudaGetLastError());
+    }
+
+    CUDA_TRY(cudaMemcpyAsync(result_count, scratch->result_count, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_TRY(cudaMemcpyAsync(overflow, scratch->overflow, sizeof(int), cudaMemcpyDeviceToHost, stream));
+    CUDA_TRY(cudaStreamSynchronize(stream));
+    if (*result_count > result_capacity) {
+        *result_count = result_capacity;
+        *overflow = 1;
+    }
+    if (*result_count) {
+        CUDA_TRY(cudaMemcpyAsync(results,
+                                 scratch->results,
+                                 (size_t)(*result_count) * sizeof(bgj_cuda_result_t),
+                                 cudaMemcpyDeviceToHost,
+                                 stream));
+        CUDA_TRY(cudaStreamSynchronize(stream));
+    }
+
+    set_plain_error("no CUDA error");
+    return 1;
+
+fail:
+    return 0;
+}
 
 struct bgj_cuda_materialize_scratch_t {
     bgj_cuda_materialize_desc_t *desc;

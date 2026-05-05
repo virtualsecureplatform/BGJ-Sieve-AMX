@@ -58,6 +58,12 @@ static void solver_profile_line(const char *name, double seconds)
     }
 }
 
+#define SOLVER_PROFILE_DO(label, stmt) do {               \
+        double __solver_profile_t0 = solver_now();        \
+        stmt;                                             \
+        solver_profile_line(label, solver_now() - __solver_profile_t0); \
+    } while (0)
+
 int __progressive_LLL(Lattice_QP *L) {
     L->LLL_QP(0.5);
     L->LLL_QP(0.75);
@@ -154,24 +160,40 @@ int _svp_solver_red(Lattice_QP* L, long algo) {
         return 1;
     }
     if (algo == SVPALGO_120T95) {
-        __progressive_LLL(L);
-        for (long l = 0; l < 5; l++) __deep40_tour(L);
-        for (long l = 0; l < 60; l += 15) __local_pump(L, 60, 15, l, l + 75);
-        L->LLL_QP();
-        for (long l = 0; l < 50; l += 10) __local_pump(L, 65, 15, l, l + 80);
-        L->LLL_QP();
-        for (long l = 0; l < 40; l += 10) __local_pump(L, 75, 15, l, l + 90);
-        L->LLL_QP();
-        __lsh_pump_red_epi8(L, num_threads, 1.1, 0.2, 85, 35, 24, 0, 24, 0, 0, 45);
-        __local_lsh_pump(L, 80, 30, 10, 120);
-        __local_lsh_pump(L, 75, 25, 20, 120);
-        __lsh_pump_red_epi8(L, num_threads, 1.1, 0.4, 88, 32, 24, 0, 24, 0, 0, 45);
-        __local_lsh_pump(L, 82, 25, 13, 120);
-        __local_lsh_pump(L, 75, 25, 20, 120);
-        __lsh_pump_red_epi8(L, num_threads, 1.1, 0.35, 90, 30, 24, 0, 24, 0, 0, 45);
-        __local_pump(L, 85, 20, 15, 120);
-        __lsh_pump_red_epi8(L, num_threads, 1.1, 0.35, 92, 28, 24, 0, 24, 0, 0, 45);
-        __local_pump(L, 85, 20, 15, 120);
+        SOLVER_PROFILE_DO("120t95 progressive_LLL", __progressive_LLL(L));
+        for (long l = 0; l < 5; l++) {
+            char label[64];
+            snprintf(label, sizeof(label), "120t95 deep40_tour_%ld", l + 1);
+            SOLVER_PROFILE_DO(label, __deep40_tour(L));
+        }
+        for (long l = 0; l < 60; l += 15) {
+            char label[64];
+            snprintf(label, sizeof(label), "120t95 local_pump_60_%ld_%ld", l, l + 75);
+            SOLVER_PROFILE_DO(label, __local_pump(L, 60, 15, l, l + 75));
+        }
+        SOLVER_PROFILE_DO("120t95 LLL_after_pump60", L->LLL_QP());
+        for (long l = 0; l < 50; l += 10) {
+            char label[64];
+            snprintf(label, sizeof(label), "120t95 local_pump_65_%ld_%ld", l, l + 80);
+            SOLVER_PROFILE_DO(label, __local_pump(L, 65, 15, l, l + 80));
+        }
+        SOLVER_PROFILE_DO("120t95 LLL_after_pump65", L->LLL_QP());
+        for (long l = 0; l < 40; l += 10) {
+            char label[64];
+            snprintf(label, sizeof(label), "120t95 local_pump_75_%ld_%ld", l, l + 90);
+            SOLVER_PROFILE_DO(label, __local_pump(L, 75, 15, l, l + 90));
+        }
+        SOLVER_PROFILE_DO("120t95 LLL_after_pump75", L->LLL_QP());
+        SOLVER_PROFILE_DO("120t95 lsh_pump_85_35_q02", __lsh_pump_red_epi8(L, num_threads, 1.1, 0.2, 85, 35, 24, 0, 24, 0, 0, 45));
+        SOLVER_PROFILE_DO("120t95 local_lsh_80_10_120", __local_lsh_pump(L, 80, 30, 10, 120));
+        SOLVER_PROFILE_DO("120t95 local_lsh_75_20_120", __local_lsh_pump(L, 75, 25, 20, 120));
+        SOLVER_PROFILE_DO("120t95 lsh_pump_88_32_q04", __lsh_pump_red_epi8(L, num_threads, 1.1, 0.4, 88, 32, 24, 0, 24, 0, 0, 45));
+        SOLVER_PROFILE_DO("120t95 local_lsh_82_13_120", __local_lsh_pump(L, 82, 25, 13, 120));
+        SOLVER_PROFILE_DO("120t95 local_lsh_75_20_120_b", __local_lsh_pump(L, 75, 25, 20, 120));
+        SOLVER_PROFILE_DO("120t95 lsh_pump_90_30_q035", __lsh_pump_red_epi8(L, num_threads, 1.1, 0.35, 90, 30, 24, 0, 24, 0, 0, 45));
+        SOLVER_PROFILE_DO("120t95 local_pump_85_15_120", __local_pump(L, 85, 20, 15, 120));
+        SOLVER_PROFILE_DO("120t95 lsh_pump_92_28_q035", __lsh_pump_red_epi8(L, num_threads, 1.1, 0.35, 92, 28, 24, 0, 24, 0, 0, 45));
+        SOLVER_PROFILE_DO("120t95 local_pump_85_15_120_b", __local_pump(L, 85, 20, 15, 120));
         // the final sieve do not insert to the basis, it only print the short vectors
         // now we run this part manually
         // __last_lsh_pump_epi8(L, num_threads, 0.6, 0.6, 102, 0, 3, 0, 40);

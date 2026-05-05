@@ -3,7 +3,9 @@
 
 #include "../include/lsfsh_tables.hpp"
 
+#include <cstdlib>
 #include <sys/time.h>
+#include <vector>
 
 #define LSH_DEFAULT_DHDIM 24
 #define LSH_DEFAULT_SHSIZE 64
@@ -31,6 +33,39 @@ double _lsh_time_curr[MAX_NTHREADS];
     } while (0)
 
 #define CURRENT_TIME (_lsh_time_curr[omp_get_thread_num()])
+#endif
+
+static inline double lsh_wall_time()
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec + (double) tv.tv_usec / 1000000.0;
+}
+
+static inline int lsh_env_profile_enabled()
+{
+    const char *env = getenv("BGJ_LSH_PROFILE");
+    if (env == NULL) env = getenv("BGJ_PUMP_PROFILE");
+    return env != NULL && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
+}
+
+#if defined(HAVE_CUDA)
+static inline int lsh_cuda_search_enabled()
+{
+    const char *env = getenv("BGJ_CUDA_LSH_SEARCH");
+    if (env != NULL && env[0] != '\0') return env[0] != '0';
+    return bgj_cuda_search_requested();
+}
+
+static inline uint32_t lsh_cuda_max_results()
+{
+    const char *env = getenv("BGJ_CUDA_LSH_MAX_RESULTS");
+    if (env != NULL && env[0] != '\0') {
+        unsigned long value = strtoul(env, NULL, 10);
+        if (value > 0 && value <= 0xffffffffUL) return (uint32_t)value;
+    }
+    return 8u << 20;
+}
 #endif
 
 #pragma region
@@ -480,13 +515,18 @@ struct lsh_mblock_provider_t {
     }
     int batch_pop(lsh_mblock_t *mb, long batch_size, lsh_profile_data_t *profile_data) {
         if (num_poped >= num_total_buckets) return 0;
+        const int env_profile = lsh_env_profile_enabled();
+        const double profile_start = env_profile ? lsh_wall_time() : 0.0;
+        double profile_center_done = 0.0;
+        double profile_collect_done = 0.0;
+        double profile_compact_done = 0.0;
         TIMER_START;
         for (long i = 0; i < LSH_MBLOCK_BATCH; i++) {
             mb[i].fvec = NULL;
             mb[i].sh = NULL;
-            mb->Mbound = 0;
+            mb[i].Mbound = 0;
         }
-        const long num_pop = ((num_total_buckets - num_poped) > batch_size) ? 
+        const long num_pop = ((num_total_buckets - num_poped) > batch_size) ?
                                 batch_size : (num_total_buckets - num_poped);
         num_poped += num_pop;
         float idiag[dh_dim];
@@ -500,6 +540,7 @@ struct lsh_mblock_provider_t {
                 }
             }
         } while (0);
+        if (env_profile) profile_center_done = lsh_wall_time();
 
 
         // collect fvec and put them to local_fvec_dst
@@ -597,23 +638,36 @@ struct lsh_mblock_provider_t {
                 local_Mbound_list[i][thread] = local_Mbound[i];
             }
         }
-        
+        if (env_profile) profile_collect_done = lsh_wall_time();
+
         // move fvec to the correct place
+        long profile_sum_mbound = 0;
+        long profile_max_mbound = 0;
+        long profile_min_mbound = max_bucket_size;
         #pragma omp parallel for
         for (long i = 0; i < num_pop; i++) {
             long right_ind = local_Mbound_list[i][0];
             for (long j = 1; j < p->num_threads; j++) {
-                memmove(_fvec_list[i] + right_ind * FD8, _fvec_list[i] + (j * max_bucket_size) / p->num_threads * FD8, 
+                memmove(_fvec_list[i] + right_ind * FD8, _fvec_list[i] + (j * max_bucket_size) / p->num_threads * FD8,
                         local_Mbound_list[i][j] * FD8 * sizeof(float));
                 right_ind += local_Mbound_list[i][j];
             }
             mb[i].Mbound = right_ind;
             mb[i].fvec = _fvec_list[i];
             mb[i].sh = _sh_list[i];
+            if (env_profile) {
+                #pragma omp critical
+                {
+                    profile_sum_mbound += right_ind;
+                    if (right_ind > profile_max_mbound) profile_max_mbound = right_ind;
+                    if (right_ind < profile_min_mbound) profile_min_mbound = right_ind;
+                }
+            }
         }
+        if (env_profile) profile_compact_done = lsh_wall_time();
 
         // compute sh from fvec
-        #pragma omp parallel for 
+        #pragma omp parallel for
         for (long thread = 0; thread < p->num_threads; thread++) {
             for (long ip = 0; ip < num_pop; ip++) {
                 const long begin_ind = (thread * mb[ip].Mbound) / p->num_threads;
@@ -730,6 +784,21 @@ struct lsh_mblock_provider_t {
         TIMER_END;
         profile_data->bucketing_time += CURRENT_TIME;
         profile_data->bucketing_ops += p->num_vec * num_pop;
+        if (env_profile) {
+            const double profile_end = lsh_wall_time();
+            const double center_time = profile_center_done - profile_start;
+            const double collect_time = profile_collect_done - profile_center_done;
+            const double compact_time = profile_compact_done - profile_collect_done;
+            const double hash_time = profile_end - profile_compact_done;
+            const double total_time = profile_end - profile_start;
+            const double avg_mbound = (num_pop > 0) ? (double) profile_sum_mbound / (double) num_pop : 0.0;
+            if (profile_min_mbound == max_bucket_size && profile_max_mbound == 0) profile_min_mbound = 0;
+            fprintf(stderr,
+                    "lsh_bucket_profile: poped=%ld/%ld num_pop=%ld threads=%ld total=%.6fs center=%.6fs collect=%.6fs compact=%.6fs hash=%.6fs avg_mbound=%.2f min_mbound=%ld max_mbound=%ld max_bucket=%ld radius2=%.6e\n",
+                    num_poped, num_total_buckets, num_pop, p->num_threads, total_time, center_time, collect_time,
+                    compact_time, hash_time, avg_mbound, profile_min_mbound, profile_max_mbound, max_bucket_size,
+                    bucket_radius2);
+        }
 
         return 1;
     }
@@ -819,6 +888,62 @@ int Pool_epi8_t<nb>::__mblock_sh_search(lsh_mblock_t mb, int32_t threshold, uint
     uint32_t *_ptr_buffer = *ptr_buffer;
     long _ptr_buffer_num = *ptr_buffer_num;
     long _ptr_buffer_size = *ptr_buffer_size;
+#if defined(HAVE_CUDA)
+    if (shsize == 64 && lsh_cuda_search_enabled() && mb.Mbound >= 4096) {
+        const uint32_t result_capacity = lsh_cuda_max_results();
+        static thread_local std::vector<bgj_cuda_result_t> cuda_results;
+        try {
+            cuda_results.resize(result_capacity);
+        } catch (...) {
+            cuda_results.clear();
+        }
+        if (!cuda_results.empty()) {
+            uint32_t result_count = 0;
+            int overflow = 0;
+            double cuda_start = lsh_env_profile_enabled() ? lsh_wall_time() : 0.0;
+            int cuda_ok = bgj_cuda_lsh_search_raw(mb.sh,
+                                                  (uint32_t)mb.Mbound,
+                                                  shsize,
+                                                  threshold,
+                                                  cuda_results.data(),
+                                                  result_capacity,
+                                                  &result_count,
+                                                  &overflow);
+            if (cuda_ok && !overflow) {
+                if (_ptr_buffer_num + result_count > _ptr_buffer_size) {
+                    _ptr_buffer_size = _ptr_buffer_num + result_count + 64;
+                    uint32_t *new_ptr_buffer = (uint32_t *) realloc(_ptr_buffer, 3 * _ptr_buffer_size * sizeof(uint32_t));
+                    if (new_ptr_buffer == NULL) return 0;
+                    _ptr_buffer = new_ptr_buffer;
+                }
+                for (uint32_t i = 0; i < result_count; i++) {
+                    _ptr_buffer[(_ptr_buffer_num + i) * 3] = (cuda_results[i].type == BGJ_CUDA_SOL_A) ? 0u : 1u;
+                    _ptr_buffer[(_ptr_buffer_num + i) * 3 + 1] = cuda_results[i].x;
+                    _ptr_buffer[(_ptr_buffer_num + i) * 3 + 2] = cuda_results[i].y;
+                }
+                _ptr_buffer_num += result_count;
+                pthread_spin_lock(&profile_data->profile_lock);
+                profile_data->dp_ops += mb.Mbound * (mb.Mbound + 1) / 2;
+                profile_data->num_mblock++;
+                pthread_spin_unlock(&profile_data->profile_lock);
+                *ptr_buffer = _ptr_buffer;
+                *ptr_buffer_size = _ptr_buffer_size;
+                *ptr_buffer_num = _ptr_buffer_num;
+                if (lsh_env_profile_enabled()) {
+                    fprintf(stderr,
+                            "lsh_cuda_search: mbound=%ld threshold=%d results=%u elapsed=%.6fs\n",
+                            mb.Mbound, threshold, result_count, lsh_wall_time() - cuda_start);
+                }
+                return 1;
+            }
+            if (lsh_env_profile_enabled()) {
+                fprintf(stderr,
+                        "lsh_cuda_search_fallback: mbound=%ld threshold=%d ok=%d overflow=%d results=%u error=%s\n",
+                        mb.Mbound, threshold, cuda_ok, overflow, result_count, bgj_cuda_last_error());
+            }
+        }
+    }
+#endif
     for (long Ind = 0; Ind < mb.Mbound; Ind += l2_block) {
         for (long Jnd = Ind; Jnd < mb.Mbound; Jnd += l2_block) {
             if (Ind == Jnd) {
@@ -1083,7 +1208,19 @@ int Pool_epi8_t<nb>::_lsfsh_insert(long target_index, double eta, long log_level
     mblock_provider.init(this, target_index, dual_vec, compress_pos, num_hbits, b_full_fp, min_norm, min_vec, target_ratio, qratio, &profile_data);
     lsh_mblock_t mb[LSH_MBLOCK_BATCH];
     const long LSH_RBATCH = ((LSH_MBLOCK_BATCH / num_threads) * num_threads) > 0 ? ((LSH_MBLOCK_BATCH / num_threads) * num_threads) : LSH_MBLOCK_BATCH;
+    const int env_profile = lsh_env_profile_enabled();
+    long profile_batch_id = 0;
+    if (env_profile) {
+        fprintf(stderr,
+                "lsh_insert_begin: nb=%u target=%ld fd=%ld id=%ld csd=%ld nvec=%ld threads=%ld rbatch=%ld total_buckets=%ld exp_bucket=%.2f max_bucket=%ld hbits=%d threshold=%d target_ratio=%.6f target_length=%.6f qratio=%.6f\n",
+                nb, target_index, FD, ID, CSD, num_vec, num_threads, LSH_RBATCH, mblock_provider.num_total_buckets,
+                mblock_provider.exp_bucket_size, mblock_provider.max_bucket_size, num_hbits, threshold, target_ratio,
+                target_length, qratio);
+    }
+    double profile_pop_start = env_profile ? lsh_wall_time() : 0.0;
     while (mblock_provider.batch_pop(mb, LSH_RBATCH, &profile_data)) {
+        const double profile_pop_time = env_profile ? lsh_wall_time() - profile_pop_start : 0.0;
+        const double profile_batch_start = env_profile ? lsh_wall_time() : 0.0;
         int wild_mb = 0;
         long num_mb = 0;
         for (long i = 0; i < LSH_RBATCH; i++) {
@@ -1135,9 +1272,25 @@ int Pool_epi8_t<nb>::_lsfsh_insert(long target_index, double eta, long log_level
         profile_data.lift_time += lift_time;
         profile_data.dp_time += search_time;
         profile_data.mblock_log(min_norm, ID);
+        if (env_profile) {
+            const double profile_batch_time = lsh_wall_time() - profile_batch_start;
+            fprintf(stderr,
+                    "lsh_insert_batch: batch=%ld num_mb=%ld wild=%d pop=%.6fs search=%.6fs lift=%.6fs post=%.6fs total=%.6fs mblock=%lu/%lu cum_bucket=%.6fs cum_search=%.6fs cum_lift=%.6fs min0=%.6f\n",
+                    ++profile_batch_id, num_mb, wild_mb, profile_pop_time, search_time, lift_time,
+                    profile_batch_time - search_time - lift_time, profile_pop_time + profile_batch_time,
+                    profile_data.num_mblock, profile_data.total_mblock, profile_data.bucketing_time,
+                    profile_data.dp_time, profile_data.lift_time, sqrt(min_norm[0]));
+        }
+        profile_pop_start = env_profile ? lsh_wall_time() : 0.0;
     }
 
     profile_data.final_log(min_norm, ID);
+    if (env_profile) {
+        fprintf(stderr,
+                "lsh_insert_done: batches=%ld target=%ld mblock=%lu/%lu bucket=%.6fs search=%.6fs lift=%.6fs init=%.6fs\n",
+                profile_batch_id, target_index, profile_data.num_mblock, profile_data.total_mblock,
+                profile_data.bucketing_time, profile_data.dp_time, profile_data.lift_time, profile_data.init_time);
+    }
     mblock_provider.clear();
     for (long i = 0; i < num_threads; i++) free(ptr_buffer[i]);
     FREE_VEC(ptr_buffer);
@@ -1293,9 +1446,15 @@ int Pool_epi8_t<nb>::lsfsh_insert(long target_index, double eta, long log_level,
     Lattice_QP *b_mid = basis->b_loc_QP(index_l - LSH_DEFAULT_DHDIM, index_l);
     TIMER_START;
     if (log_level >= 2) printf("param: ");
-    _opt_nsh_threshold(dual_vec, compress_pos, num_hbits, num_tbits, threshold, 
+    _opt_nsh_threshold(dual_vec, compress_pos, num_hbits, num_tbits, threshold,
                         b_mid, LSH_DEFAULT_SHSIZE, exp_length, tail_alpha_prob_list, log_level);
     TIMER_END;
+    if (lsh_env_profile_enabled()) {
+        fprintf(stderr,
+                "lsh_opt_profile: target=%ld csd=%ld opt=%.6fs hbits=%d tbits=%d threshold=%d exp_length=%.6f dual_exp_length=%.6f dual_gh=%.6f unique=%d\n",
+                target_index, CSD, CURRENT_TIME, num_hbits, num_tbits, threshold, exp_length, dual_exp_length,
+                dual_gh, unique_target ? 1 : 0);
+    }
     delete b_mid;
     if (log_level >= 0) {
         if (log_level >= 1) printf("param: ");

@@ -66,6 +66,15 @@ extern "C" int bgj_cuda_bucket_bgj1_raw(const int8_t *pool_vecs,
                                          uint32_t *entry_count,
                                          int *overflow);
 
+extern "C" int bgj_cuda_lsh_search_raw(const uint8_t *sh,
+                                        uint32_t mbound,
+                                        uint32_t shsize,
+                                        int32_t threshold,
+                                        bgj_cuda_result_t *results,
+                                        uint32_t result_capacity,
+                                        uint32_t *result_count,
+                                        int *overflow);
+
 extern "C" int bgj_cuda_materialize_sol_list_raw(const int8_t *pool_vecs,
                                                   uint64_t pool_epoch,
                                                   uint32_t pool_size,
