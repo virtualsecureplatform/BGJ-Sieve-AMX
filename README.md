@@ -325,6 +325,7 @@ challenge quality check under `bench/results/`.
 ```bash
 $ CUDA_VISIBLE_DEVICES=1 bench/svp_solver_100t90_seed46937.py --mode cuda
 $ CUDA_VISIBLE_DEVICES=1 bench/svp_solver_100t90_seed46937.py --mode both
+$ CUDA_VISIBLE_DEVICES=1 bench/svp_solver_100t90_seed46937.py --mode cuda --profile
 ```
 
 The harness uses the official SVP-challenge seed-0 generator when an instance

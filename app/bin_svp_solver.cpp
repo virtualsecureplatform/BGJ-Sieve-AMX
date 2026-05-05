@@ -41,6 +41,22 @@ double _solver_time_curr;
 #define SVPALGO_150T102     6
 
 long num_threads = 1;
+long profile = 0;
+
+static double solver_now()
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec + (double)tv.tv_usec / 1000000.0;
+}
+
+static void solver_profile_line(const char *name, double seconds)
+{
+    if (profile) {
+        printf("profile: %-32s %.6fs\n", name, seconds);
+        fflush(stdout);
+    }
+}
 
 int __progressive_LLL(Lattice_QP *L) {
     L->LLL_QP(0.5);
@@ -95,12 +111,28 @@ int _svp_solver_red(Lattice_QP* L, long algo) {
         return 0;
     }
     if (algo == SVPALGO_100T90) {
+        double t0 = solver_now();
         __progressive_LLL(L);
-        for (long l = 0; l < 3; l++) __deep40_tour(L);
+        solver_profile_line("100t90 progressive_LLL", solver_now() - t0);
+        for (long l = 0; l < 3; l++) {
+            char label[64];
+            snprintf(label, sizeof(label), "100t90 deep40_tour_%ld", l + 1);
+            t0 = solver_now();
+            __deep40_tour(L);
+            solver_profile_line(label, solver_now() - t0);
+        }
+        t0 = solver_now();
         __local_pump(L, 65, 15, 0, 80);
+        solver_profile_line("100t90 local_pump_65_0_80", solver_now() - t0);
+        t0 = solver_now();
         __local_dual_pump(L, 65, 15, 20, 100);
+        solver_profile_line("100t90 local_dual_pump_65_20_100", solver_now() - t0);
+        t0 = solver_now();
         __local_pump(L, 72, 15, 0, 87);
+        solver_profile_line("100t90 local_pump_72_0_87", solver_now() - t0);
+        t0 = solver_now();
         __pump_red_epi8(L, 1, 100, 82, 18, 1, 0, 0, 0, 0);
+        solver_profile_line("100t90 final_pump_82_d4f18", solver_now() - t0);
 
         return 1;
     }
@@ -249,13 +281,14 @@ int _svp_solver_red(Lattice_QP* L, long algo) {
 }
 
 int show_help(int argc, char** argv) {
-    printf("Usage: %s <lattice_file> [--algo algorithm] [--threads num_threads] [--goal goal_length] [--cuda]\n", argv[0]);
+    printf("Usage: %s <lattice_file> [--algo algorithm] [--threads num_threads] [--goal goal_length] [--cuda] [--profile]\n", argv[0]);
     printf("./red/<lattice_file> will be read and the reducted basis will be written to ./red/<lattice_file>r\n");
     printf("Options:\n");
     printf("   -s, --seed          sampler seed\n");
     printf("   -t, --threads       number of CPU threads\n");
     printf("   -g, --goal          print possible sol only below this length\n");
     printf("   -cuda, --cuda       use CUDA-assisted BGJ1 phases\n");
+    printf("   -profile, --profile print coarse stage timings\n");
     printf("Supported algorithms:\n");
     printf( "   SVPALGO_NULL        0\n"
             "   SVPALGO_100T90      1\n"
@@ -312,6 +345,10 @@ int main(int argc, char** argv) {
             cuda = 1;
             continue;
         }
+        if (!strcasecmp(argv[i], "-profile") || !strcasecmp(argv[i], "--profile")) {
+            profile = 1;
+            continue;
+        }
         if (!strcasecmp(argv[i], "-g") || !strcasecmp(argv[i], "--goal")) {
             if (i < argc - 1) {
                 i++;
@@ -356,15 +393,23 @@ int main(int argc, char** argv) {
     snprintf(output, sizeof(output), "./red/%sr", argv[filename_place]);
 
     TIMER_START;
+    double profile_t0 = solver_now();
     NTL::Mat<NTL::ZZ> L_ZZ;
     std::ifstream data(input, std::ios::in);
     data >> L_ZZ;
+    solver_profile_line("read_raw_basis", solver_now() - profile_t0);
+    profile_t0 = solver_now();
     NTL::ZZ det2;
     LLL(det2, L_ZZ, 1, 3, 0);
-    
+    solver_profile_line("initial_NTL_LLL", solver_now() - profile_t0);
+
+    profile_t0 = solver_now();
     Lattice_QP L(L_ZZ);
+    solver_profile_line("lattice_init", solver_now() - profile_t0);
     SetSamplerSeed((uint64_t)seed);
+    profile_t0 = solver_now();
     _svp_solver_red(&L, algo);
+    solver_profile_line("solver_red_total", solver_now() - profile_t0);
     TIMER_END;
     
     double min_len = sqrt(dot_avx2(L.get_b().hi[0], L.get_b().hi[0], L.NumRows()));
@@ -373,7 +418,9 @@ int main(int argc, char** argv) {
         printf("possible sol: %s, length = %.2f, time = %.2fs, vec = ", argv[filename_place], min_len, CURRENT_TIME);
         PRINT_VEC(L.get_b().hi[0], L.NumRows());
     }
+    profile_t0 = solver_now();
     L.store(output);
+    solver_profile_line("store_reduced_basis", solver_now() - profile_t0);
 
 
     return 0;

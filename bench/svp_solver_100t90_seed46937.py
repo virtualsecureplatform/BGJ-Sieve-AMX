@@ -71,6 +71,7 @@ def parse_args(argv):
     parser.add_argument("--cxx", default=os.environ.get("CXX", "clang++"))
     parser.add_argument("--cuda-visible-devices", default=os.environ.get("CUDA_VISIBLE_DEVICES"))
     parser.add_argument("--validate-generator", action="store_true")
+    parser.add_argument("--profile", action="store_true", help="pass --profile to svp_solver")
     parser.add_argument(
         "--require-challenge",
         action=argparse.BooleanOptionalAction,
@@ -242,6 +243,8 @@ def run_solver(args, mode, lattice, gh):
         command.append("--cuda")
         if args.cuda_visible_devices:
             env_update["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
+    if args.profile:
+        command.append("--profile")
 
     log_file = args.output_dir / "logs" / f"{mode}.log"
     log_file.parent.mkdir(parents=True, exist_ok=True)
