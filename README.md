@@ -45,7 +45,7 @@ BGJ1 path:
 $ ./bgj_epi8 L_100 cuda
 ```
 
-`app/svp_tool` accepts `--cuda` for the BGJ1 phases inside the SVP pump flow.
+`app/svp_tool` accepts `--cuda` for the BGJ sieve phases inside the SVP pump flow.
 That mode is conservative by default: it keeps the CPU bucket density unless a
 bucket target/alpha is explicitly provided, skips CUDA search below the
 configured dot-product threshold, and disables CUDA candidate materialization
@@ -54,6 +54,15 @@ materialization overheads that make low-dimensional pump stages slower than the
 CPU path.
 `app/svp_solver` also accepts `--cuda`; it enables the same
 `BGJ_SVP_CUDA=1` hook used by the solver internals.
+For BGJ2, CUDA search is enabled only for the first-level reuse buckets by
+default. The second-level subbucket search remains on CPU unless
+`BGJ_CUDA_BGJ2_SEARCH1=1` is set, because the current kernel launch and packing
+costs are slower than CPU search for those smaller buckets on the SVP-100
+profiled path. `BGJ_CUDA_BGJ2_SEARCH=0` disables BGJ2 search offload,
+`BGJ_CUDA_BGJ2_SEARCH0=0` disables only the first-level reuse buckets, and
+`BGJ_CUDA_BGJ2_MIN_DOTS` sets the BGJ2-only search threshold. BGJ2-only search
+batching can be tested with `BGJ_CUDA_BGJ2_BATCH=1` or
+`BGJ_CUDA_BGJ2_BATCH_SIZE=<n>` without changing the BGJ1 batch setting.
 
 For reproducible CUDA/BGJ profiling, pass a fixed sampler seed as the fifth
 positional argument, with `-s/--seed`, or with `BGJ_SEED`:

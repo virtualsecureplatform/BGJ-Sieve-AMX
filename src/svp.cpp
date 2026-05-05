@@ -35,6 +35,14 @@ static int svp_bgj1_sieve(Pool_epi8_t<nb> &p, long log_level, long lps_auto_adj)
     return p.bgj1_Sieve(log_level, lps_auto_adj);
 }
 
+template <uint32_t nb>
+static int svp_bgj2_sieve(Pool_epi8_t<nb> &p, long log_level, long lps_auto_adj) {
+#if defined(HAVE_CUDA)
+    if (svp_cuda_bgj1_enabled()) return p.bgj2_Sieve_cuda(log_level, lps_auto_adj);
+#endif
+    return p.bgj2_Sieve(log_level, lps_auto_adj);
+}
+
 static int svp_pump_profile_enabled()
 {
     const char *env = std::getenv("BGJ_PUMP_PROFILE");
@@ -330,7 +338,7 @@ void __pump_red_epi8(Lattice_QP *L, long num_threads, double eta, long msd, long
                         SVP_PROFILE_ASSIGN(profile_sieve_bgj3, ret, p.bgj3_Sieve(log_level-3, 1));              \
                         profile_bgj3_count++;                                                                   \
                     } else if (p.CSD > 80) {                                                                    \
-                        SVP_PROFILE_ASSIGN(profile_sieve_bgj2, ret, p.bgj2_Sieve(log_level-3, 1));              \
+                        SVP_PROFILE_ASSIGN(profile_sieve_bgj2, ret, svp_bgj2_sieve(p, log_level-3, 1));         \
                         profile_bgj2_count++;                                                                   \
                     } else {                                                                                    \
                         SVP_PROFILE_ASSIGN(profile_sieve_bgj1, ret, svp_bgj1_sieve(p, log_level-3, 1));         \
@@ -374,7 +382,7 @@ void __pump_red_epi8(Lattice_QP *L, long num_threads, double eta, long msd, long
                             SVP_PROFILE_ASSIGN(profile_sieve_bgj3, ret, p.bgj3_Sieve(log_level-3, 1));          \
                             profile_bgj3_count++;                                                               \
                         } else if (p.CSD > 90) {                                                                \
-                            SVP_PROFILE_ASSIGN(profile_sieve_bgj2, ret, p.bgj2_Sieve(log_level-3, 1));          \
+                            SVP_PROFILE_ASSIGN(profile_sieve_bgj2, ret, svp_bgj2_sieve(p, log_level-3, 1));     \
                             profile_bgj2_count++;                                                               \
                         } else {                                                                                \
                             SVP_PROFILE_ASSIGN(profile_sieve_bgj1, ret, svp_bgj1_sieve(p, log_level-3, 1));     \
@@ -513,7 +521,7 @@ void __lsh_pump_red_epi8(Lattice_QP *L, long num_threads, double eta, double qra
                     if (p.CSD > 92) {                                                                           \
                         ret = p.bgj3_Sieve(log_level-3, 1);                                                     \
                     } else if (p.CSD > 80) {                                                                    \
-                        ret = p.bgj2_Sieve(log_level-3, 1);                                                     \
+                        ret = svp_bgj2_sieve(p, log_level-3, 1);                                                \
                     } else {                                                                                    \
                         ret = svp_bgj1_sieve(p, log_level-3, 1); \
                     }                                                                                           \
@@ -552,7 +560,7 @@ void __lsh_pump_red_epi8(Lattice_QP *L, long num_threads, double eta, double qra
                         if (p.CSD > 102) {                                                                       \
                             ret = p.bgj3_Sieve(log_level-3, 1);                                                 \
                         } else if (p.CSD > 90) {                                                                \
-                            ret = p.bgj2_Sieve(log_level-3, 1);                                                 \
+                            ret = svp_bgj2_sieve(p, log_level-3, 1);                                            \
                         } else {                                                                                \
                             ret = svp_bgj1_sieve(p, log_level-3, 1); \
                         }                                                                                       \
@@ -654,7 +662,7 @@ void __last_lsh_pump_epi8(Lattice_QP *L, long num_threads, double qratio, double
                 if (p.CSD > 92) {                                                                           \
                     ret = p.bgj3_Sieve(log_level-3, 1);                                                     \
                 } else if (p.CSD > 80) {                                                                    \
-                    ret = p.bgj2_Sieve(log_level-3, 1);                                                     \
+                    ret = svp_bgj2_sieve(p, log_level-3, 1);                                                \
                 } else {                                                                                    \
                     ret = svp_bgj1_sieve(p, log_level-3, 1); \
                 }                                                                                           \
@@ -1135,7 +1143,7 @@ void __hkz_red_epi8(Lattice_QP *L, long num_threads, long log_level) {
             if (p.CSD > 92) {                                                                           \
                 p.bgj3_Sieve(log_level-3, 1);                                                           \
             } else if (p.CSD > 80) {                                                                    \
-                p.bgj2_Sieve(log_level-3, 1);                                                           \
+                svp_bgj2_sieve(p, log_level-3, 1);                                                       \
             } else {                                                                                    \
                 svp_bgj1_sieve(p, log_level-3, 1); \
             }                                                                                           \
@@ -1149,7 +1157,7 @@ void __hkz_red_epi8(Lattice_QP *L, long num_threads, long log_level) {
             if (p.CSD > 92) {                                                                           \
                 p.bgj3_Sieve(log_level-3, 1);                                                           \
             } else if (p.CSD > 80) {                                                                    \
-                p.bgj2_Sieve(log_level-3, 1);                                                           \
+                svp_bgj2_sieve(p, log_level-3, 1);                                                       \
             } else {                                                                                    \
                 svp_bgj1_sieve(p, log_level-3, 1); \
             }                                                                                           \

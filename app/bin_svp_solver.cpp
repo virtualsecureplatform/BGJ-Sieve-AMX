@@ -287,7 +287,7 @@ int show_help(int argc, char** argv) {
     printf("   -s, --seed          sampler seed\n");
     printf("   -t, --threads       number of CPU threads\n");
     printf("   -g, --goal          print possible sol only below this length\n");
-    printf("   -cuda, --cuda       use CUDA-assisted BGJ1 phases\n");
+    printf("   -cuda, --cuda       use CUDA-assisted BGJ sieve phases\n");
     printf("   -profile, --profile print coarse stage timings\n");
     printf("Supported algorithms:\n");
     printf( "   SVPALGO_NULL        0\n"

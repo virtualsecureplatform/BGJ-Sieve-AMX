@@ -479,6 +479,9 @@ struct Pool_epi8_t {
         int bgj1_Sieve_cuda(long log_level = 0, long lps_auto_adj = 1);
         #endif
         int bgj2_Sieve(long log_level = 0, long lps_auto_adj = 1);
+        #if defined(HAVE_CUDA)
+        int bgj2_Sieve_cuda(long log_level = 0, long lps_auto_adj = 1);
+        #endif
         int bgj3_Sieve(long log_level = 0, long lps_auto_adj = 1);
         #if defined(__AMX_INT8__)
         int bgj3_Sieve_amx(long log_level = 0, long max_epoch = -1, double goal_norm_scale = -1.0, long ESD = -1, double prefer_deep = -1.0);
