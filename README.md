@@ -115,6 +115,13 @@ challenge runs. Set `BGJ_CUDA_BATCH=1` to enable batching,
 `BGJ_CUDA_BATCH_MIN_DOTS=<n>` to tune the size threshold. With BGJ log level
 `2` or higher, the BGJ1 profile prints CUDA single-bucket, batched, cred, and
 fallback bucket counts, dot counts, and timings.
+The `app/bgj_epi8 ... cuda` entry point now follows the stronger CPU `bgjf`
+progression: CUDA BGJ1 for the initial and low-dimensional stages, then the
+existing CPU BGJ2/BGJ3 stages above the same thresholds as `bgjf`. The old
+BGJ1-only CUDA path is still available as `bgj1-cuda`; the benchmark harness
+selects it with modes prefixed by `cuda-bgj1`. The hybrid path keeps CUDA
+candidate materialization enabled for BGJ2/BGJ3 inserts, but their searches are
+still CPU-side.
 Do not enable search batching by default without rebenchmarking: a May 2026
 A100/GPU1 SVP100 seed-42 challenge run with a 600s timeout regressed from
 `281.15s` total / `102.80s` search in the default single-bucket mode to
@@ -150,14 +157,22 @@ the scalar A100 implementation avoids the CPU sort but also skips the Tensor
 Core search kernels.
 The benchmark harness also accepts modes such as `cuda-maxres1048576` and
 `cuda-maxres4194304` and can record final vector quality with `--print-quality`.
-On the SVP-100 seed-0 challenge lattice preprocessed by `app/lattice_preprocess`
-and run on A100/GPU1 with seed 42 and a 600s per-mode timeout,
-`cuda-maxres1048576` took `214.67s` and reported Euclidean norm `2860.50415`
-with approximation factor `1.12639278`; `cuda-maxres4194304` took `239.46s`
-with norm `2895.50548` and factor `1.14017540`; the previous uncapped default
-took `297.26s` with norm `2866.45583` and factor `1.12873640`. The challenge
-bound for that run is `1.05 * GH = 2666.50267`, so none of these app-level
-SVP-100 runs is a valid SVP challenge solution yet.
+Before the hybrid `bgjf` CUDA entry point, the BGJ1-only SVP-100 seed-0
+challenge lattice preprocessed by `app/lattice_preprocess` and run on A100/GPU1
+with seed 42 and a 600s per-mode timeout had these results:
+`cuda-bgj1-maxres1048576` took `214.67s` and reported Euclidean norm
+`2860.50415` with approximation factor `1.12639278`;
+`cuda-bgj1-maxres4194304` took `239.46s` with norm `2895.50548` and factor
+`1.14017540`; the previous uncapped BGJ1-only default took `297.26s` with norm
+`2866.45583` and factor `1.12873640`. The challenge bound for that run is
+`1.05 * GH = 2666.50267`, so none of those app-level SVP-100 BGJ1-only runs is
+a valid SVP challenge solution yet. On smaller seed-0 challenge cases, the
+hybrid `cuda` schedule did not improve final quality over `cuda-bgj1`: dim 82
+found norm `2302.66823` with factor `0.995665088` in `17.63s` versus `11.15s`
+for BGJ1-only, and dim 92 found norm `2440.24364` with factor `0.996808924` in
+`226.81s` versus `55.91s` for BGJ1-only. This suggests BGJ2/BGJ3 search
+offload should be justified on harder cases where the stronger schedule changes
+quality, not by these small passing instances.
 CUDA BGJ1 enables the CUDA candidate materializer by default. It chunks
 solution records, uses signed INT8 cuBLAS GEMM for coefficient reconstruction,
 and defaults to the exact CUDA reconstruction kernel on A100. It keeps the

@@ -487,6 +487,7 @@ struct Pool_epi8_t {
         int left_progressive_bgjfsieve(long ind_l, long ind_r, long num_threads, long log_level, long ssd = 45);
         int left_progressive_bgj1sieve(long ind_l, long ind_r, long num_threads, long log_level);
         #if defined(HAVE_CUDA)
+        int left_progressive_bgjfsieve_cuda(long ind_l, long ind_r, long num_threads, long log_level, long ssd = 45);
         int left_progressive_bgj1sieve_cuda(long ind_l, long ind_r, long num_threads, long log_level);
         #endif
         int left_progressive_bgj2sieve(long ind_l, long ind_r, long num_threads, long log_level);

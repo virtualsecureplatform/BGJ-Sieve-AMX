@@ -26,7 +26,12 @@ int main(int argc, char** argv) {
                 if (!strcasecmp(argv[i+1], "bgj2")) algo = 2;
                 if (!strcasecmp(argv[i+1], "bgj3")) algo = 3;
                 #if defined(HAVE_CUDA)
-                if (!strcasecmp(argv[i+1], "cuda") || !strcasecmp(argv[i+1], "bgj1-cuda")) algo = 7;
+                if (!strcasecmp(argv[i+1], "cuda") ||
+                    !strcasecmp(argv[i+1], "bgjf-cuda") ||
+                    !strcasecmp(argv[i+1], "cuda-bgjf") ||
+                    !strcasecmp(argv[i+1], "cuda-f")) algo = 7;
+                if (!strcasecmp(argv[i+1], "bgj1-cuda") ||
+                    !strcasecmp(argv[i+1], "cuda-bgj1")) algo = 8;
                 #endif
                 #if defined(__AMX_INT8__)
                 if (!strcasecmp(argv[i+1], "amx")) algo = 9;
@@ -51,11 +56,11 @@ int main(int argc, char** argv) {
     }
     if (argc < 2 || help) {
         #if defined(__AMX_INT8__) && defined(HAVE_CUDA)
-        printf("Usage: %s <lattice_file> [bgjf|bgj1|bgj2|bgj3|cuda|amx] [num_threads] [log_level] [seed] [-p|--print|--print-final]\n", argv[0]);
+        printf("Usage: %s <lattice_file> [bgjf|bgj1|bgj2|bgj3|cuda|bgj1-cuda|amx] [num_threads] [log_level] [seed] [-p|--print|--print-final]\n", argv[0]);
         #elif defined(__AMX_INT8__)
         printf("Usage: %s <lattice_file> [bgjf|bgj1|bgj2|bgj3|amx] [num_threads] [log_level] [seed] [-p|--print|--print-final]\n", argv[0]);
         #elif defined(HAVE_CUDA)
-        printf("Usage: %s <lattice_file> [bgjf|bgj1|bgj2|bgj3|cuda] [num_threads] [log_level] [seed] [-p|--print|--print-final]\n", argv[0]);
+        printf("Usage: %s <lattice_file> [bgjf|bgj1|bgj2|bgj3|cuda|bgj1-cuda] [num_threads] [log_level] [seed] [-p|--print|--print-final]\n", argv[0]);
         #else
         printf("Usage: %s <lattice_file> [bgjf|bgj1|bgj2|bgj3] [num_threads] [log_level] [seed] [-p|--print|--print-final]\n", argv[0]);
         #endif
@@ -69,7 +74,12 @@ int main(int argc, char** argv) {
             if (!strcasecmp(argv[2], "bgj2")) algo = 2;
             if (!strcasecmp(argv[2], "bgj3")) algo = 3;
             #if defined(HAVE_CUDA)
-            if (!strcasecmp(argv[2], "cuda") || !strcasecmp(argv[2], "bgj1-cuda")) algo = 7;
+            if (!strcasecmp(argv[2], "cuda") ||
+                !strcasecmp(argv[2], "bgjf-cuda") ||
+                !strcasecmp(argv[2], "cuda-bgjf") ||
+                !strcasecmp(argv[2], "cuda-f")) algo = 7;
+            if (!strcasecmp(argv[2], "bgj1-cuda") ||
+                !strcasecmp(argv[2], "cuda-bgj1")) algo = 8;
             #endif
             #if defined(__AMX_INT8__)
             if (!strcasecmp(argv[2], "amx")) algo = 9;
@@ -175,6 +185,13 @@ int main(int argc, char** argv) {
     } else if (algo == 3) {
         RUN_EPI8_PROGRESSIVE(left_progressive_bgj3sieve);
     } else if (algo == 7) {
+        #if defined(HAVE_CUDA)
+        RUN_EPI8_PROGRESSIVE(left_progressive_bgjfsieve_cuda);
+        #else
+        fprintf(stderr, "Error: CUDA support is not compiled in. Rebuild with `make CUDA=1`.\n");
+        return 1;
+        #endif
+    } else if (algo == 8) {
         #if defined(HAVE_CUDA)
         RUN_EPI8_PROGRESSIVE(left_progressive_bgj1sieve_cuda);
         #else

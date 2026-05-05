@@ -20,12 +20,22 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SVPCHALLENGE_DIR = ROOT.parent / "G6K-GPU-Tensor" / "svpchallenge"
 SVPCHALLENGE_URL = "https://www.latticechallenge.org/svp-challenge/generator.php"
 
-BEGIN_RE = re.compile(r"begin bgj1 sieve, sieving dimension = (\d+), pool size = (\d+)")
+BEGIN_RE = re.compile(r"begin bgj\d+ sieve, sieving dimension = (\d+), pool size = (\d+)")
 SOL_RE = re.compile(r"solution collect done, found (\d+) solutions in (\d+) buckets")
 TIMING_RE = re.compile(
     r"^bucket time = ([0-9.]+)s, search time = ([0-9.]+)s, "
     r"sort time = ([0-9.]+)s, insert time = ([0-9.]+)s"
 )
+BGJ2_TIMING_RE = re.compile(
+    r"^bucket-0 time = ([0-9.]+)s, bucket-1 time = ([0-9.]+)s, "
+    r"search-0 time = ([0-9.]+)s, search-1 time = ([0-9.]+)s"
+)
+BGJ3_TIMING_RE = re.compile(
+    r"^bucket-0 time = ([0-9.]+)s, bucket-1 time = ([0-9.]+)s, "
+    r"bucket-2 time = ([0-9.]+)s, search-0 time = ([0-9.]+)s, "
+    r"search-1 time = ([0-9.]+)s, search-2 time = ([0-9.]+)s"
+)
+SORT_INSERT_RE = re.compile(r"^sort time = ([0-9.]+)s, insert time = ([0-9.]+)s")
 CUDA_RE = re.compile(
     r"cuda search0: single=(\d+) buckets/(\d+) dp in ([0-9.]+)s, "
     r"batch=(\d+) calls/(\d+) buckets/(\d+) dp in ([0-9.]+)s, "
@@ -334,6 +344,8 @@ def mode_command(app, lattice, mode, threads, log_level, seed):
 
     if mode == "cpu":
         algo = "bgj1"
+    elif mode.startswith("cuda-bgj1"):
+        algo = "bgj1-cuda"
     elif not mode.startswith("cuda"):
         raise ValueError(f"unknown mode: {mode}")
 
@@ -470,6 +482,24 @@ def parse_app_output(output):
             stats["search_time_sec"] += float(timing.group(2))
             stats["sort_time_sec"] += float(timing.group(3))
             stats["insert_time_sec"] += float(timing.group(4))
+            continue
+
+        bgj3_timing = BGJ3_TIMING_RE.search(line)
+        if bgj3_timing:
+            stats["bucket_time_sec"] += sum(float(bgj3_timing.group(i)) for i in range(1, 4))
+            stats["search_time_sec"] += sum(float(bgj3_timing.group(i)) for i in range(4, 7))
+            continue
+
+        bgj2_timing = BGJ2_TIMING_RE.search(line)
+        if bgj2_timing:
+            stats["bucket_time_sec"] += float(bgj2_timing.group(1)) + float(bgj2_timing.group(2))
+            stats["search_time_sec"] += float(bgj2_timing.group(3)) + float(bgj2_timing.group(4))
+            continue
+
+        sort_insert = SORT_INSERT_RE.search(line)
+        if sort_insert:
+            stats["sort_time_sec"] += float(sort_insert.group(1))
+            stats["insert_time_sec"] += float(sort_insert.group(2))
             continue
 
         cuda = CUDA_RE.search(line)
