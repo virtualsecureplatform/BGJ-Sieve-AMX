@@ -35,6 +35,39 @@ static int svp_bgj1_sieve(Pool_epi8_t<nb> &p, long log_level, long lps_auto_adj)
     return p.bgj1_Sieve(log_level, lps_auto_adj);
 }
 
+static int svp_pump_profile_enabled()
+{
+    const char *env = std::getenv("BGJ_PUMP_PROFILE");
+    return env && env[0] && env[0] != '0';
+}
+
+static double svp_profile_now()
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec + (double)tv.tv_usec / 1000000.0;
+}
+
+#define SVP_PROFILE_DO(acc, stmt) do {                             \
+        if (pump_profile) {                                        \
+            double __svp_profile_t0 = svp_profile_now();           \
+            stmt;                                                  \
+            acc += svp_profile_now() - __svp_profile_t0;           \
+        } else {                                                   \
+            stmt;                                                  \
+        }                                                          \
+    } while (0)
+
+#define SVP_PROFILE_ASSIGN(acc, lhs, expr) do {                    \
+        if (pump_profile) {                                        \
+            double __svp_profile_t0 = svp_profile_now();           \
+            lhs = (expr);                                          \
+            acc += svp_profile_now() - __svp_profile_t0;           \
+        } else {                                                   \
+            lhs = (expr);                                          \
+        }                                                          \
+    } while (0)
+
 
 /** svp kernel based on 3-Sieve.
  *  \param msd maximal sieving dimension
@@ -218,7 +251,29 @@ void __pump_red_epi8(Lattice_QP *L, long num_threads, double eta, long msd, long
     ne = max(0, ne);
 
     constexpr double pool_size_ratio = 3.2;
-    
+
+    const int pump_profile = svp_pump_profile_enabled();
+    static long pump_profile_seq = 0;
+    const long profile_seq = pump_profile ? ++pump_profile_seq : 0;
+    const int profile_cuda_bgj1 = svp_cuda_bgj1_enabled();
+    const double profile_total_start = pump_profile ? svp_profile_now() : 0.0;
+    double profile_shuffle_gso = 0.0;
+    double profile_pool_setup = 0.0;
+    double profile_sampling = 0.0;
+    double profile_extend = 0.0;
+    double profile_sieve_bgj1 = 0.0;
+    double profile_sieve_bgj2 = 0.0;
+    double profile_sieve_bgj3 = 0.0;
+    double profile_insert = 0.0;
+    double profile_tail_lll = 0.0;
+    double profile_shrink = 0.0;
+    double profile_final_lll = 0.0;
+    long profile_bgj1_count = 0;
+    long profile_bgj2_count = 0;
+    long profile_bgj3_count = 0;
+    long profile_insert_count = 0;
+    long profile_tail_lll_count = 0;
+    const long profile_orig_minsd = minsd;
 
     bool GET_STUCKED = shuffle_first;
     long num_stuck = 0;
@@ -226,9 +281,17 @@ void __pump_red_epi8(Lattice_QP *L, long num_threads, double eta, long msd, long
         if (GET_STUCKED) {
             if (num_stuck == 0 || num_stuck == 3) {
                 long shuf_dim = (n > 90) ? (0.6 * n + 14) : (n - 22);
-                L->tail_shuffle(shuf_dim);
-                L->compute_gso_QP(n-shuf_dim);
-                L->set_gso_status(GSO_COMPUTED_QP);
+                if (pump_profile) {
+                    double __svp_profile_t0 = svp_profile_now();
+                    L->tail_shuffle(shuf_dim);
+                    L->compute_gso_QP(n-shuf_dim);
+                    L->set_gso_status(GSO_COMPUTED_QP);
+                    profile_shuffle_gso += svp_profile_now() - __svp_profile_t0;
+                } else {
+                    L->tail_shuffle(shuf_dim);
+                    L->compute_gso_QP(n-shuf_dim);
+                    L->set_gso_status(GSO_COMPUTED_QP);
+                }
                 if (num_stuck == 3) {
                     fprintf(stderr, "[Warning] __pump_red_epi8: get stucked, try again after shuffle.\n");
                 }
@@ -245,24 +308,33 @@ void __pump_red_epi8(Lattice_QP *L, long num_threads, double eta, long msd, long
             Pool_epi8_t<3> p(L);
             p.set_num_threads(num_threads);
             #define __PUMP_RED_EPI8_ONE_TRY do {                                                                \
+                double __svp_profile_t0 = pump_profile ? svp_profile_now() : 0.0;                                \
                 long minps = (long)(pow(4./3., minsd * 0.5) * pool_size_ratio);                                 \
                 minps *= 3;                                                                                     \
                 p.set_max_pool_size((max_pool_size > minps) ? max_pool_size : minps);                           \
                 p.set_sieving_context(n-minsd, n);                                                              \
-                if (p.sampling(minps) == -1) return;                                                            \
+                if (pump_profile) profile_pool_setup += svp_profile_now() - __svp_profile_t0;                    \
+                int __svp_sampling_ret = 0;                                                                      \
+                SVP_PROFILE_ASSIGN(profile_sampling, __svp_sampling_ret, p.sampling(minps));                     \
+                if (__svp_sampling_ret == -1) return;                                                           \
                                                                                                                 \
-                int ret = svp_bgj1_sieve(p, log_level - 3, 1); \
+                int ret = 0;                                                                                    \
+                SVP_PROFILE_ASSIGN(profile_sieve_bgj1, ret, svp_bgj1_sieve(p, log_level - 3, 1));               \
+                profile_bgj1_count++;                                                                           \
                 num_stuck = ret;                                                                                \
                 while ((p.CSD < msd) && (p.CSD < n)) {                                                          \
-                    p.extend_left();                                                                            \
+                    SVP_PROFILE_DO(profile_extend, p.extend_left());                                             \
                     long target_num_vec = (long) (pow(4./3., p.CSD * 0.5) * pool_size_ratio);                   \
                     if (target_num_vec > p.num_vec + p.num_empty) p.num_empty = target_num_vec - p.num_vec;     \
                     if (p.CSD > 92) {                                                                           \
-                        ret = p.bgj3_Sieve(log_level-3, 1);                                                     \
+                        SVP_PROFILE_ASSIGN(profile_sieve_bgj3, ret, p.bgj3_Sieve(log_level-3, 1));              \
+                        profile_bgj3_count++;                                                                   \
                     } else if (p.CSD > 80) {                                                                    \
-                        ret = p.bgj2_Sieve(log_level-3, 1);                                                     \
+                        SVP_PROFILE_ASSIGN(profile_sieve_bgj2, ret, p.bgj2_Sieve(log_level-3, 1));              \
+                        profile_bgj2_count++;                                                                   \
                     } else {                                                                                    \
-                        ret = svp_bgj1_sieve(p, log_level-3, 1); \
+                        SVP_PROFILE_ASSIGN(profile_sieve_bgj1, ret, svp_bgj1_sieve(p, log_level-3, 1));         \
+                        profile_bgj1_count++;                                                                   \
                     }                                                                                           \
                     if (ret) {                                                                                  \
                         num_stuck++;                                                                            \
@@ -273,14 +345,16 @@ void __pump_red_epi8(Lattice_QP *L, long num_threads, double eta, long msd, long
                                                                                                                 \
                 long ind = max(p.index_l - f, 0);                                                               \
                 while ((ind < n - minsd) && (!GET_STUCKED)) {                                                   \
-                    p.insert(ind, eta);                                                                         \
+                    SVP_PROFILE_DO(profile_insert, p.insert(ind, eta));                                         \
+                    profile_insert_count++;                                                                     \
                     int tlll_dim = 32;                                                                          \
                     for (long i = 32; i < p.CSD - 1; i++) {                                                     \
                         if (L->get_B().hi[p.CSD-i+p.index_l] <  0.49 * L->get_B().hi[p.CSD-i-1+p.index_l]) {    \
                             tlll_dim = i;                                                                       \
                         }                                                                                       \
                     }                                                                                           \
-                    p.tail_LLL(0.99, p.CSD);                                                                 \
+                    SVP_PROFILE_DO(profile_tail_lll, p.tail_LLL(0.99, p.CSD));                                  \
+                    profile_tail_lll_count++;                                                                   \
                                                                                                                 \
                     ni--;                                                                                       \
                     if (ni <= 0) break;                                                                         \
@@ -288,20 +362,23 @@ void __pump_red_epi8(Lattice_QP *L, long num_threads, double eta, long msd, long
                                                                                                                 \
                     if (ne > 0) {                                                                               \
                         ne--;                                                                                   \
-                        p.extend_left();                                                                        \
+                        SVP_PROFILE_DO(profile_extend, p.extend_left());                                        \
                         ind--;                                                                                  \
                     }                                                                                           \
                     if (ns > 0) {                                                                               \
                         ns--;                                                                                   \
                         if ((long)(pow(4./3., p.CSD * 0.5) * pool_size_ratio) < p.num_vec) {                    \
-                            p.shrink((long)(pow(4./3., p.CSD * 0.5) * pool_size_ratio));                        \
+                            SVP_PROFILE_DO(profile_shrink, p.shrink((long)(pow(4./3., p.CSD * 0.5) * pool_size_ratio))); \
                         }                                                                                       \
                         if (p.CSD > 102) {                                                                      \
-                            ret = p.bgj3_Sieve(log_level-3, 1);                                                 \
+                            SVP_PROFILE_ASSIGN(profile_sieve_bgj3, ret, p.bgj3_Sieve(log_level-3, 1));          \
+                            profile_bgj3_count++;                                                               \
                         } else if (p.CSD > 90) {                                                                \
-                            ret = p.bgj2_Sieve(log_level-3, 1);                                                 \
+                            SVP_PROFILE_ASSIGN(profile_sieve_bgj2, ret, p.bgj2_Sieve(log_level-3, 1));          \
+                            profile_bgj2_count++;                                                               \
                         } else {                                                                                \
-                            ret = svp_bgj1_sieve(p, log_level-3, 1); \
+                            SVP_PROFILE_ASSIGN(profile_sieve_bgj1, ret, svp_bgj1_sieve(p, log_level-3, 1));     \
+                            profile_bgj1_count++;                                                               \
                         }                                                                                       \
                         if (ret) {                                                                              \
                             num_stuck++;                                                                        \
@@ -340,7 +417,24 @@ void __pump_red_epi8(Lattice_QP *L, long num_threads, double eta, long msd, long
         }
     } while (GET_STUCKED && num_stuck <= 3);
 
-    L->LLL_QP(0.99);
+    SVP_PROFILE_DO(profile_final_lll, L->LLL_QP(0.99));
+    if (pump_profile) {
+        const double profile_total = svp_profile_now() - profile_total_start;
+        fprintf(stdout,
+                "pump_profile: seq=%ld n=%ld msd=%ld f=%ld minsd=%ld cuda_bgj1=%d "
+                "total=%.6fs shuffle_gso=%.6fs setup=%.6fs sampling=%.6fs "
+                "extend=%.6fs bgj1=%.6fs/%ld bgj2=%.6fs/%ld bgj3=%.6fs/%ld "
+                "insert=%.6fs/%ld tail_lll=%.6fs/%ld shrink=%.6fs final_lll=%.6fs\n",
+                profile_seq, n, msd, f, profile_orig_minsd, profile_cuda_bgj1,
+                profile_total, profile_shuffle_gso, profile_pool_setup, profile_sampling,
+                profile_extend, profile_sieve_bgj1, profile_bgj1_count,
+                profile_sieve_bgj2, profile_bgj2_count,
+                profile_sieve_bgj3, profile_bgj3_count,
+                profile_insert, profile_insert_count,
+                profile_tail_lll, profile_tail_lll_count,
+                profile_shrink, profile_final_lll);
+        fflush(stdout);
+    }
     if (log_level < 2) return;
     for (long i = 0; i < n; i++){
         dPot -= (n-i) * log2(L->get_B().hi[i]);

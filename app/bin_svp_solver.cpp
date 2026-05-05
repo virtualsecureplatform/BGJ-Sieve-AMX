@@ -386,6 +386,9 @@ int main(int argc, char** argv) {
         setenv("BGJ_SVP_CUDA", "1", 1);
         #endif
     }
+    if (profile) {
+        setenv("BGJ_PUMP_PROFILE", "1", 1);
+    }
 
     char input[256];
     char output[256];
