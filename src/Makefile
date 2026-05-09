@@ -1,6 +1,6 @@
 OBJ = config.o pool_epi8.o bucket_epi8.o bgj_epi8.o bgj_cuda.o 3Sieve_parallel.o naivedh_epi8.o naivesh_epi8.o fcSieve.o bgj1.o bgjf32.o dual.o
 OBJ += vec.o quad.o utils.o lattice.o lll.o UidHashTable.o pool.o 3Sieve.o svp.o bkz.o sampler.o lsfdh_epi8.o lsfsh_epi8.o
-OBJ += bgj_amx.o bucket_amx.o booster_amx.o
+OBJ += bgj_amx.o bucket_amx.o booster_amx.o fplll_bridge.o
 CXX = clang++
 NVCC ?= nvcc
 CFLAGS = -O3 -g -fopenmp=libomp -march=native -pthread -stdlib=libc++ -Wno-deprecated-declarations
@@ -14,6 +14,8 @@ CUDA ?= 0
 CUDA_PATH ?= /usr/local/cuda
 CUDA_CXX ?= g++
 CUDA_SMS ?= 80
+FPLLL_PREFIX ?= ../dep/fplll/install
+FPLLL ?= $(if $(wildcard $(FPLLL_PREFIX)/include/fplll/fplll.h),1,0)
 
 ifeq ($(ON_CYGWIN), true)
 	CFLAGS += -D__ON_CYGWIN
@@ -36,6 +38,11 @@ ifeq ($(CUDA), 1)
 	CUDA_NVCC_FLAGS += -ccbin $(CUDA_CXX) $(CUDA_FLAGS)
 	CUDA_NVCC_FLAGS += $(foreach sm,$(CUDA_SMS),-gencode arch=compute_$(sm),code=sm_$(sm))
 	CUDA_NVCC_FLAGS += -gencode arch=compute_$(lastword $(CUDA_SMS)),code=compute_$(lastword $(CUDA_SMS))
+endif
+
+ifeq ($(FPLLL), 1)
+	CFLAGS += -DHAVE_FPLLL
+	INC_DIR += -I$(FPLLL_PREFIX)/include
 endif
 
 all: libllib.a

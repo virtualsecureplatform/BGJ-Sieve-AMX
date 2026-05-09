@@ -8,6 +8,8 @@ UID_BACKEND ?= gtl
 CXXSTD ?=
 CUDA ?= 0
 CUDA_PATH ?= /usr/local/cuda
+FPLLL_PREFIX ?= ../dep/fplll/install
+FPLLL ?= $(if $(wildcard $(FPLLL_PREFIX)/include/fplll/fplll.h),1,0)
 
 ON_CYGWIN = false
 
@@ -29,6 +31,12 @@ ifeq ($(CUDA), 1)
 	CFLAGS += -DHAVE_CUDA
 	CUDA_LIBDIR = $(if $(filter x86_64 ppc64le powerpc64le,$(shell uname -m)),lib64,lib)
 	LIBS += -L$(CUDA_PATH)/$(CUDA_LIBDIR) -Wl,-rpath=$(CUDA_PATH)/$(CUDA_LIBDIR) -lcudart -lcublas
+endif
+
+ifeq ($(FPLLL), 1)
+	CFLAGS += -DHAVE_FPLLL
+	INC_DIR += -I$(FPLLL_PREFIX)/include
+	LIBS += -L$(FPLLL_PREFIX)/lib -Wl,-rpath=$(abspath $(FPLLL_PREFIX)/lib) -Wl,-rpath=$(abspath ../dep/gmp/lib) -lfplll -lmpfr
 endif
 
 all: $(BIN)

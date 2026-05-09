@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <sys/time.h>
 
 static int bgj_cuda_requested_flag = 0;
 
@@ -35,12 +37,27 @@ int bgj_cuda_materialize_requested()
     return 0;
 }
 
+int bgj_cuda_cred_transform_requested()
+{
+    return 0;
+}
+
+int bgj_cuda_overlap_cred_requested()
+{
+    return 0;
+}
+
 int bgj_cuda_bucket_requested()
 {
     return 0;
 }
 
 int bgj_cuda_device_count()
+{
+    return 0;
+}
+
+int bgj_cuda_execution_device_count()
 {
     return 0;
 }
@@ -59,7 +76,104 @@ const char *bgj_cuda_last_error()
 #include <algorithm>
 #include <vector>
 
+struct bgj_cuda_host_profile_state_t {
+    pthread_mutex_t lock;
+    int registered;
+    uint64_t buckets;
+    uint64_t results;
+    uint64_t try_add2;
+    uint64_t try_add3;
+    uint64_t succ_add2;
+    uint64_t succ_add3;
+    double sort_sec;
+    double consume_sec;
+
+    bgj_cuda_host_profile_state_t()
+        : lock(PTHREAD_MUTEX_INITIALIZER),
+          registered(0),
+          buckets(0),
+          results(0),
+          try_add2(0),
+          try_add3(0),
+          succ_add2(0),
+          succ_add3(0),
+          sort_sec(0.0),
+          consume_sec(0.0)
+    {
+    }
+};
+
+static bgj_cuda_host_profile_state_t bgj_cuda_host_profile;
+
+static double bgj_cuda_host_wall_time()
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec + (double)tv.tv_usec * 1e-6;
+}
+
+static int bgj_cuda_host_profile_requested()
+{
+    const char *env = getenv("BGJ_CUDA_HOST_PROFILE");
+    return env && env[0] && env[0] != '0';
+}
+
+static void bgj_cuda_host_profile_dump()
+{
+    if (!bgj_cuda_host_profile_requested()) return;
+
+    pthread_mutex_lock(&bgj_cuda_host_profile.lock);
+    fprintf(stderr,
+            "cuda_host_profile: buckets=%lu results=%lu try_add2=%lu try_add3=%lu "
+            "succ_add2=%lu succ_add3=%lu sort=%.6fs consume=%.6fs\n",
+            (unsigned long)bgj_cuda_host_profile.buckets,
+            (unsigned long)bgj_cuda_host_profile.results,
+            (unsigned long)bgj_cuda_host_profile.try_add2,
+            (unsigned long)bgj_cuda_host_profile.try_add3,
+            (unsigned long)bgj_cuda_host_profile.succ_add2,
+            (unsigned long)bgj_cuda_host_profile.succ_add3,
+            bgj_cuda_host_profile.sort_sec,
+            bgj_cuda_host_profile.consume_sec);
+    pthread_mutex_unlock(&bgj_cuda_host_profile.lock);
+}
+
+static void bgj_cuda_host_profile_register()
+{
+    if (!bgj_cuda_host_profile_requested()) return;
+
+    pthread_mutex_lock(&bgj_cuda_host_profile.lock);
+    if (!bgj_cuda_host_profile.registered) {
+        bgj_cuda_host_profile.registered = 1;
+        atexit(bgj_cuda_host_profile_dump);
+    }
+    pthread_mutex_unlock(&bgj_cuda_host_profile.lock);
+}
+
+static void bgj_cuda_host_profile_record(uint32_t result_count,
+                                         uint64_t try_add2,
+                                         uint64_t try_add3,
+                                         uint64_t succ_add2,
+                                         uint64_t succ_add3,
+                                         double sort_sec,
+                                         double consume_sec)
+{
+    if (!bgj_cuda_host_profile_requested()) return;
+    bgj_cuda_host_profile_register();
+
+    pthread_mutex_lock(&bgj_cuda_host_profile.lock);
+    bgj_cuda_host_profile.buckets++;
+    bgj_cuda_host_profile.results += result_count;
+    bgj_cuda_host_profile.try_add2 += try_add2;
+    bgj_cuda_host_profile.try_add3 += try_add3;
+    bgj_cuda_host_profile.succ_add2 += succ_add2;
+    bgj_cuda_host_profile.succ_add3 += succ_add3;
+    bgj_cuda_host_profile.sort_sec += sort_sec;
+    bgj_cuda_host_profile.consume_sec += consume_sec;
+    pthread_mutex_unlock(&bgj_cuda_host_profile.lock);
+}
+
 extern "C" int bgj_cuda_raw_device_count();
+extern "C" int bgj_cuda_raw_execution_device_count();
 extern "C" const char *bgj_cuda_raw_last_error();
 extern "C" int bgj_cuda_search_bucket_raw(const int8_t *p_vecs,
                                            const int8_t *n_vecs,
@@ -73,8 +187,10 @@ extern "C" int bgj_cuda_search_bucket_raw(const int8_t *p_vecs,
                                            uint32_t num_n,
                                            uint32_t vec_length,
                                            int32_t goal_norm,
+                                           uint32_t center_id,
                                            int32_t center_norm,
                                            int record_dp,
+                                           int transform_dp,
                                            bgj_cuda_result_t *results,
                                            uint32_t result_capacity,
                                            uint32_t *result_count,
@@ -92,12 +208,44 @@ extern "C" int bgj_cuda_search_bucket_pool_raw(const int8_t *pool_vecs,
                                                 uint32_t num_n,
                                                 uint32_t vec_length,
                                                 int32_t goal_norm,
+                                                uint32_t center_id,
                                                 int32_t center_norm,
                                                 int record_dp,
+                                                int transform_dp,
                                                 bgj_cuda_result_t *results,
                                                 uint32_t result_capacity,
                                                 uint32_t *result_count,
                                                 int *overflow);
+extern "C" int bgj_cuda_search_bucket_pool_raw_submit_async(const int8_t *pool_vecs,
+                                                            uint64_t pool_epoch,
+                                                            uint32_t pool_size,
+                                                            const uint32_t *p_ids,
+                                                            const uint32_t *n_ids,
+                                                            const int32_t *p_norm,
+                                                            const int32_t *n_norm,
+                                                            const int32_t *p_dot,
+                                                            const int32_t *n_dot,
+                                                            uint32_t num_p,
+                                                            uint32_t num_n,
+                                                            uint32_t vec_length,
+                                                            int32_t goal_norm,
+                                                            uint32_t center_id,
+                                                            int32_t center_norm,
+                                                            int record_dp,
+                                                            int transform_dp,
+                                                            int device_transform_dp,
+                                                            int raw_center_dp,
+                                                            int record_dot_copy_event,
+                                                            uint32_t result_capacity,
+                                                            uint32_t *submitted_result_count,
+                                                            int *submitted_overflow);
+extern "C" int bgj_cuda_search_bucket_raw_wait_dot_copy_async();
+extern "C" int bgj_cuda_search_bucket_raw_finish_async(bgj_cuda_result_t *results,
+                                                       uint32_t result_capacity,
+                                                       uint32_t *submitted_result_count,
+                                                       int *submitted_overflow,
+                                                       uint32_t *result_count,
+                                                       int *overflow);
 extern "C" int bgj_cuda_search_bucket_pool_batch_raw(const int8_t *pool_vecs,
                                                       uint64_t pool_epoch,
                                                       uint32_t pool_size,
@@ -112,8 +260,10 @@ extern "C" int bgj_cuda_search_bucket_pool_batch_raw(const int8_t *pool_vecs,
                                                       uint32_t batch_size,
                                                       uint32_t vec_length,
                                                       const int32_t *goal_norm,
+                                                      const uint32_t *center_id,
                                                       const int32_t *center_norm,
                                                       int record_dp,
+                                                      int transform_dp,
                                                       bgj_cuda_result_t *const *results,
                                                       const uint32_t *result_capacity,
                                                       uint32_t *result_count,
@@ -124,6 +274,11 @@ int bgj_cuda_device_count()
     static int count = -1;
     if (count < 0) count = bgj_cuda_raw_device_count();
     return count;
+}
+
+int bgj_cuda_execution_device_count()
+{
+    return bgj_cuda_raw_execution_device_count();
 }
 
 const char *bgj_cuda_last_error()
@@ -207,6 +362,20 @@ uint64_t bgj_cuda_batch_min_dots()
     return 128ULL * 1024ULL;
 }
 
+int bgj_cuda_cred_transform_requested()
+{
+    const char *env = getenv("BGJ_CUDA_CRED");
+    if (env && env[0]) return env[0] != '0';
+    return 0;
+}
+
+int bgj_cuda_overlap_cred_requested()
+{
+    const char *env = getenv("BGJ_CUDA_OVERLAP_CRED");
+    if (env && env[0]) return env[0] != '0';
+    return 1;
+}
+
 static int bgj_cuda_rank_of(const std::vector<int32_t> &rank,
                             const std::vector<uint32_t> &stamp,
                             uint32_t epoch,
@@ -283,10 +452,13 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
                                          bgj_cuda_result_t *results,
                                          uint32_t result_count)
 {
+    const double consume_t0 = bgj_cuda_host_wall_time();
+    double sort_sec = 0.0;
     const uint32_t num_p = (uint32_t)bkt->num_pvec;
     const uint32_t num_n = (uint32_t)bkt->num_nvec;
 
     if (result_count > 1 && bgj_cuda_sort_results_requested()) {
+        const double sort_t0 = bgj_cuda_host_wall_time();
         static thread_local std::vector<int32_t> p_rank;
         static thread_local std::vector<int32_t> n_rank;
         static thread_local std::vector<uint32_t> p_rank_stamp;
@@ -338,6 +510,7 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
                       if (a.x != b.x) return a.x < b.x;
                       return a.y < b.y;
                   });
+        sort_sec = bgj_cuda_host_wall_time() - sort_t0;
     }
 
     uint64_t try_add2 = 0;
@@ -408,6 +581,13 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
         pthread_spin_unlock(&prof->profile_lock);
     }
 
+    bgj_cuda_host_profile_record(result_count,
+                                 try_add2,
+                                 try_add3,
+                                 succ_add2,
+                                 succ_add3,
+                                 sort_sec,
+                                 bgj_cuda_host_wall_time() - consume_t0);
     return 1;
 }
 
@@ -464,6 +644,7 @@ int Pool_epi8_t<nb>::_search_bgj1_cuda(bucket_epi8_t<record_dp> *bkt,
 
     uint32_t result_count = 0;
     int overflow = 0;
+    const int transform_dp = record_dp && bgj_cuda_cred_transform_requested();
     const int ok = use_pool_cache ?
                    bgj_cuda_search_bucket_pool_raw(vec,
                                                    pool_epoch,
@@ -478,8 +659,10 @@ int Pool_epi8_t<nb>::_search_bgj1_cuda(bucket_epi8_t<record_dp> *bkt,
                                                    num_n,
                                                    (uint32_t)vec_length,
                                                    goal_norm,
+                                                   bkt->center_ind,
                                                    bkt->center_norm,
                                                    record_dp ? 1 : 0,
+                                                   transform_dp,
                                                    results,
                                                    result_capacity,
                                                    &result_count,
@@ -496,8 +679,10 @@ int Pool_epi8_t<nb>::_search_bgj1_cuda(bucket_epi8_t<record_dp> *bkt,
                                               num_n,
                                               (uint32_t)vec_length,
                                               goal_norm,
+                                              bkt->center_ind,
                                               bkt->center_norm,
                                               record_dp ? 1 : 0,
+                                              transform_dp,
                                               results,
                                               result_capacity,
                                               &result_count,
@@ -506,6 +691,94 @@ int Pool_epi8_t<nb>::_search_bgj1_cuda(bucket_epi8_t<record_dp> *bkt,
     if (!ok || (overflow && bgj_cuda_overflow_fallback_requested())) {
         return 0;
     }
+
+    return bgj_cuda_consume_bgj1_results<nb, record_dp, profiling>(this,
+                                                                    bkt,
+                                                                    sol,
+                                                                    prof,
+                                                                    results,
+                                                                    result_count);
+}
+
+template <uint32_t nb>
+template <bool record_dp, bool profiling>
+int Pool_epi8_t<nb>::_search_bgj1_cuda_overlap(bucket_epi8_t<record_dp> *bkt,
+                                               sol_list_epi8_t *sol,
+                                               int32_t goal_norm,
+                                               bgj_profile_data_t<nb> *prof)
+{
+    if (!record_dp) return _search_bgj1_cuda<record_dp, profiling>(bkt, sol, goal_norm, prof);
+    if (bkt->num_pvec < 0 || bkt->num_nvec < 0) return 0;
+
+    const uint32_t num_p = (uint32_t)bkt->num_pvec;
+    const uint32_t num_n = (uint32_t)bkt->num_nvec;
+    if (num_p + num_n == 0) {
+        _search_cred<record_dp, profiling>(bkt, sol, goal_norm, prof);
+        return 1;
+    }
+
+    const int can_submit = bgj_cuda_device_count() > 0 &&
+                           bgj_cuda_pool_cache_requested() &&
+                           !bgj_cuda_cred_transform_requested() &&
+                           num_vec >= 0 &&
+                           num_vec <= 0xffffffffL &&
+                           bkt->num_pvec <= 0xffffffffL &&
+                           bkt->num_nvec <= 0xffffffffL;
+    if (!can_submit) {
+        _search_cred<record_dp, profiling>(bkt, sol, goal_norm, prof);
+        return 0;
+    }
+
+    const uint32_t result_capacity = bgj_cuda_max_results();
+    static thread_local std::vector<bgj_cuda_result_t> result_storage;
+
+    try {
+        result_storage.resize((size_t)result_capacity);
+    } catch (...) {
+        _search_cred<record_dp, profiling>(bkt, sol, goal_norm, prof);
+        return 0;
+    }
+
+    uint32_t submitted_result_count = 0;
+    int submitted_overflow = 0;
+    const int submitted = bgj_cuda_search_bucket_pool_raw_submit_async(vec,
+                                                                       pool_epoch,
+                                                                       (uint32_t)num_vec,
+                                                                       bkt->pvec,
+                                                                       bkt->nvec,
+                                                                       bkt->pnorm,
+                                                                       bkt->nnorm,
+                                                                       num_p ? bkt->pdot : NULL,
+                                                                       num_n ? bkt->ndot : NULL,
+                                                                       num_p,
+                                                                       num_n,
+                                                                       (uint32_t)vec_length,
+                                                                       goal_norm,
+                                                                       bkt->center_ind,
+                                                                       bkt->center_norm,
+                                                                       1,
+                                                                       0,
+                                                                       0,
+                                                                       1,
+                                                                       1,
+                                                                       result_capacity,
+                                                                       &submitted_result_count,
+                                                                       &submitted_overflow);
+
+    const int dot_ready = submitted ? bgj_cuda_search_bucket_raw_wait_dot_copy_async() : 0;
+    _search_cred<record_dp, profiling>(bkt, sol, goal_norm, prof);
+    if (!submitted || !dot_ready) return 0;
+
+    uint32_t result_count = 0;
+    int overflow = 0;
+    bgj_cuda_result_t *results = result_storage.data();
+    const int finished = bgj_cuda_search_bucket_raw_finish_async(results,
+                                                                 result_capacity,
+                                                                 &submitted_result_count,
+                                                                 &submitted_overflow,
+                                                                 &result_count,
+                                                                 &overflow);
+    if (!finished || (overflow && bgj_cuda_overflow_fallback_requested())) return 0;
 
     return bgj_cuda_consume_bgj1_results<nb, record_dp, profiling>(this,
                                                                     bkt,
@@ -540,6 +813,7 @@ int Pool_epi8_t<nb>::_search_bgj1_cuda_batch(bucket_epi8_t<record_dp> **buckets,
     static thread_local std::vector<const int32_t *> n_dot;
     static thread_local std::vector<uint32_t> num_p;
     static thread_local std::vector<uint32_t> num_n;
+    static thread_local std::vector<uint32_t> center_ids;
     static thread_local std::vector<int32_t> goal_norms;
     static thread_local std::vector<int32_t> center_norms;
     static thread_local std::vector<bgj_cuda_result_t *> result_ptrs;
@@ -557,6 +831,7 @@ int Pool_epi8_t<nb>::_search_bgj1_cuda_batch(bucket_epi8_t<record_dp> **buckets,
         n_dot.resize(batch_size);
         num_p.resize(batch_size);
         num_n.resize(batch_size);
+        center_ids.resize(batch_size);
         goal_norms.resize(batch_size);
         center_norms.resize(batch_size);
         result_ptrs.resize(batch_size);
@@ -582,6 +857,7 @@ int Pool_epi8_t<nb>::_search_bgj1_cuda_batch(bucket_epi8_t<record_dp> **buckets,
         n_norm[i] = bkt->nnorm;
         p_dot[i] = record_dp ? bkt->pdot : NULL;
         n_dot[i] = record_dp ? bkt->ndot : NULL;
+        center_ids[i] = bkt->center_ind;
         goal_norms[i] = goal_norm;
         center_norms[i] = bkt->center_norm;
         result_capacities[i] = result_capacity;
@@ -609,8 +885,10 @@ int Pool_epi8_t<nb>::_search_bgj1_cuda_batch(bucket_epi8_t<record_dp> **buckets,
                                                          batch_size,
                                                          (uint32_t)vec_length,
                                                          goal_norms.data(),
+                                                         center_ids.data(),
                                                          center_norms.data(),
                                                          record_dp ? 1 : 0,
+                                                         record_dp && bgj_cuda_cred_transform_requested(),
                                                          result_ptrs.data(),
                                                          result_capacities.data(),
                                                          result_counts.data(),
@@ -633,6 +911,8 @@ int Pool_epi8_t<nb>::_search_bgj1_cuda_batch(bucket_epi8_t<record_dp> **buckets,
     return 1;
 }
 
+static long bgj_cuda_host_threads(long requested, long sieving_dim);
+
 template <uint32_t nb>
 int Pool_epi8_t<nb>::bgj1_Sieve_cuda(long log_level, long lps_auto_adj)
 {
@@ -651,6 +931,7 @@ int Pool_epi8_t<nb>::bgj1_Sieve_cuda(long log_level, long lps_auto_adj)
         return bgj1_Sieve(log_level, lps_auto_adj);
     }
 
+    set_num_threads(bgj_cuda_host_threads(num_threads, CSD));
     const int old = bgj_cuda_search_requested();
     bgj_cuda_set_search_requested(1);
     const int ret = bgj1_Sieve(log_level, lps_auto_adj);
@@ -667,6 +948,7 @@ int Pool_epi8_t<nb>::bgj2_Sieve_cuda(long log_level, long lps_auto_adj)
         return bgj2_Sieve(log_level, lps_auto_adj);
     }
 
+    set_num_threads(bgj_cuda_host_threads(num_threads, CSD));
     const int old = bgj_cuda_search_requested();
     bgj_cuda_set_search_requested(1);
     const int ret = bgj2_Sieve(log_level, lps_auto_adj);
@@ -683,6 +965,7 @@ int Pool_epi8_t<nb>::bgj3_Sieve_cuda(long log_level, long lps_auto_adj)
         return bgj3_Sieve(log_level, lps_auto_adj);
     }
 
+    set_num_threads(bgj_cuda_host_threads(num_threads, CSD));
     const int old = bgj_cuda_search_requested();
     bgj_cuda_set_search_requested(1);
     const int ret = bgj3_Sieve(log_level, lps_auto_adj);
@@ -692,6 +975,7 @@ int Pool_epi8_t<nb>::bgj3_Sieve_cuda(long log_level, long lps_auto_adj)
 
 static long bgj_cuda_host_threads(long requested, long sieving_dim)
 {
+    const int active_devices = bgj_cuda_execution_device_count();
     const char *env = getenv("BGJ_CUDA_HOST_THREADS");
     if (env && env[0]) {
         char *end = NULL;
@@ -702,6 +986,7 @@ static long bgj_cuda_host_threads(long requested, long sieving_dim)
     }
 
     if (requested < 1) requested = 1;
+    if (active_devices > requested) requested = active_devices;
     if (requested < 2 && sieving_dim >= 80) return 2;
     return requested > MAX_NTHREADS ? MAX_NTHREADS : requested;
 }
@@ -792,8 +1077,10 @@ int Pool_epi8_t<nb>::left_progressive_bgj1sieve_cuda(long ind_l, long ind_r, lon
 
 #if COMPILE_POOL_EPI8_96
 template int Pool_epi8_t<3>::_search_bgj1_cuda<BGJ1_EPI8_USE_3RED, 1>(bucket_epi8_t<BGJ1_EPI8_USE_3RED> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<3> *prof);
+template int Pool_epi8_t<3>::_search_bgj1_cuda_overlap<BGJ1_EPI8_USE_3RED, 1>(bucket_epi8_t<BGJ1_EPI8_USE_3RED> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<3> *prof);
 template int Pool_epi8_t<3>::_search_bgj1_cuda_batch<BGJ1_EPI8_USE_3RED, 1>(bucket_epi8_t<BGJ1_EPI8_USE_3RED> **buckets, long num_bucket, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<3> *prof);
 template int Pool_epi8_t<3>::_search_bgj1_cuda<0, 1>(bucket_epi8_t<0> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<3> *prof);
+template int Pool_epi8_t<3>::_search_bgj1_cuda_overlap<0, 1>(bucket_epi8_t<0> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<3> *prof);
 template int Pool_epi8_t<3>::_search_bgj1_cuda_batch<0, 1>(bucket_epi8_t<0> **buckets, long num_bucket, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<3> *prof);
 template int Pool_epi8_t<3>::bgj1_Sieve_cuda(long log_level, long lps_auto_adj);
 template int Pool_epi8_t<3>::bgj2_Sieve_cuda(long log_level, long lps_auto_adj);
@@ -804,8 +1091,10 @@ template int Pool_epi8_t<3>::left_progressive_bgj1sieve_cuda(long ind_l, long in
 
 #if COMPILE_POOL_EPI8_128
 template int Pool_epi8_t<4>::_search_bgj1_cuda<BGJ1_EPI8_USE_3RED, 1>(bucket_epi8_t<BGJ1_EPI8_USE_3RED> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<4> *prof);
+template int Pool_epi8_t<4>::_search_bgj1_cuda_overlap<BGJ1_EPI8_USE_3RED, 1>(bucket_epi8_t<BGJ1_EPI8_USE_3RED> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<4> *prof);
 template int Pool_epi8_t<4>::_search_bgj1_cuda_batch<BGJ1_EPI8_USE_3RED, 1>(bucket_epi8_t<BGJ1_EPI8_USE_3RED> **buckets, long num_bucket, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<4> *prof);
 template int Pool_epi8_t<4>::_search_bgj1_cuda<0, 1>(bucket_epi8_t<0> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<4> *prof);
+template int Pool_epi8_t<4>::_search_bgj1_cuda_overlap<0, 1>(bucket_epi8_t<0> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<4> *prof);
 template int Pool_epi8_t<4>::_search_bgj1_cuda_batch<0, 1>(bucket_epi8_t<0> **buckets, long num_bucket, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<4> *prof);
 template int Pool_epi8_t<4>::bgj1_Sieve_cuda(long log_level, long lps_auto_adj);
 template int Pool_epi8_t<4>::bgj2_Sieve_cuda(long log_level, long lps_auto_adj);
@@ -816,8 +1105,10 @@ template int Pool_epi8_t<4>::left_progressive_bgj1sieve_cuda(long ind_l, long in
 
 #if COMPILE_POOL_EPI8_160
 template int Pool_epi8_t<5>::_search_bgj1_cuda<BGJ1_EPI8_USE_3RED, 1>(bucket_epi8_t<BGJ1_EPI8_USE_3RED> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<5> *prof);
+template int Pool_epi8_t<5>::_search_bgj1_cuda_overlap<BGJ1_EPI8_USE_3RED, 1>(bucket_epi8_t<BGJ1_EPI8_USE_3RED> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<5> *prof);
 template int Pool_epi8_t<5>::_search_bgj1_cuda_batch<BGJ1_EPI8_USE_3RED, 1>(bucket_epi8_t<BGJ1_EPI8_USE_3RED> **buckets, long num_bucket, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<5> *prof);
 template int Pool_epi8_t<5>::_search_bgj1_cuda<0, 1>(bucket_epi8_t<0> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<5> *prof);
+template int Pool_epi8_t<5>::_search_bgj1_cuda_overlap<0, 1>(bucket_epi8_t<0> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<5> *prof);
 template int Pool_epi8_t<5>::_search_bgj1_cuda_batch<0, 1>(bucket_epi8_t<0> **buckets, long num_bucket, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<5> *prof);
 template int Pool_epi8_t<5>::bgj1_Sieve_cuda(long log_level, long lps_auto_adj);
 template int Pool_epi8_t<5>::bgj2_Sieve_cuda(long log_level, long lps_auto_adj);
@@ -828,8 +1119,10 @@ template int Pool_epi8_t<5>::left_progressive_bgj1sieve_cuda(long ind_l, long in
 
 #if COMPILE_POOL_EPI8_192
 template int Pool_epi8_t<6>::_search_bgj1_cuda<BGJ1_EPI8_USE_3RED, 1>(bucket_epi8_t<BGJ1_EPI8_USE_3RED> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<6> *prof);
+template int Pool_epi8_t<6>::_search_bgj1_cuda_overlap<BGJ1_EPI8_USE_3RED, 1>(bucket_epi8_t<BGJ1_EPI8_USE_3RED> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<6> *prof);
 template int Pool_epi8_t<6>::_search_bgj1_cuda_batch<BGJ1_EPI8_USE_3RED, 1>(bucket_epi8_t<BGJ1_EPI8_USE_3RED> **buckets, long num_bucket, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<6> *prof);
 template int Pool_epi8_t<6>::_search_bgj1_cuda<0, 1>(bucket_epi8_t<0> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<6> *prof);
+template int Pool_epi8_t<6>::_search_bgj1_cuda_overlap<0, 1>(bucket_epi8_t<0> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<6> *prof);
 template int Pool_epi8_t<6>::_search_bgj1_cuda_batch<0, 1>(bucket_epi8_t<0> **buckets, long num_bucket, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<6> *prof);
 template int Pool_epi8_t<6>::bgj1_Sieve_cuda(long log_level, long lps_auto_adj);
 template int Pool_epi8_t<6>::bgj2_Sieve_cuda(long log_level, long lps_auto_adj);
@@ -840,8 +1133,10 @@ template int Pool_epi8_t<6>::left_progressive_bgj1sieve_cuda(long ind_l, long in
 
 #if COMPILE_POOL_EPI8_224
 template int Pool_epi8_t<7>::_search_bgj1_cuda<BGJ1_EPI8_USE_3RED, 1>(bucket_epi8_t<BGJ1_EPI8_USE_3RED> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<7> *prof);
+template int Pool_epi8_t<7>::_search_bgj1_cuda_overlap<BGJ1_EPI8_USE_3RED, 1>(bucket_epi8_t<BGJ1_EPI8_USE_3RED> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<7> *prof);
 template int Pool_epi8_t<7>::_search_bgj1_cuda_batch<BGJ1_EPI8_USE_3RED, 1>(bucket_epi8_t<BGJ1_EPI8_USE_3RED> **buckets, long num_bucket, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<7> *prof);
 template int Pool_epi8_t<7>::_search_bgj1_cuda<0, 1>(bucket_epi8_t<0> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<7> *prof);
+template int Pool_epi8_t<7>::_search_bgj1_cuda_overlap<0, 1>(bucket_epi8_t<0> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<7> *prof);
 template int Pool_epi8_t<7>::_search_bgj1_cuda_batch<0, 1>(bucket_epi8_t<0> **buckets, long num_bucket, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<7> *prof);
 template int Pool_epi8_t<7>::bgj1_Sieve_cuda(long log_level, long lps_auto_adj);
 template int Pool_epi8_t<7>::bgj2_Sieve_cuda(long log_level, long lps_auto_adj);

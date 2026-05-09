@@ -45,11 +45,14 @@ struct alignas(16) bgj_cuda_bucket_entry_t {
 };
 
 int bgj_cuda_device_count();
+int bgj_cuda_execution_device_count();
 const char *bgj_cuda_last_error();
 int bgj_cuda_search_requested();
 void bgj_cuda_set_search_requested(int enabled);
 uint32_t bgj_cuda_batch_size(uint32_t host_threads);
 uint64_t bgj_cuda_batch_min_dots();
+int bgj_cuda_cred_transform_requested();
+int bgj_cuda_overlap_cred_requested();
 int bgj_cuda_materialize_requested();
 int bgj_cuda_bucket_requested();
 

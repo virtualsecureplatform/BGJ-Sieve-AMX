@@ -1,4 +1,5 @@
 #include "../include/pool_epi8.h"
+#include "../include/fplll_bridge.h"
 
 #if defined(__AMX_INT8__)
 #include "../include/bgj_amx.h"
@@ -33,6 +34,25 @@ static long bgj_uid_reserve_total_hint(long pool_size) {
     const long max_hint = bgj_uid_reserve_max();
     if (max_hint > 0 && total_hint > max_hint) total_hint = max_hint;
     return total_hint;
+}
+
+static int bgj_tail_lll_use_fplll()
+{
+    if (!bgj_fplll_is_available()) return 0;
+    const char *backend = getenv("BGJ_TAIL_LLL_BACKEND");
+    if (backend == NULL || backend[0] == '\0') return 1;
+    if (!strcasecmp(backend, "fplll") || !strcasecmp(backend, "1") ||
+        !strcasecmp(backend, "true") || !strcasecmp(backend, "yes")) return 1;
+    return 0;
+}
+
+static int bgj_tail_deep_lll_use_custom()
+{
+    const char *backend = getenv("BGJ_TAIL_DEEP_LLL_BACKEND");
+    if (backend == NULL || backend[0] == '\0') return 0;
+    if (!strcasecmp(backend, "custom") || !strcasecmp(backend, "1") ||
+        !strcasecmp(backend, "true") || !strcasecmp(backend, "yes")) return 1;
+    return 0;
 }
 
 static void bgj_reserve_uid_table(UidHashTable *uid, long pool_size) {
@@ -1287,8 +1307,16 @@ int Pool_epi8_t<nb>::tail_LLL(double delta, long n) {
         
         L_tmp->reconstruct(L_src);
         delete L_src;
-        L_tmp->LLL_QP(delta, CSD-n, CSD);
-        L_tmp->LLL_DEEP_QP(delta-0.03, CSD-n, CSD);
+        int fplll_tail_status = -1;
+        if (bgj_tail_lll_use_fplll()) {
+            fplll_tail_status = bgj_fplll_lll_qp(*L_tmp, delta, CSD-n, CSD, 0);
+        }
+        if (fplll_tail_status != 0) {
+            L_tmp->LLL_QP(delta, CSD-n, CSD);
+        }
+        if (fplll_tail_status != 0 || bgj_tail_deep_lll_use_custom()) {
+            L_tmp->LLL_DEEP_QP(delta-0.03, CSD-n, CSD);
+        }
         L_tmp->dual_size_red();
         Lattice_QP *L_tmp_dual = L_tmp->dual_QP();
         

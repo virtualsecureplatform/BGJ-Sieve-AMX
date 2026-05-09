@@ -81,6 +81,31 @@ def parse_args(argv):
     parser.add_argument("--generator-bin", type=Path, help="existing official generator binary")
     parser.add_argument("--cxx", default=os.environ.get("CXX", "clang++"))
     parser.add_argument("--cuda-visible-devices", default=os.environ.get("CUDA_VISIBLE_DEVICES"))
+    parser.add_argument(
+        "--cuda-devices",
+        default=os.environ.get("BGJ_CUDA_DEVICES"),
+        help="comma-separated runtime CUDA device ordinals for BGJ_CUDA_DEVICES, e.g. 0,1",
+    )
+    parser.add_argument(
+        "--lll-backend",
+        default=os.environ.get("BGJ_LLL_BACKEND"),
+        help="initial integer LLL backend to pass as BGJ_LLL_BACKEND, e.g. fplll or ntl",
+    )
+    parser.add_argument(
+        "--tail-lll-backend",
+        default=os.environ.get("BGJ_TAIL_LLL_BACKEND"),
+        help="tail_LLL regular LLL backend to pass as BGJ_TAIL_LLL_BACKEND, e.g. fplll or custom",
+    )
+    parser.add_argument(
+        "--tail-deep-lll-backend",
+        default=os.environ.get("BGJ_TAIL_DEEP_LLL_BACKEND"),
+        help="tail_LLL deep pass backend to pass as BGJ_TAIL_DEEP_LLL_BACKEND, e.g. custom or skip",
+    )
+    parser.add_argument(
+        "--cuda-overlap-cred",
+        default=os.environ.get("BGJ_CUDA_OVERLAP_CRED"),
+        help="pass BGJ_CUDA_OVERLAP_CRED to the CUDA solver, e.g. 0 or 1",
+    )
     parser.add_argument("--validate-generator", action="store_true")
     parser.add_argument("--profile", action="store_true", help="pass --profile to svp_solver")
     parser.add_argument(
@@ -258,6 +283,16 @@ def run_solver(args, mode, lattice, gh):
         command.append("--cuda")
         if args.cuda_visible_devices:
             env_update["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
+        if args.cuda_devices:
+            env_update["BGJ_CUDA_DEVICES"] = args.cuda_devices
+    if args.lll_backend:
+        env_update["BGJ_LLL_BACKEND"] = args.lll_backend
+    if args.tail_lll_backend:
+        env_update["BGJ_TAIL_LLL_BACKEND"] = args.tail_lll_backend
+    if args.tail_deep_lll_backend:
+        env_update["BGJ_TAIL_DEEP_LLL_BACKEND"] = args.tail_deep_lll_backend
+    if args.cuda_overlap_cred:
+        env_update["BGJ_CUDA_OVERLAP_CRED"] = args.cuda_overlap_cred
     if args.profile:
         command.append("--profile")
 

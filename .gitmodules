@@ -1,3 +1,7 @@
 [submodule "dep/gtl"]
 	path = dep/gtl
 	url = https://github.com/greg7mdp/gtl.git
+[submodule "dep/fplll"]
+	path = dep/fplll
+	url = https://github.com/fplll/fplll.git
+	ignore = untracked

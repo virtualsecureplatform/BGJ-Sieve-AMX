@@ -7,6 +7,17 @@
 #include "NTL/LLL.h"
 
 #include "../include/lattice.h"
+#include "../include/fplll_bridge.h"
+
+static int preprocess_use_fplll_initial_lll()
+{
+    if (!bgj_fplll_is_available()) return 0;
+    const char *backend = getenv("BGJ_LLL_BACKEND");
+    if (backend == NULL || backend[0] == '\0') return 1;
+    if (!strcasecmp(backend, "fplll") || !strcasecmp(backend, "1") ||
+        !strcasecmp(backend, "true") || !strcasecmp(backend, "yes")) return 1;
+    return 0;
+}
 
 int main(int argc, char **argv)
 {
@@ -50,8 +61,18 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    NTL::ZZ det2;
-    LLL(det2, L_ZZ, 1, 3, verbose ? 1 : 0);
+    int fplll_status = -1;
+    if (preprocess_use_fplll_initial_lll()) {
+        fplll_status = bgj_fplll_lll(L_ZZ, 1.0 / 3.0, verbose ? 1 : 0);
+    }
+    if (fplll_status != 0) {
+        if (preprocess_use_fplll_initial_lll() && verbose) {
+            fprintf(stderr, "Warning: fplll initial LLL failed (%s); falling back to NTL LLL.\n",
+                    bgj_fplll_status_string(fplll_status));
+        }
+        NTL::ZZ det2;
+        LLL(det2, L_ZZ, 1, 3, verbose ? 1 : 0);
+    }
 
     Lattice_QP L(L_ZZ);
     if (qp_lll) {

@@ -12,6 +12,7 @@
 #include "../include/lattice.h"
 #include "../include/pool_epi8.h"
 #include "../include/sampler.h"
+#include "../include/fplll_bridge.h"
 
 #if 1
 struct timeval _solver_timer_start, _solver_timer_end;
@@ -56,6 +57,16 @@ static void solver_profile_line(const char *name, double seconds)
         printf("profile: %-32s %.6fs\n", name, seconds);
         fflush(stdout);
     }
+}
+
+static int solver_use_fplll_initial_lll()
+{
+    if (!bgj_fplll_is_available()) return 0;
+    const char *backend = getenv("BGJ_LLL_BACKEND");
+    if (backend == NULL || backend[0] == '\0') return 1;
+    if (!strcasecmp(backend, "fplll") || !strcasecmp(backend, "1") ||
+        !strcasecmp(backend, "true") || !strcasecmp(backend, "yes")) return 1;
+    return 0;
 }
 
 #define SOLVER_PROFILE_DO(label, stmt) do {               \
@@ -445,9 +456,23 @@ int main(int argc, char** argv) {
     data >> L_ZZ;
     solver_profile_line("read_raw_basis", solver_now() - profile_t0);
     profile_t0 = solver_now();
-    NTL::ZZ det2;
-    LLL(det2, L_ZZ, 1, 3, 0);
-    solver_profile_line("initial_NTL_LLL", solver_now() - profile_t0);
+    if (solver_use_fplll_initial_lll()) {
+        int fplll_status = bgj_fplll_lll(L_ZZ, 1.0 / 3.0, 0);
+        solver_profile_line(fplll_status == 0 ? "initial_fplll_LLL" : "initial_fplll_LLL_failed",
+                            solver_now() - profile_t0);
+        if (fplll_status != 0) {
+            fprintf(stderr, "Warning: fplll initial LLL failed (%s); falling back to NTL LLL.\n",
+                    bgj_fplll_status_string(fplll_status));
+            profile_t0 = solver_now();
+            NTL::ZZ det2;
+            LLL(det2, L_ZZ, 1, 3, 0);
+            solver_profile_line("initial_NTL_LLL", solver_now() - profile_t0);
+        }
+    } else {
+        NTL::ZZ det2;
+        LLL(det2, L_ZZ, 1, 3, 0);
+        solver_profile_line("initial_NTL_LLL", solver_now() - profile_t0);
+    }
 
     profile_t0 = solver_now();
     Lattice_QP L(L_ZZ);

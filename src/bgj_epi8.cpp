@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <sys/time.h>
 #include <malloc.h>
+#include <algorithm>
 #include <type_traits>
 
 
@@ -66,6 +67,36 @@ static uint64_t bgj_epi8_env_u64(const char *name, uint64_t default_value)
 }
 
 #if defined(HAVE_CUDA)
+static int bgj_epi8_cuda_work_sort_requested()
+{
+    const char *env = getenv("BGJ_CUDA_WORK_SORT");
+    if (env && env[0]) return env[0] != '0';
+    return 0;
+}
+
+template <bool record_dp>
+static uint64_t bgj_epi8_cuda_bucket_work(const bucket_epi8_t<record_dp> *bucket)
+{
+    if (!bucket) return 0;
+    return bgj_epi8_bucket_pair_dots(bucket->num_pvec, bucket->num_nvec);
+}
+
+template <bool record_dp>
+static void bgj_epi8_cuda_sort_buckets_by_work(bucket_epi8_t<record_dp> **buckets,
+                                               long num_bucket)
+{
+    if (num_bucket <= 1 || !bgj_cuda_search_requested() ||
+        !bgj_epi8_cuda_work_sort_requested()) {
+        return;
+    }
+
+    std::sort(buckets, buckets + num_bucket,
+              [](const bucket_epi8_t<record_dp> *a,
+                 const bucket_epi8_t<record_dp> *b) {
+                  return bgj_epi8_cuda_bucket_work(a) < bgj_epi8_cuda_bucket_work(b);
+              });
+}
+
 static uint32_t bgj2_epi8_cuda_batch_size(uint32_t search_threads)
 {
     uint32_t value = bgj_cuda_batch_size(search_threads);
@@ -1027,6 +1058,9 @@ int Pool_epi8_t<nb>::bgj1_Sieve(long log_level, long lps_auto_adj){
             }
             local_profile.bucket0_log();
             local_profile.template pool_bucket_check<BGJ1_EPI8_USE_3RED>(main_bucket, BGJ1_EPI8_BUCKET_BATCHSIZE, alpha);
+            #if defined(HAVE_CUDA)
+            bgj_epi8_cuda_sort_buckets_by_work<BGJ1_EPI8_USE_3RED>(main_bucket, BGJ1_EPI8_BUCKET_BATCHSIZE);
+            #endif
 
             ///////////////// searching /////////////////
             pthread_spinlock_t bucket_list_lock;
@@ -1071,6 +1105,8 @@ int Pool_epi8_t<nb>::bgj1_Sieve(long log_level, long lps_auto_adj){
                     bool cuda_done = false;
                     #if defined(HAVE_CUDA)
                     if (bgj_cuda_search_requested()) {
+                        const int cuda_cred_on_device = bgj_cuda_cred_transform_requested();
+                        const int cuda_overlap_cred = !cuda_cred_on_device && bgj_cuda_overlap_cred_requested();
                         if (cuda_batch_capacity > 1 &&
                             bgj_epi8_bucket_pair_dots(bkt->num_pvec, bkt->num_nvec) >= cuda_batch_min_dots) {
                             bucket_epi8_t<BGJ1_EPI8_USE_3RED> *cuda_batch[BGJ1_EPI8_BUCKET_BATCHSIZE];
@@ -1102,11 +1138,14 @@ int Pool_epi8_t<nb>::bgj1_Sieve(long log_level, long lps_auto_adj){
                                     batch_ndp_long += ndp;
                                     if (ndp > 0) batch_ndp += (uint64_t)ndp;
                                 }
-                                double t0 = bgj_epi8_wall_time();
-                                for (long i = 0; i < cuda_num_bucket; i++) {
-                                    _search_cred<BGJ1_EPI8_USE_3RED, 1>(cuda_batch[i], sol_list[thread], goal_norm, &local_profile);
+                                double t0 = 0.0;
+                                if (!cuda_cred_on_device) {
+                                    t0 = bgj_epi8_wall_time();
+                                    for (long i = 0; i < cuda_num_bucket; i++) {
+                                        _search_cred<BGJ1_EPI8_USE_3RED, 1>(cuda_batch[i], sol_list[thread], goal_norm, &local_profile);
+                                    }
+                                    __cuda_cred_time0 += bgj_epi8_wall_time() - t0;
                                 }
-                                __cuda_cred_time0 += bgj_epi8_wall_time() - t0;
                                 t0 = bgj_epi8_wall_time();
                                 cuda_done = _search_bgj1_cuda_batch<BGJ1_EPI8_USE_3RED, 1>(cuda_batch,
                                                                                            cuda_num_bucket,
@@ -1116,6 +1155,13 @@ int Pool_epi8_t<nb>::bgj1_Sieve(long log_level, long lps_auto_adj){
                                 __cuda_batch_time0 += bgj_epi8_wall_time() - t0;
                                 __cuda_batch_call0++;
                                 if (!cuda_done) {
+                                    if (cuda_cred_on_device) {
+                                        t0 = bgj_epi8_wall_time();
+                                        for (long i = 0; i < cuda_num_bucket; i++) {
+                                            _search_cred<BGJ1_EPI8_USE_3RED, 1>(cuda_batch[i], sol_list[thread], goal_norm, &local_profile);
+                                        }
+                                        __cuda_cred_time0 += bgj_epi8_wall_time() - t0;
+                                    }
                                     t0 = bgj_epi8_wall_time();
                                     for (long i = 0; i < cuda_num_bucket; i++) {
                                         _search_np<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, BGJ1_EPI8_USE_3RED, 1>(cuda_batch[i], sol_list[thread], goal_norm, &local_profile);
@@ -1131,36 +1177,50 @@ int Pool_epi8_t<nb>::bgj1_Sieve(long log_level, long lps_auto_adj){
                                 }
                                 __search0_ndp += batch_ndp_long;
                                 continue;
-	                            } else if (cuda_num_bucket > 1) {
-	                                for (long i = 0; i < cuda_num_bucket; i++) {
-	                                    const long ndp_long = bgj_epi8_search0_profile_ndp(cuda_batch[i]->num_pvec,
-	                                                                                       cuda_batch[i]->num_nvec);
-	                                    const uint64_t ndp = ndp_long > 0 ? (uint64_t)ndp_long : 0;
-	                                    bool one_cred_done = false;
-	                                    bool one_cuda_done = false;
-	                                    if (ndp >= cuda_batch_min_dots) {
-	                                        double t0 = bgj_epi8_wall_time();
-	                                        _search_cred<BGJ1_EPI8_USE_3RED, 1>(cuda_batch[i], sol_list[thread], goal_norm, &local_profile);
-	                                        __cuda_cred_time0 += bgj_epi8_wall_time() - t0;
-	                                        one_cred_done = true;
-	                                        t0 = bgj_epi8_wall_time();
-	                                        one_cuda_done =
-	                                            _search_bgj1_cuda<BGJ1_EPI8_USE_3RED, 1>(cuda_batch[i],
-	                                                                                      sol_list[thread],
-	                                                                                      goal_norm,
-	                                                                                      &local_profile) > 0;
-	                                        __cuda_single_time0 += bgj_epi8_wall_time() - t0;
-	                                    }
-	                                    if (!one_cuda_done) {
-	                                        if (!one_cred_done) {
-	                                            const double cred_t0 = bgj_epi8_wall_time();
-	                                            _search_cred<BGJ1_EPI8_USE_3RED, 1>(cuda_batch[i], sol_list[thread], goal_norm, &local_profile);
-	                                            __cuda_cred_time0 += bgj_epi8_wall_time() - cred_t0;
-	                                        }
-	                                        const double t0 = bgj_epi8_wall_time();
-	                                        _search_np<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, BGJ1_EPI8_USE_3RED, 1>(cuda_batch[i], sol_list[thread], goal_norm, &local_profile);
-	                                        _search_pp<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, BGJ1_EPI8_USE_3RED, 1>(cuda_batch[i], sol_list[thread], goal_norm, &local_profile);
-	                                        _search_nn<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, BGJ1_EPI8_USE_3RED, 1>(cuda_batch[i], sol_list[thread], goal_norm, &local_profile);
+                            } else if (cuda_num_bucket > 1) {
+                                for (long i = 0; i < cuda_num_bucket; i++) {
+                                    const long ndp_long = bgj_epi8_search0_profile_ndp(cuda_batch[i]->num_pvec,
+                                                                                       cuda_batch[i]->num_nvec);
+                                    const uint64_t ndp = ndp_long > 0 ? (uint64_t)ndp_long : 0;
+                                    bool one_cred_done = false;
+                                    bool one_cuda_done = false;
+                                    if (ndp >= cuda_batch_min_dots) {
+                                        double t0 = 0.0;
+                                        if (cuda_overlap_cred) {
+                                            t0 = bgj_epi8_wall_time();
+                                            one_cuda_done =
+                                                _search_bgj1_cuda_overlap<BGJ1_EPI8_USE_3RED, 1>(cuda_batch[i],
+                                                                                                 sol_list[thread],
+                                                                                                 goal_norm,
+                                                                                                 &local_profile) > 0;
+                                            __cuda_single_time0 += bgj_epi8_wall_time() - t0;
+                                            one_cred_done = true;
+                                        } else {
+                                            if (!cuda_cred_on_device) {
+                                                t0 = bgj_epi8_wall_time();
+                                                _search_cred<BGJ1_EPI8_USE_3RED, 1>(cuda_batch[i], sol_list[thread], goal_norm, &local_profile);
+                                                __cuda_cred_time0 += bgj_epi8_wall_time() - t0;
+                                                one_cred_done = true;
+                                            }
+                                            t0 = bgj_epi8_wall_time();
+                                            one_cuda_done =
+                                                _search_bgj1_cuda<BGJ1_EPI8_USE_3RED, 1>(cuda_batch[i],
+                                                                                        sol_list[thread],
+                                                                                        goal_norm,
+                                                                                        &local_profile) > 0;
+                                            __cuda_single_time0 += bgj_epi8_wall_time() - t0;
+                                        }
+                                    }
+                                    if (!one_cuda_done) {
+                                        if (!one_cred_done) {
+                                            const double cred_t0 = bgj_epi8_wall_time();
+                                            _search_cred<BGJ1_EPI8_USE_3RED, 1>(cuda_batch[i], sol_list[thread], goal_norm, &local_profile);
+                                            __cuda_cred_time0 += bgj_epi8_wall_time() - cred_t0;
+                                        }
+                                        const double t0 = bgj_epi8_wall_time();
+                                        _search_np<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, BGJ1_EPI8_USE_3RED, 1>(cuda_batch[i], sol_list[thread], goal_norm, &local_profile);
+                                        _search_pp<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, BGJ1_EPI8_USE_3RED, 1>(cuda_batch[i], sol_list[thread], goal_norm, &local_profile);
+                                        _search_nn<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, BGJ1_EPI8_USE_3RED, 1>(cuda_batch[i], sol_list[thread], goal_norm, &local_profile);
                                         __cuda_fallback_time0 += bgj_epi8_wall_time() - t0;
                                         __cuda_fallback_bucket0++;
                                         __cuda_fallback_ndp0 += ndp;
@@ -1176,13 +1236,23 @@ int Pool_epi8_t<nb>::bgj1_Sieve(long log_level, long lps_auto_adj){
                         const long ndp_long = bgj_epi8_search0_profile_ndp(bkt->num_pvec, bkt->num_nvec);
                         const uint64_t ndp = ndp_long > 0 ? (uint64_t)ndp_long : 0;
                         if (ndp >= cuda_batch_min_dots) {
-                            double t0 = bgj_epi8_wall_time();
-                            _search_cred<BGJ1_EPI8_USE_3RED, 1>(bkt, sol_list[thread], goal_norm, &local_profile);
-                            __cuda_cred_time0 += bgj_epi8_wall_time() - t0;
-                            cred_done = true;
-                            t0 = bgj_epi8_wall_time();
-                            cuda_done = _search_bgj1_cuda<BGJ1_EPI8_USE_3RED, 1>(bkt, sol_list[thread], goal_norm, &local_profile) > 0;
-                            __cuda_single_time0 += bgj_epi8_wall_time() - t0;
+                            double t0 = 0.0;
+                            if (cuda_overlap_cred) {
+                                t0 = bgj_epi8_wall_time();
+                                cuda_done = _search_bgj1_cuda_overlap<BGJ1_EPI8_USE_3RED, 1>(bkt, sol_list[thread], goal_norm, &local_profile) > 0;
+                                __cuda_single_time0 += bgj_epi8_wall_time() - t0;
+                                cred_done = true;
+                            } else {
+                                if (!cuda_cred_on_device) {
+                                    t0 = bgj_epi8_wall_time();
+                                    _search_cred<BGJ1_EPI8_USE_3RED, 1>(bkt, sol_list[thread], goal_norm, &local_profile);
+                                    __cuda_cred_time0 += bgj_epi8_wall_time() - t0;
+                                    cred_done = true;
+                                }
+                                t0 = bgj_epi8_wall_time();
+                                cuda_done = _search_bgj1_cuda<BGJ1_EPI8_USE_3RED, 1>(bkt, sol_list[thread], goal_norm, &local_profile) > 0;
+                                __cuda_single_time0 += bgj_epi8_wall_time() - t0;
+                            }
                             if (cuda_done) {
                                 __cuda_single_bucket0++;
                                 __cuda_single_ndp0 += ndp;
@@ -1374,6 +1444,9 @@ int Pool_epi8_t<nb>::bgj2_Sieve(long log_level, long lps_auto_adj){
             local_profile.bucket0_log();
             local_profile.template pool_bucket_check<BGJ2_EPI8_REUSE_USE_3RED>(rbucket, BGJ2_EPI8_BUCKET0_BATCHSIZE, alpha_r0);
             local_profile.template pool_bucket_check<0>(bucket0, BGJ2_EPI8_BUCKET0_BATCHSIZE, alpha_b0);
+            #if defined(HAVE_CUDA)
+            bgj_epi8_cuda_sort_buckets_by_work<BGJ2_EPI8_REUSE_USE_3RED>(rbucket, BGJ2_EPI8_BUCKET0_BATCHSIZE);
+            #endif
 
             ///////////////// bucket1 /////////////////
             TIMER_START;
@@ -1404,6 +1477,9 @@ int Pool_epi8_t<nb>::bgj2_Sieve(long log_level, long lps_auto_adj){
             local_profile.bucket1_log();
             local_profile.subbucket_check(bucket0, bucket1, BGJ2_EPI8_BUCKET0_BATCHSIZE, BGJ2_EPI8_BUCKET1_BATCHSIZE, alpha_b1);
             local_profile.sol_check(sol_list, num_threads, goal_norm, uid);
+            #if defined(HAVE_CUDA)
+            bgj_epi8_cuda_sort_buckets_by_work<0>(bucket1, BGJ2_EPI8_BUCKET0_BATCHSIZE * BGJ2_EPI8_BUCKET1_BATCHSIZE);
+            #endif
 
             const long search_threads = bgj1_epi8_search_threads_runtime(num_threads);
             #if defined(HAVE_CUDA)
@@ -1453,6 +1529,8 @@ int Pool_epi8_t<nb>::bgj2_Sieve(long log_level, long lps_auto_adj){
                     bool cuda_done = false;
                     #if defined(HAVE_CUDA)
                     if (bgj_cuda_search_requested() && cuda_bgj2_search0) {
+                        const int cuda_cred_on_device = bgj_cuda_cred_transform_requested();
+                        const int cuda_overlap_cred = !cuda_cred_on_device && bgj_cuda_overlap_cred_requested();
                         if (cuda_batch_capacity > 1 &&
                             bgj_epi8_bucket_pair_dots(bkt->num_pvec, bkt->num_nvec) >= cuda_batch_min_dots) {
                             bucket_epi8_t<BGJ2_EPI8_REUSE_USE_3RED> *cuda_batch[BGJ2_EPI8_BUCKET0_BATCHSIZE];
@@ -1484,11 +1562,14 @@ int Pool_epi8_t<nb>::bgj2_Sieve(long log_level, long lps_auto_adj){
                                     batch_ndp_long += ndp;
                                     if (ndp > 0) batch_ndp += (uint64_t)ndp;
                                 }
-                                double t0 = bgj_epi8_wall_time();
-                                for (long i = 0; i < cuda_num_bucket; i++) {
-                                    _search_cred<BGJ2_EPI8_REUSE_USE_3RED, 1>(cuda_batch[i], sol_list[thread], goal_norm, &local_profile);
+                                double t0 = 0.0;
+                                if (!cuda_cred_on_device) {
+                                    t0 = bgj_epi8_wall_time();
+                                    for (long i = 0; i < cuda_num_bucket; i++) {
+                                        _search_cred<BGJ2_EPI8_REUSE_USE_3RED, 1>(cuda_batch[i], sol_list[thread], goal_norm, &local_profile);
+                                    }
+                                    __cuda_cred_time0 += bgj_epi8_wall_time() - t0;
                                 }
-                                __cuda_cred_time0 += bgj_epi8_wall_time() - t0;
                                 t0 = bgj_epi8_wall_time();
                                 cuda_done = _search_bgj1_cuda_batch<BGJ2_EPI8_REUSE_USE_3RED, 1>(cuda_batch,
                                                                                                  cuda_num_bucket,
@@ -1498,6 +1579,13 @@ int Pool_epi8_t<nb>::bgj2_Sieve(long log_level, long lps_auto_adj){
                                 __cuda_batch_time0 += bgj_epi8_wall_time() - t0;
                                 __cuda_batch_call0++;
                                 if (!cuda_done) {
+                                    if (cuda_cred_on_device) {
+                                        t0 = bgj_epi8_wall_time();
+                                        for (long i = 0; i < cuda_num_bucket; i++) {
+                                            _search_cred<BGJ2_EPI8_REUSE_USE_3RED, 1>(cuda_batch[i], sol_list[thread], goal_norm, &local_profile);
+                                        }
+                                        __cuda_cred_time0 += bgj_epi8_wall_time() - t0;
+                                    }
                                     t0 = bgj_epi8_wall_time();
                                     for (long i = 0; i < cuda_num_bucket; i++) {
                                         _search_np<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, BGJ2_EPI8_REUSE_USE_3RED, 1>(cuda_batch[i], sol_list[thread], goal_norm, &local_profile);
@@ -1521,17 +1609,31 @@ int Pool_epi8_t<nb>::bgj2_Sieve(long log_level, long lps_auto_adj){
                                     bool one_cred_done = false;
                                     bool one_cuda_done = false;
                                     if (bgj_epi8_bucket_pair_dots(cuda_batch[i]->num_pvec, cuda_batch[i]->num_nvec) >= cuda_batch_min_dots) {
-                                        double t0 = bgj_epi8_wall_time();
-                                        _search_cred<BGJ2_EPI8_REUSE_USE_3RED, 1>(cuda_batch[i], sol_list[thread], goal_norm, &local_profile);
-                                        __cuda_cred_time0 += bgj_epi8_wall_time() - t0;
-                                        one_cred_done = true;
-                                        t0 = bgj_epi8_wall_time();
-                                        one_cuda_done =
-                                            _search_bgj1_cuda<BGJ2_EPI8_REUSE_USE_3RED, 1>(cuda_batch[i],
-                                                                                           sol_list[thread],
-                                                                                           goal_norm,
-                                                                                           &local_profile) > 0;
-                                        __cuda_single_time0 += bgj_epi8_wall_time() - t0;
+                                        double t0 = 0.0;
+                                        if (cuda_overlap_cred) {
+                                            t0 = bgj_epi8_wall_time();
+                                            one_cuda_done =
+                                                _search_bgj1_cuda_overlap<BGJ2_EPI8_REUSE_USE_3RED, 1>(cuda_batch[i],
+                                                                                                        sol_list[thread],
+                                                                                                        goal_norm,
+                                                                                                        &local_profile) > 0;
+                                            __cuda_single_time0 += bgj_epi8_wall_time() - t0;
+                                            one_cred_done = true;
+                                        } else {
+                                            if (!cuda_cred_on_device) {
+                                                t0 = bgj_epi8_wall_time();
+                                                _search_cred<BGJ2_EPI8_REUSE_USE_3RED, 1>(cuda_batch[i], sol_list[thread], goal_norm, &local_profile);
+                                                __cuda_cred_time0 += bgj_epi8_wall_time() - t0;
+                                                one_cred_done = true;
+                                            }
+                                            t0 = bgj_epi8_wall_time();
+                                            one_cuda_done =
+                                                _search_bgj1_cuda<BGJ2_EPI8_REUSE_USE_3RED, 1>(cuda_batch[i],
+                                                                                               sol_list[thread],
+                                                                                               goal_norm,
+                                                                                               &local_profile) > 0;
+                                            __cuda_single_time0 += bgj_epi8_wall_time() - t0;
+                                        }
                                     }
                                     if (!one_cuda_done) {
                                         if (!one_cred_done) {
@@ -1558,13 +1660,23 @@ int Pool_epi8_t<nb>::bgj2_Sieve(long log_level, long lps_auto_adj){
                         const long ndp_long = bgj_epi8_search0_profile_ndp(bkt->num_pvec, bkt->num_nvec);
                         const uint64_t ndp = ndp_long > 0 ? (uint64_t)ndp_long : 0;
                         if (bgj_epi8_bucket_pair_dots(bkt->num_pvec, bkt->num_nvec) >= cuda_batch_min_dots) {
-                            double t0 = bgj_epi8_wall_time();
-                            _search_cred<BGJ2_EPI8_REUSE_USE_3RED, 1>(bkt, sol_list[thread], goal_norm, &local_profile);
-                            __cuda_cred_time0 += bgj_epi8_wall_time() - t0;
-                            cred_done = true;
-                            t0 = bgj_epi8_wall_time();
-                            cuda_done = _search_bgj1_cuda<BGJ2_EPI8_REUSE_USE_3RED, 1>(bkt, sol_list[thread], goal_norm, &local_profile) > 0;
-                            __cuda_single_time0 += bgj_epi8_wall_time() - t0;
+                            double t0 = 0.0;
+                            if (cuda_overlap_cred) {
+                                t0 = bgj_epi8_wall_time();
+                                cuda_done = _search_bgj1_cuda_overlap<BGJ2_EPI8_REUSE_USE_3RED, 1>(bkt, sol_list[thread], goal_norm, &local_profile) > 0;
+                                __cuda_single_time0 += bgj_epi8_wall_time() - t0;
+                                cred_done = true;
+                            } else {
+                                if (!cuda_cred_on_device) {
+                                    t0 = bgj_epi8_wall_time();
+                                    _search_cred<BGJ2_EPI8_REUSE_USE_3RED, 1>(bkt, sol_list[thread], goal_norm, &local_profile);
+                                    __cuda_cred_time0 += bgj_epi8_wall_time() - t0;
+                                    cred_done = true;
+                                }
+                                t0 = bgj_epi8_wall_time();
+                                cuda_done = _search_bgj1_cuda<BGJ2_EPI8_REUSE_USE_3RED, 1>(bkt, sol_list[thread], goal_norm, &local_profile) > 0;
+                                __cuda_single_time0 += bgj_epi8_wall_time() - t0;
+                            }
                             if (cuda_done) {
                                 __cuda_single_bucket0++;
                                 __cuda_single_ndp0 += ndp;
@@ -1653,6 +1765,7 @@ int Pool_epi8_t<nb>::bgj2_Sieve(long log_level, long lps_auto_adj){
                     bool cuda_done = false;
                     #if defined(HAVE_CUDA)
                     if (bgj_cuda_search_requested() && cuda_bgj2_search1) {
+                        const int cuda_cred_on_device = bgj_cuda_cred_transform_requested();
                         if (cuda_batch_capacity > 1 &&
                             bgj_epi8_bucket_pair_dots(bkt->num_pvec, bkt->num_nvec) >= cuda_batch_min_dots) {
                             bucket_epi8_t<0> *cuda_batch[BGJ2_EPI8_BUCKET1_BATCHSIZE];
@@ -1684,11 +1797,14 @@ int Pool_epi8_t<nb>::bgj2_Sieve(long log_level, long lps_auto_adj){
                                     batch_ndp_long += ndp;
                                     if (ndp > 0) batch_ndp += (uint64_t)ndp;
                                 }
-                                double t0 = bgj_epi8_wall_time();
-                                for (long i = 0; i < cuda_num_bucket; i++) {
-                                    _search_cred<0, 1>(cuda_batch[i], sol_list[thread], goal_norm, &local_profile);
+                                double t0 = 0.0;
+                                if (!cuda_cred_on_device) {
+                                    t0 = bgj_epi8_wall_time();
+                                    for (long i = 0; i < cuda_num_bucket; i++) {
+                                        _search_cred<0, 1>(cuda_batch[i], sol_list[thread], goal_norm, &local_profile);
+                                    }
+                                    __cuda_cred_time1 += bgj_epi8_wall_time() - t0;
                                 }
-                                __cuda_cred_time1 += bgj_epi8_wall_time() - t0;
                                 t0 = bgj_epi8_wall_time();
                                 cuda_done = _search_bgj1_cuda_batch<0, 1>(cuda_batch,
                                                                           cuda_num_bucket,
@@ -1698,6 +1814,13 @@ int Pool_epi8_t<nb>::bgj2_Sieve(long log_level, long lps_auto_adj){
                                 __cuda_batch_time1 += bgj_epi8_wall_time() - t0;
                                 __cuda_batch_call1++;
                                 if (!cuda_done) {
+                                    if (cuda_cred_on_device) {
+                                        t0 = bgj_epi8_wall_time();
+                                        for (long i = 0; i < cuda_num_bucket; i++) {
+                                            _search_cred<0, 1>(cuda_batch[i], sol_list[thread], goal_norm, &local_profile);
+                                        }
+                                        __cuda_cred_time1 += bgj_epi8_wall_time() - t0;
+                                    }
                                     t0 = bgj_epi8_wall_time();
                                     for (long i = 0; i < cuda_num_bucket; i++) {
                                         _search_np<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, 0, 1>(cuda_batch[i], sol_list[thread], goal_norm, &local_profile);
@@ -1721,10 +1844,13 @@ int Pool_epi8_t<nb>::bgj2_Sieve(long log_level, long lps_auto_adj){
                                     bool one_cred_done = false;
                                     bool one_cuda_done = false;
                                     if (bgj_epi8_bucket_pair_dots(cuda_batch[i]->num_pvec, cuda_batch[i]->num_nvec) >= cuda_batch_min_dots) {
-                                        double t0 = bgj_epi8_wall_time();
-                                        _search_cred<0, 1>(cuda_batch[i], sol_list[thread], goal_norm, &local_profile);
-                                        __cuda_cred_time1 += bgj_epi8_wall_time() - t0;
-                                        one_cred_done = true;
+                                        double t0 = 0.0;
+                                        if (!cuda_cred_on_device) {
+                                            t0 = bgj_epi8_wall_time();
+                                            _search_cred<0, 1>(cuda_batch[i], sol_list[thread], goal_norm, &local_profile);
+                                            __cuda_cred_time1 += bgj_epi8_wall_time() - t0;
+                                            one_cred_done = true;
+                                        }
                                         t0 = bgj_epi8_wall_time();
                                         one_cuda_done =
                                             _search_bgj1_cuda<0, 1>(cuda_batch[i],
@@ -1758,10 +1884,13 @@ int Pool_epi8_t<nb>::bgj2_Sieve(long log_level, long lps_auto_adj){
                         const long ndp_long = bgj_epi8_search0_profile_ndp(bkt->num_pvec, bkt->num_nvec);
                         const uint64_t ndp = ndp_long > 0 ? (uint64_t)ndp_long : 0;
                         if (bgj_epi8_bucket_pair_dots(bkt->num_pvec, bkt->num_nvec) >= cuda_batch_min_dots) {
-                            double t0 = bgj_epi8_wall_time();
-                            _search_cred<0, 1>(bkt, sol_list[thread], goal_norm, &local_profile);
-                            __cuda_cred_time1 += bgj_epi8_wall_time() - t0;
-                            cred_done = true;
+                            double t0 = 0.0;
+                            if (!cuda_cred_on_device) {
+                                t0 = bgj_epi8_wall_time();
+                                _search_cred<0, 1>(bkt, sol_list[thread], goal_norm, &local_profile);
+                                __cuda_cred_time1 += bgj_epi8_wall_time() - t0;
+                                cred_done = true;
+                            }
                             t0 = bgj_epi8_wall_time();
                             cuda_done = _search_bgj1_cuda<0, 1>(bkt, sol_list[thread], goal_norm, &local_profile) > 0;
                             __cuda_single_time1 += bgj_epi8_wall_time() - t0;
@@ -2015,13 +2144,25 @@ int Pool_epi8_t<nb>::bgj3_Sieve(long log_level, long lps_auto_adj){
                     #if defined(HAVE_CUDA)
                     if (bgj_cuda_search_requested() && cuda_enabled &&
                         bgj_epi8_bucket_pair_dots(search_bkt->num_pvec, search_bkt->num_nvec) >= cuda_bgj3_min_dots) {
-                        double t0 = bgj_epi8_wall_time();
-                        _search_cred<record_dp, 1>(search_bkt, sol, goal_norm, &local_profile);
-                        cuda_cred_time += bgj_epi8_wall_time() - t0;
-                        cred_done = true;
-                        t0 = bgj_epi8_wall_time();
-                        cuda_done = _search_bgj1_cuda<record_dp, 1>(search_bkt, sol, goal_norm, &local_profile) > 0;
-                        cuda_single_time += bgj_epi8_wall_time() - t0;
+                        const int cuda_cred_on_device = record_dp && bgj_cuda_cred_transform_requested();
+                        const int cuda_overlap_cred = record_dp && !cuda_cred_on_device && bgj_cuda_overlap_cred_requested();
+                        double t0 = 0.0;
+                        if (cuda_overlap_cred) {
+                            t0 = bgj_epi8_wall_time();
+                            cuda_done = _search_bgj1_cuda_overlap<record_dp, 1>(search_bkt, sol, goal_norm, &local_profile) > 0;
+                            cuda_single_time += bgj_epi8_wall_time() - t0;
+                            cred_done = true;
+                        } else {
+                            if (!cuda_cred_on_device) {
+                                t0 = bgj_epi8_wall_time();
+                                _search_cred<record_dp, 1>(search_bkt, sol, goal_norm, &local_profile);
+                                cuda_cred_time += bgj_epi8_wall_time() - t0;
+                                cred_done = true;
+                            }
+                            t0 = bgj_epi8_wall_time();
+                            cuda_done = _search_bgj1_cuda<record_dp, 1>(search_bkt, sol, goal_norm, &local_profile) > 0;
+                            cuda_single_time += bgj_epi8_wall_time() - t0;
+                        }
                         if (cuda_done) {
                             cuda_single_bucket++;
                             cuda_single_ndp += ndp;
@@ -2070,6 +2211,7 @@ int Pool_epi8_t<nb>::bgj3_Sieve(long log_level, long lps_auto_adj){
                     if (bgj_cuda_search_requested() && cuda_bgj3_search2 &&
                         cuda_bgj3_batch_capacity > 1 &&
                         cuda_num_bucket >= (long)cuda_bgj3_min_batch) {
+                        const int cuda_cred_on_device = bgj_cuda_cred_transform_requested();
                         long batch_ndp_long = 0;
                         uint64_t batch_ndp = 0;
                         for (long i = 0; i < cuda_num_bucket; i++) {
@@ -2079,11 +2221,14 @@ int Pool_epi8_t<nb>::bgj3_Sieve(long log_level, long lps_auto_adj){
                             if (ndp > 0) batch_ndp += (uint64_t)ndp;
                         }
 
-                        double t0 = bgj_epi8_wall_time();
-                        for (long i = 0; i < cuda_num_bucket; i++) {
-                            _search_cred<0, 1>(cuda_batch[i], sol, goal_norm, &local_profile);
+                        double t0 = 0.0;
+                        if (!cuda_cred_on_device) {
+                            t0 = bgj_epi8_wall_time();
+                            for (long i = 0; i < cuda_num_bucket; i++) {
+                                _search_cred<0, 1>(cuda_batch[i], sol, goal_norm, &local_profile);
+                            }
+                            cuda_cred_time += bgj_epi8_wall_time() - t0;
                         }
-                        cuda_cred_time += bgj_epi8_wall_time() - t0;
 
                         t0 = bgj_epi8_wall_time();
                         const int cuda_done = _search_bgj1_cuda_batch<0, 1>(cuda_batch,
@@ -2101,6 +2246,13 @@ int Pool_epi8_t<nb>::bgj3_Sieve(long log_level, long lps_auto_adj){
                             return;
                         }
 
+                        if (cuda_cred_on_device) {
+                            t0 = bgj_epi8_wall_time();
+                            for (long i = 0; i < cuda_num_bucket; i++) {
+                                _search_cred<0, 1>(cuda_batch[i], sol, goal_norm, &local_profile);
+                            }
+                            cuda_cred_time += bgj_epi8_wall_time() - t0;
+                        }
                         t0 = bgj_epi8_wall_time();
                         for (long i = 0; i < cuda_num_bucket; i++) {
                             _search_np<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, 0, 1>(cuda_batch[i], sol, goal_norm, &local_profile);
@@ -2339,6 +2491,7 @@ int Pool_epi8_t<nb>::bgj3_Sieve(long log_level, long lps_auto_adj){
                             #endif
                             if (cuda_batchable) {
                                 cuda_search2_batch[cuda_search2_num_bucket++] = _bkt;
+                                #if defined(HAVE_CUDA)
                                 if (cuda_search2_num_bucket >= (long)cuda_bgj3_batch_capacity) {
                                     bgj3_flush_search2_batch(cuda_search2_batch,
                                                              cuda_search2_num_bucket,
@@ -2356,6 +2509,7 @@ int Pool_epi8_t<nb>::bgj3_Sieve(long log_level, long lps_auto_adj){
                                                              __cuda_batch_call2,
                                                              __cuda_fallback_bucket2);
                                 }
+                                #endif
                             } else {
                                 bgj3_search_bucket(_bkt,
                                                    std::integral_constant<bool, false>(),

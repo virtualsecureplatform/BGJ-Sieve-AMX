@@ -1076,6 +1076,8 @@ struct Pool_epi8_t {
         template <bool record_dp, bool profiling>
         int _search_bgj1_cuda(bucket_epi8_t<record_dp> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<nb> *prof = NULL);
         template <bool record_dp, bool profiling>
+        int _search_bgj1_cuda_overlap(bucket_epi8_t<record_dp> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<nb> *prof = NULL);
+        template <bool record_dp, bool profiling>
         int _search_bgj1_cuda_batch(bucket_epi8_t<record_dp> **buckets, long num_bucket, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<nb> *prof = NULL);
         long _sol_list_to_desc(sol_list_epi8_t **sol_list, long num_sol_list, bgj_cuda_materialize_desc_t *desc, uint64_t *dst_vu);
         int _desc_to_vec_cpu(const bgj_cuda_materialize_desc_t *desc, long num_desc, long cpu_threads, int8_t *dst_vec, int32_t *dst_vnorm, int32_t *dst_vsum);

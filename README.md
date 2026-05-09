@@ -25,6 +25,36 @@ $ git submodule update --init --recursive
 $ make
 ```
 
+Optional fplll support can replace the initial integer-matrix LLL step used by
+`app/svp_solver` and `app/lattice_preprocess`. It can also accelerate the
+regular LLL part of `tail_LLL`; the custom projected deep-LLL pass is still
+used afterward. Build fplll from the checked-out submodule with the same
+`clang++`/`libc++` ABI as this project:
+
+```bash
+$ git submodule update --init --recursive dep/fplll
+$ sudo apt-get install -y autoconf automake libtool pkg-config libmpfr-dev
+$ cd dep/fplll
+$ ./autogen.sh
+$ ./configure --prefix="$PWD/install" --with-gmp="$PWD/../gmp" --with-mpfr=/usr \
+      CC=clang CXX=clang++ \
+      CXXFLAGS="-O3 -g -march=native -stdlib=libc++ -fPIC" \
+      LDFLAGS="-stdlib=libc++"
+$ make -j"$(nproc)"
+$ make install
+$ cd ../../src && make
+$ cd ../app && make
+```
+
+If `dep/fplll/install/include/fplll/fplll.h` exists, the Makefiles enable
+`FPLLL=1` by default; pass `FPLLL=0` to disable it. When compiled with fplll,
+fplll is the default initial LLL backend. Set `BGJ_LLL_BACKEND=ntl` to force
+the previous NTL path. Set `BGJ_TAIL_LLL_BACKEND=custom` to force the previous
+custom regular LLL inside `tail_LLL`. Set `BGJ_TAIL_DEEP_LLL_BACKEND=skip` to
+skip the custom deep-LLL pass after a successful fplll tail LLL pass; this is
+the default when fplll tail LLL succeeds. Set `BGJ_TAIL_DEEP_LLL_BACKEND=custom`
+to restore the previous custom deep pass.
+
 CUDA support can be enabled for BGJ sieve runs. In CUDA mode the A100 tuning
 path uses GPU bucket search, GPU pool bucketing, and GPU candidate
 materialization for BGJ1 by default. BGJ2 and BGJ3 reuse the same CUDA bucket
@@ -149,6 +179,18 @@ challenge runs. Set `BGJ_CUDA_BATCH=1` to enable batching,
 `BGJ_CUDA_BATCH_MIN_DOTS=<n>` to tune the size threshold. With BGJ log level
 `2` or higher, the BGJ1 profile prints CUDA single-bucket, batched, cred, and
 fallback bucket counts, dot counts, and timings.
+CUDA single-bucket search overlaps pair search with the CPU `_search_cred` pass
+by default. The pair kernels read raw center-dot values directly and the host
+waits only for a dot-copy CUDA event before running `_search_cred`. Set
+`BGJ_CUDA_OVERLAP_CRED=0` to disable this path when comparing schedules.
+Multi-GPU execution is opt-in. Set `BGJ_CUDA_DEVICES=0,1` to spread independent
+CUDA search worker threads across two visible runtime devices; each GPU keeps
+its own pool cache and scratch streams. `BGJ_CUDA_NUM_DEVICES=2` is a shorthand
+for devices `0,1`. CUDA sieve wrappers raise the host search thread count to at
+least the active GPU count unless `BGJ_CUDA_HOST_THREADS` is set explicitly, so
+two-device runs have enough host work to feed both GPUs. The SVP-100 benchmark
+harness accepts `--cuda-devices 0,1`, which records the setting in the result
+environment JSON.
 The `app/bgj_epi8 ... cuda` entry point now follows the stronger CPU `bgjf`
 progression: CUDA BGJ1 for the initial and low-dimensional stages, then BGJ2
 and BGJ3 with CUDA search offload above the same thresholds as `bgjf`. The old
