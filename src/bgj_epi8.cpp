@@ -66,6 +66,15 @@ static uint64_t bgj_epi8_env_u64(const char *name, uint64_t default_value)
     return (uint64_t)parsed;
 }
 
+static int bgj_epi8_bgj2_cuda_profile_requested()
+{
+    static const int requested = []() {
+        const char *env = getenv("BGJ_CUDA_BGJ2_PROFILE");
+        return env && env[0] && env[0] != '0';
+    }();
+    return requested;
+}
+
 #if defined(HAVE_CUDA)
 static int bgj_epi8_cuda_work_sort_requested()
 {
@@ -486,6 +495,52 @@ void bgj_profile_data_t<nb>::insert_inner_log(uint64_t *length_stat, uint64_t nu
 
 template <uint32_t nb>
 void bgj_profile_data_t<nb>::final_log(int bgj, long sieving_stucked) {
+    if (bgj == 2 && bgj_epi8_bgj2_cuda_profile_requested() && p->CSD > MIN_LOG_CSD) {
+        fprintf(log_err,
+                "bgj2_cuda_profile: csd=%ld bucket0_wall=%.6fs bucket1_wall=%.6fs "
+                "search0_wall=%.6fs search1_wall=%.6fs sort=%.6fs insert=%.6fs "
+                "search0_ndp=%lu search1_ndp=%lu "
+                "cuda0_single=%lu/%lu/%.6fs cuda0_batch=%lu/%lu/%lu/%.6fs "
+                "cuda0_cred=%.6fs cuda0_fallback=%lu/%lu/%.6fs "
+                "cuda1_single=%lu/%lu/%.6fs cuda1_batch=%lu/%lu/%lu/%.6fs "
+                "cuda1_cred=%.6fs cuda1_fallback=%lu/%lu/%.6fs "
+                "try_add2=%lu try_add3=%lu succ_add2=%lu succ_add3=%lu\n",
+                p->CSD,
+                bucket0_time,
+                bucket1_time,
+                search0_time,
+                search1_time,
+                sort_time,
+                insert_time,
+                (unsigned long)search0_ndp,
+                (unsigned long)search1_ndp,
+                (unsigned long)cuda_single_bucket0,
+                (unsigned long)cuda_single_ndp0,
+                cuda_single_time0,
+                (unsigned long)cuda_batch_call0,
+                (unsigned long)cuda_batch_bucket0,
+                (unsigned long)cuda_batch_ndp0,
+                cuda_batch_time0,
+                cuda_cred_time0,
+                (unsigned long)cuda_fallback_bucket0,
+                (unsigned long)cuda_fallback_ndp0,
+                cuda_fallback_time0,
+                (unsigned long)cuda_single_bucket1,
+                (unsigned long)cuda_single_ndp1,
+                cuda_single_time1,
+                (unsigned long)cuda_batch_call1,
+                (unsigned long)cuda_batch_bucket1,
+                (unsigned long)cuda_batch_ndp1,
+                cuda_batch_time1,
+                cuda_cred_time1,
+                (unsigned long)cuda_fallback_bucket1,
+                (unsigned long)cuda_fallback_ndp1,
+                cuda_fallback_time1,
+                (unsigned long)try_add2,
+                (unsigned long)try_add3,
+                (unsigned long)succ_add2,
+                (unsigned long)succ_add3);
+    }
     if (log_level >= 1 && p->CSD > MIN_LOG_CSD) {
         if (sieving_stucked){
             fprintf(log_out, "sieving stucked, aborted.\n");
