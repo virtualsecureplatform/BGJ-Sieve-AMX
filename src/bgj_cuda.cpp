@@ -74,6 +74,7 @@ const char *bgj_cuda_last_error()
 #include "../include/bucket_epi8.h"
 
 #include <algorithm>
+#include <unordered_set>
 #include <vector>
 
 struct bgj_cuda_host_profile_state_t {
@@ -86,7 +87,10 @@ struct bgj_cuda_host_profile_state_t {
     uint64_t succ_add2;
     uint64_t succ_add3;
     uint64_t type_count[5];
+    uint64_t bucket_uid_unique;
+    uint64_t bucket_uid_dup;
     double sort_sec;
+    double bucket_uid_sec;
     double uid_sec;
     double sol_sec;
     double consume_sec;
@@ -101,7 +105,10 @@ struct bgj_cuda_host_profile_state_t {
           succ_add2(0),
           succ_add3(0),
           type_count(),
+          bucket_uid_unique(0),
+          bucket_uid_dup(0),
           sort_sec(0.0),
+          bucket_uid_sec(0.0),
           uid_sec(0.0),
           sol_sec(0.0),
           consume_sec(0.0)
@@ -132,7 +139,8 @@ static void bgj_cuda_host_profile_dump()
     fprintf(stderr,
             "cuda_host_profile: buckets=%lu results=%lu try_add2=%lu try_add3=%lu "
             "succ_add2=%lu succ_add3=%lu type=[%lu,%lu,%lu,%lu,%lu] "
-            "sort=%.6fs uid=%.6fs sol=%.6fs consume=%.6fs\n",
+            "bucket_uid_unique=%lu bucket_uid_dup=%lu "
+            "sort=%.6fs bucket_uid=%.6fs uid=%.6fs sol=%.6fs consume=%.6fs\n",
             (unsigned long)bgj_cuda_host_profile.buckets,
             (unsigned long)bgj_cuda_host_profile.results,
             (unsigned long)bgj_cuda_host_profile.try_add2,
@@ -144,7 +152,10 @@ static void bgj_cuda_host_profile_dump()
             (unsigned long)bgj_cuda_host_profile.type_count[2],
             (unsigned long)bgj_cuda_host_profile.type_count[3],
             (unsigned long)bgj_cuda_host_profile.type_count[4],
+            (unsigned long)bgj_cuda_host_profile.bucket_uid_unique,
+            (unsigned long)bgj_cuda_host_profile.bucket_uid_dup,
             bgj_cuda_host_profile.sort_sec,
+            bgj_cuda_host_profile.bucket_uid_sec,
             bgj_cuda_host_profile.uid_sec,
             bgj_cuda_host_profile.sol_sec,
             bgj_cuda_host_profile.consume_sec);
@@ -169,7 +180,10 @@ static void bgj_cuda_host_profile_record(uint32_t result_count,
                                          uint64_t succ_add2,
                                          uint64_t succ_add3,
                                          const uint64_t *type_count,
+                                         uint64_t bucket_uid_unique,
+                                         uint64_t bucket_uid_dup,
                                          double sort_sec,
+                                         double bucket_uid_sec,
                                          double uid_sec,
                                          double sol_sec,
                                          double consume_sec)
@@ -187,7 +201,10 @@ static void bgj_cuda_host_profile_record(uint32_t result_count,
     for (uint32_t i = 0; i < 5; i++) {
         bgj_cuda_host_profile.type_count[i] += type_count ? type_count[i] : 0;
     }
+    bgj_cuda_host_profile.bucket_uid_unique += bucket_uid_unique;
+    bgj_cuda_host_profile.bucket_uid_dup += bucket_uid_dup;
     bgj_cuda_host_profile.sort_sec += sort_sec;
+    bgj_cuda_host_profile.bucket_uid_sec += bucket_uid_sec;
     bgj_cuda_host_profile.uid_sec += uid_sec;
     bgj_cuda_host_profile.sol_sec += sol_sec;
     bgj_cuda_host_profile.consume_sec += consume_sec;
@@ -541,10 +558,38 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
     uint64_t succ_add2 = 0;
     uint64_t succ_add3 = 0;
     uint64_t type_count[5] = {0, 0, 0, 0, 0};
+    uint64_t bucket_uid_unique = 0;
+    uint64_t bucket_uid_dup = 0;
+    double bucket_uid_sec = 0.0;
     double uid_sec = 0.0;
     double sol_sec = 0.0;
 
     if (host_profile) {
+        static thread_local std::unordered_set<uint64_t> bucket_uid_seen;
+        int bucket_uid_profile = result_count > 0;
+        if (bucket_uid_profile) {
+            try {
+                bucket_uid_seen.clear();
+                if (bucket_uid_seen.bucket_count() < (size_t)result_count) {
+                    bucket_uid_seen.reserve((size_t)result_count);
+                }
+            } catch (...) {
+                bucket_uid_seen.clear();
+                bucket_uid_profile = 0;
+            }
+        }
+        auto profile_bucket_uid = [&](uint64_t u) {
+            if (!bucket_uid_profile) return;
+            const double t0 = bgj_cuda_host_wall_time();
+            pool->uid->normalize_uid(u);
+            if (bucket_uid_seen.insert(u).second) {
+                bucket_uid_unique++;
+            } else {
+                bucket_uid_dup++;
+            }
+            bucket_uid_sec += bgj_cuda_host_wall_time() - t0;
+        };
+
         for (uint32_t i = 0; i < result_count; i++) {
             const uint32_t x = results[i].x;
             const uint32_t y = results[i].y;
@@ -554,6 +599,7 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
             case BGJ_CUDA_SOL_A: {
                 try_add2++;
                 const uint64_t u = pool->vu[x] + pool->vu[y];
+                profile_bucket_uid(u);
                 double t0 = bgj_cuda_host_wall_time();
                 const int inserted = pool->uid->insert_uid(u);
                 uid_sec += bgj_cuda_host_wall_time() - t0;
@@ -568,6 +614,7 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
             case BGJ_CUDA_SOL_S: {
                 try_add2++;
                 const uint64_t u = pool->vu[x] - pool->vu[y];
+                profile_bucket_uid(u);
                 double t0 = bgj_cuda_host_wall_time();
                 const int inserted = pool->uid->insert_uid(u);
                 uid_sec += bgj_cuda_host_wall_time() - t0;
@@ -582,6 +629,7 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
             case BGJ_CUDA_SOL_AA: {
                 try_add3++;
                 const uint64_t u = bkt->center_u + pool->vu[x] + pool->vu[y];
+                profile_bucket_uid(u);
                 double t0 = bgj_cuda_host_wall_time();
                 const int inserted = pool->uid->insert_uid(u);
                 uid_sec += bgj_cuda_host_wall_time() - t0;
@@ -596,6 +644,7 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
             case BGJ_CUDA_SOL_SA: {
                 try_add3++;
                 const uint64_t u = bkt->center_u - pool->vu[x] + pool->vu[y];
+                profile_bucket_uid(u);
                 double t0 = bgj_cuda_host_wall_time();
                 const int inserted = pool->uid->insert_uid(u);
                 uid_sec += bgj_cuda_host_wall_time() - t0;
@@ -610,6 +659,7 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
             case BGJ_CUDA_SOL_SS: {
                 try_add3++;
                 const uint64_t u = bkt->center_u - pool->vu[x] - pool->vu[y];
+                profile_bucket_uid(u);
                 double t0 = bgj_cuda_host_wall_time();
                 const int inserted = pool->uid->insert_uid(u);
                 uid_sec += bgj_cuda_host_wall_time() - t0;
@@ -697,7 +747,10 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
                                      succ_add2,
                                      succ_add3,
                                      type_count,
+                                     bucket_uid_unique,
+                                     bucket_uid_dup,
                                      sort_sec,
+                                     bucket_uid_sec,
                                      uid_sec,
                                      sol_sec,
                                      bgj_cuda_host_wall_time() - consume_t0);
