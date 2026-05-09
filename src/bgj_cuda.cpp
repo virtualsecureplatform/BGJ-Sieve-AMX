@@ -85,7 +85,10 @@ struct bgj_cuda_host_profile_state_t {
     uint64_t try_add3;
     uint64_t succ_add2;
     uint64_t succ_add3;
+    uint64_t type_count[5];
     double sort_sec;
+    double uid_sec;
+    double sol_sec;
     double consume_sec;
 
     bgj_cuda_host_profile_state_t()
@@ -97,7 +100,10 @@ struct bgj_cuda_host_profile_state_t {
           try_add3(0),
           succ_add2(0),
           succ_add3(0),
+          type_count(),
           sort_sec(0.0),
+          uid_sec(0.0),
+          sol_sec(0.0),
           consume_sec(0.0)
     {
     }
@@ -125,14 +131,22 @@ static void bgj_cuda_host_profile_dump()
     pthread_mutex_lock(&bgj_cuda_host_profile.lock);
     fprintf(stderr,
             "cuda_host_profile: buckets=%lu results=%lu try_add2=%lu try_add3=%lu "
-            "succ_add2=%lu succ_add3=%lu sort=%.6fs consume=%.6fs\n",
+            "succ_add2=%lu succ_add3=%lu type=[%lu,%lu,%lu,%lu,%lu] "
+            "sort=%.6fs uid=%.6fs sol=%.6fs consume=%.6fs\n",
             (unsigned long)bgj_cuda_host_profile.buckets,
             (unsigned long)bgj_cuda_host_profile.results,
             (unsigned long)bgj_cuda_host_profile.try_add2,
             (unsigned long)bgj_cuda_host_profile.try_add3,
             (unsigned long)bgj_cuda_host_profile.succ_add2,
             (unsigned long)bgj_cuda_host_profile.succ_add3,
+            (unsigned long)bgj_cuda_host_profile.type_count[0],
+            (unsigned long)bgj_cuda_host_profile.type_count[1],
+            (unsigned long)bgj_cuda_host_profile.type_count[2],
+            (unsigned long)bgj_cuda_host_profile.type_count[3],
+            (unsigned long)bgj_cuda_host_profile.type_count[4],
             bgj_cuda_host_profile.sort_sec,
+            bgj_cuda_host_profile.uid_sec,
+            bgj_cuda_host_profile.sol_sec,
             bgj_cuda_host_profile.consume_sec);
     pthread_mutex_unlock(&bgj_cuda_host_profile.lock);
 }
@@ -154,7 +168,10 @@ static void bgj_cuda_host_profile_record(uint32_t result_count,
                                          uint64_t try_add3,
                                          uint64_t succ_add2,
                                          uint64_t succ_add3,
+                                         const uint64_t *type_count,
                                          double sort_sec,
+                                         double uid_sec,
+                                         double sol_sec,
                                          double consume_sec)
 {
     if (!bgj_cuda_host_profile_requested()) return;
@@ -167,7 +184,12 @@ static void bgj_cuda_host_profile_record(uint32_t result_count,
     bgj_cuda_host_profile.try_add3 += try_add3;
     bgj_cuda_host_profile.succ_add2 += succ_add2;
     bgj_cuda_host_profile.succ_add3 += succ_add3;
+    for (uint32_t i = 0; i < 5; i++) {
+        bgj_cuda_host_profile.type_count[i] += type_count ? type_count[i] : 0;
+    }
     bgj_cuda_host_profile.sort_sec += sort_sec;
+    bgj_cuda_host_profile.uid_sec += uid_sec;
+    bgj_cuda_host_profile.sol_sec += sol_sec;
     bgj_cuda_host_profile.consume_sec += consume_sec;
     pthread_mutex_unlock(&bgj_cuda_host_profile.lock);
 }
@@ -452,7 +474,8 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
                                          bgj_cuda_result_t *results,
                                          uint32_t result_count)
 {
-    const double consume_t0 = bgj_cuda_host_wall_time();
+    const int host_profile = bgj_cuda_host_profile_requested();
+    const double consume_t0 = host_profile ? bgj_cuda_host_wall_time() : 0.0;
     double sort_sec = 0.0;
     const uint32_t num_p = (uint32_t)bkt->num_pvec;
     const uint32_t num_n = (uint32_t)bkt->num_nvec;
@@ -517,58 +540,144 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
     uint64_t try_add3 = 0;
     uint64_t succ_add2 = 0;
     uint64_t succ_add3 = 0;
+    uint64_t type_count[5] = {0, 0, 0, 0, 0};
+    double uid_sec = 0.0;
+    double sol_sec = 0.0;
 
-    for (uint32_t i = 0; i < result_count; i++) {
-        const uint32_t x = results[i].x;
-        const uint32_t y = results[i].y;
-        switch (results[i].type) {
-        case BGJ_CUDA_SOL_A: {
-            try_add2++;
-            const uint64_t u = pool->vu[x] + pool->vu[y];
-            if (pool->uid->insert_uid(u)) {
-                succ_add2++;
-                sol->add_sol_a(x, y);
+    if (host_profile) {
+        for (uint32_t i = 0; i < result_count; i++) {
+            const uint32_t x = results[i].x;
+            const uint32_t y = results[i].y;
+            const uint32_t type = results[i].type;
+            if (type < 5) type_count[type]++;
+            switch (type) {
+            case BGJ_CUDA_SOL_A: {
+                try_add2++;
+                const uint64_t u = pool->vu[x] + pool->vu[y];
+                double t0 = bgj_cuda_host_wall_time();
+                const int inserted = pool->uid->insert_uid(u);
+                uid_sec += bgj_cuda_host_wall_time() - t0;
+                if (inserted) {
+                    succ_add2++;
+                    t0 = bgj_cuda_host_wall_time();
+                    sol->add_sol_a(x, y);
+                    sol_sec += bgj_cuda_host_wall_time() - t0;
+                }
+                break;
             }
-            break;
-        }
-        case BGJ_CUDA_SOL_S: {
-            try_add2++;
-            const uint64_t u = pool->vu[x] - pool->vu[y];
-            if (pool->uid->insert_uid(u)) {
-                succ_add2++;
-                sol->add_sol_s(x, y);
+            case BGJ_CUDA_SOL_S: {
+                try_add2++;
+                const uint64_t u = pool->vu[x] - pool->vu[y];
+                double t0 = bgj_cuda_host_wall_time();
+                const int inserted = pool->uid->insert_uid(u);
+                uid_sec += bgj_cuda_host_wall_time() - t0;
+                if (inserted) {
+                    succ_add2++;
+                    t0 = bgj_cuda_host_wall_time();
+                    sol->add_sol_s(x, y);
+                    sol_sec += bgj_cuda_host_wall_time() - t0;
+                }
+                break;
             }
-            break;
-        }
-        case BGJ_CUDA_SOL_AA: {
-            try_add3++;
-            const uint64_t u = bkt->center_u + pool->vu[x] + pool->vu[y];
-            if (pool->uid->insert_uid(u)) {
-                succ_add3++;
-                sol->add_sol_aa(bkt->center_ind, x, y);
+            case BGJ_CUDA_SOL_AA: {
+                try_add3++;
+                const uint64_t u = bkt->center_u + pool->vu[x] + pool->vu[y];
+                double t0 = bgj_cuda_host_wall_time();
+                const int inserted = pool->uid->insert_uid(u);
+                uid_sec += bgj_cuda_host_wall_time() - t0;
+                if (inserted) {
+                    succ_add3++;
+                    t0 = bgj_cuda_host_wall_time();
+                    sol->add_sol_aa(bkt->center_ind, x, y);
+                    sol_sec += bgj_cuda_host_wall_time() - t0;
+                }
+                break;
             }
-            break;
-        }
-        case BGJ_CUDA_SOL_SA: {
-            try_add3++;
-            const uint64_t u = bkt->center_u - pool->vu[x] + pool->vu[y];
-            if (pool->uid->insert_uid(u)) {
-                succ_add3++;
-                sol->add_sol_sa(bkt->center_ind, x, y);
+            case BGJ_CUDA_SOL_SA: {
+                try_add3++;
+                const uint64_t u = bkt->center_u - pool->vu[x] + pool->vu[y];
+                double t0 = bgj_cuda_host_wall_time();
+                const int inserted = pool->uid->insert_uid(u);
+                uid_sec += bgj_cuda_host_wall_time() - t0;
+                if (inserted) {
+                    succ_add3++;
+                    t0 = bgj_cuda_host_wall_time();
+                    sol->add_sol_sa(bkt->center_ind, x, y);
+                    sol_sec += bgj_cuda_host_wall_time() - t0;
+                }
+                break;
             }
-            break;
-        }
-        case BGJ_CUDA_SOL_SS: {
-            try_add3++;
-            const uint64_t u = bkt->center_u - pool->vu[x] - pool->vu[y];
-            if (pool->uid->insert_uid(u)) {
-                succ_add3++;
-                sol->add_sol_ss(bkt->center_ind, x, y);
+            case BGJ_CUDA_SOL_SS: {
+                try_add3++;
+                const uint64_t u = bkt->center_u - pool->vu[x] - pool->vu[y];
+                double t0 = bgj_cuda_host_wall_time();
+                const int inserted = pool->uid->insert_uid(u);
+                uid_sec += bgj_cuda_host_wall_time() - t0;
+                if (inserted) {
+                    succ_add3++;
+                    t0 = bgj_cuda_host_wall_time();
+                    sol->add_sol_ss(bkt->center_ind, x, y);
+                    sol_sec += bgj_cuda_host_wall_time() - t0;
+                }
+                break;
             }
-            break;
+            default:
+                break;
+            }
         }
-        default:
-            break;
+    } else {
+        for (uint32_t i = 0; i < result_count; i++) {
+            const uint32_t x = results[i].x;
+            const uint32_t y = results[i].y;
+            switch (results[i].type) {
+            case BGJ_CUDA_SOL_A: {
+                try_add2++;
+                const uint64_t u = pool->vu[x] + pool->vu[y];
+                if (pool->uid->insert_uid(u)) {
+                    succ_add2++;
+                    sol->add_sol_a(x, y);
+                }
+                break;
+            }
+            case BGJ_CUDA_SOL_S: {
+                try_add2++;
+                const uint64_t u = pool->vu[x] - pool->vu[y];
+                if (pool->uid->insert_uid(u)) {
+                    succ_add2++;
+                    sol->add_sol_s(x, y);
+                }
+                break;
+            }
+            case BGJ_CUDA_SOL_AA: {
+                try_add3++;
+                const uint64_t u = bkt->center_u + pool->vu[x] + pool->vu[y];
+                if (pool->uid->insert_uid(u)) {
+                    succ_add3++;
+                    sol->add_sol_aa(bkt->center_ind, x, y);
+                }
+                break;
+            }
+            case BGJ_CUDA_SOL_SA: {
+                try_add3++;
+                const uint64_t u = bkt->center_u - pool->vu[x] + pool->vu[y];
+                if (pool->uid->insert_uid(u)) {
+                    succ_add3++;
+                    sol->add_sol_sa(bkt->center_ind, x, y);
+                }
+                break;
+            }
+            case BGJ_CUDA_SOL_SS: {
+                try_add3++;
+                const uint64_t u = bkt->center_u - pool->vu[x] - pool->vu[y];
+                if (pool->uid->insert_uid(u)) {
+                    succ_add3++;
+                    sol->add_sol_ss(bkt->center_ind, x, y);
+                }
+                break;
+            }
+            default:
+                break;
+            }
         }
     }
 
@@ -581,13 +690,18 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
         pthread_spin_unlock(&prof->profile_lock);
     }
 
-    bgj_cuda_host_profile_record(result_count,
-                                 try_add2,
-                                 try_add3,
-                                 succ_add2,
-                                 succ_add3,
-                                 sort_sec,
-                                 bgj_cuda_host_wall_time() - consume_t0);
+    if (host_profile) {
+        bgj_cuda_host_profile_record(result_count,
+                                     try_add2,
+                                     try_add3,
+                                     succ_add2,
+                                     succ_add3,
+                                     type_count,
+                                     sort_sec,
+                                     uid_sec,
+                                     sol_sec,
+                                     bgj_cuda_host_wall_time() - consume_t0);
+    }
     return 1;
 }
 
