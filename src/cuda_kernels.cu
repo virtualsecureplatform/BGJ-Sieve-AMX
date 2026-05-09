@@ -3,6 +3,7 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <mma.h>
+#include <algorithm>
 #include <pthread.h>
 #include <new>
 #include <stdint.h>
@@ -256,12 +257,16 @@ static thread_local bgj_cuda_raw_batch_scratch_t bgj_cuda_raw_batch_scratch;
 struct bgj_cuda_raw_async_state_t {
     int active;
     uint64_t estimated_dots;
+    uint32_t num_p;
+    uint32_t num_n;
     double total_t0;
     double submit_sec;
 
     bgj_cuda_raw_async_state_t()
         : active(0),
           estimated_dots(0),
+          num_p(0),
+          num_n(0),
           total_t0(0.0),
           submit_sec(0.0)
     {
@@ -560,6 +565,266 @@ static void bgj_cuda_device_profile_record(int device,
     entry->copy_sec += copy_sec;
     entry->total_sec += total_sec;
     pthread_mutex_unlock(&bgj_cuda_device_profile.lock);
+}
+
+enum bgj_cuda_bucket_profile_kind_t {
+    BGJ_CUDA_BUCKET_PROFILE_SINGLE = 0,
+    BGJ_CUDA_BUCKET_PROFILE_ASYNC = 1,
+    BGJ_CUDA_BUCKET_PROFILE_BATCH = 2,
+    BGJ_CUDA_BUCKET_PROFILE_BATCH_ITEM = 3
+};
+
+struct bgj_cuda_bucket_profile_entry_t {
+    uint64_t seq;
+    uint64_t score;
+    uint64_t estimated_dots;
+    uint64_t results;
+    uint64_t overflows;
+    uint64_t failures;
+    uint32_t num_p;
+    uint32_t num_n;
+    uint32_t batch_size;
+    uint32_t batch_index;
+    int device;
+    int kind;
+    double submit_sec;
+    double wait_sec;
+    double copy_sec;
+    double total_sec;
+};
+
+struct bgj_cuda_bucket_profile_state_t {
+    pthread_mutex_t lock;
+    int enabled;
+    int limit;
+    uint64_t dump_every;
+    uint64_t next_dump_seq;
+    uint64_t next_seq;
+    int slow_count;
+    int work_count;
+    bgj_cuda_bucket_profile_entry_t slow[256];
+    bgj_cuda_bucket_profile_entry_t work[256];
+
+    bgj_cuda_bucket_profile_state_t()
+        : enabled(0),
+          limit(64),
+          dump_every(0),
+          next_dump_seq(0),
+          next_seq(0),
+          slow_count(0),
+          work_count(0),
+          slow(),
+          work()
+    {
+        pthread_mutex_init(&lock, NULL);
+    }
+
+    ~bgj_cuda_bucket_profile_state_t()
+    {
+        pthread_mutex_destroy(&lock);
+    }
+};
+
+static bgj_cuda_bucket_profile_state_t bgj_cuda_bucket_profile;
+static pthread_once_t bgj_cuda_bucket_profile_once = PTHREAD_ONCE_INIT;
+
+static void bgj_cuda_bucket_profile_dump();
+
+static long bgj_cuda_bucket_profile_parse_long(const char *name, long default_value)
+{
+    const char *env = getenv(name);
+    if (!env || !env[0]) return default_value;
+    char *end = NULL;
+    long parsed = strtol(env, &end, 10);
+    if (end == env) return default_value;
+    return parsed;
+}
+
+static void bgj_cuda_bucket_profile_init_once()
+{
+    const char *env = getenv("BGJ_CUDA_BUCKET_PROFILE");
+    bgj_cuda_bucket_profile.enabled = env && env[0] && env[0] != '0';
+    if (!bgj_cuda_bucket_profile.enabled) return;
+
+    long limit = bgj_cuda_bucket_profile_parse_long("BGJ_CUDA_BUCKET_PROFILE_TOP", 64);
+    if (limit < 1) limit = 1;
+    if (limit > 256) limit = 256;
+    bgj_cuda_bucket_profile.limit = (int)limit;
+
+    long dump_every =
+        bgj_cuda_bucket_profile_parse_long("BGJ_CUDA_BUCKET_PROFILE_DUMP_EVERY", 0);
+    if (dump_every < 0) dump_every = 0;
+    bgj_cuda_bucket_profile.dump_every = (uint64_t)dump_every;
+    bgj_cuda_bucket_profile.next_dump_seq = (uint64_t)dump_every;
+
+    atexit(bgj_cuda_bucket_profile_dump);
+}
+
+static int bgj_cuda_bucket_profile_requested()
+{
+    pthread_once(&bgj_cuda_bucket_profile_once, bgj_cuda_bucket_profile_init_once);
+    return bgj_cuda_bucket_profile.enabled;
+}
+
+static int bgj_cuda_bucket_profile_limit()
+{
+    pthread_once(&bgj_cuda_bucket_profile_once, bgj_cuda_bucket_profile_init_once);
+    return bgj_cuda_bucket_profile.limit;
+}
+
+static const char *bgj_cuda_bucket_profile_kind_name(int kind)
+{
+    switch (kind) {
+    case BGJ_CUDA_BUCKET_PROFILE_SINGLE:
+        return "single";
+    case BGJ_CUDA_BUCKET_PROFILE_ASYNC:
+        return "async";
+    case BGJ_CUDA_BUCKET_PROFILE_BATCH:
+        return "batch";
+    case BGJ_CUDA_BUCKET_PROFILE_BATCH_ITEM:
+        return "batch_item";
+    default:
+        return "unknown";
+    }
+}
+
+static void bgj_cuda_bucket_profile_dump_list(const char *label,
+                                              const bgj_cuda_bucket_profile_entry_t *entries,
+                                              int count)
+{
+    bgj_cuda_bucket_profile_entry_t sorted[256];
+    for (int i = 0; i < count; i++) sorted[i] = entries[i];
+    std::sort(sorted, sorted + count,
+              [](const bgj_cuda_bucket_profile_entry_t &a,
+                 const bgj_cuda_bucket_profile_entry_t &b) {
+                  if (a.score != b.score) return a.score > b.score;
+                  return a.seq < b.seq;
+              });
+    for (int i = 0; i < count; i++) {
+        const bgj_cuda_bucket_profile_entry_t *e = &sorted[i];
+        fprintf(stderr,
+                "%s: rank=%d seq=%lu kind=%s device=%d batch=%u/%u "
+                "num_p=%u num_n=%u dots=%lu results=%lu overflows=%lu "
+                "failures=%lu submit=%.6fs wait=%.6fs copy=%.6fs total=%.6fs "
+                "score=%lu\n",
+                label,
+                i + 1,
+                (unsigned long)e->seq,
+                bgj_cuda_bucket_profile_kind_name(e->kind),
+                e->device,
+                e->batch_index,
+                e->batch_size,
+                e->num_p,
+                e->num_n,
+                (unsigned long)e->estimated_dots,
+                (unsigned long)e->results,
+                (unsigned long)e->overflows,
+                (unsigned long)e->failures,
+                e->submit_sec,
+                e->wait_sec,
+                e->copy_sec,
+                e->total_sec,
+                (unsigned long)e->score);
+    }
+}
+
+static void bgj_cuda_bucket_profile_dump_snapshot(const char *reason)
+{
+    if (!bgj_cuda_bucket_profile_requested()) return;
+    pthread_mutex_lock(&bgj_cuda_bucket_profile.lock);
+    fprintf(stderr,
+            "cuda_bucket_profile_summary: reason=%s records=%lu top=%d dump_every=%lu\n",
+            reason,
+            (unsigned long)bgj_cuda_bucket_profile.next_seq,
+            bgj_cuda_bucket_profile.limit,
+            (unsigned long)bgj_cuda_bucket_profile.dump_every);
+    bgj_cuda_bucket_profile_dump_list("cuda_bucket_profile_slow",
+                                      bgj_cuda_bucket_profile.slow,
+                                      bgj_cuda_bucket_profile.slow_count);
+    bgj_cuda_bucket_profile_dump_list("cuda_bucket_profile_work",
+                                      bgj_cuda_bucket_profile.work,
+                                      bgj_cuda_bucket_profile.work_count);
+    fflush(stderr);
+    pthread_mutex_unlock(&bgj_cuda_bucket_profile.lock);
+}
+
+static void bgj_cuda_bucket_profile_dump()
+{
+    bgj_cuda_bucket_profile_dump_snapshot("exit");
+}
+
+static void bgj_cuda_bucket_profile_insert_top(bgj_cuda_bucket_profile_entry_t *entries,
+                                               int *count,
+                                               const bgj_cuda_bucket_profile_entry_t &entry,
+                                               int limit)
+{
+    if (*count < limit) {
+        entries[*count] = entry;
+        (*count)++;
+        return;
+    }
+    int min_index = 0;
+    for (int i = 1; i < *count; i++) {
+        if (entries[i].score < entries[min_index].score) min_index = i;
+    }
+    if (entry.score > entries[min_index].score) entries[min_index] = entry;
+}
+
+static void bgj_cuda_bucket_profile_record(int kind,
+                                           int device,
+                                           uint32_t batch_size,
+                                           uint32_t batch_index,
+                                           uint32_t num_p,
+                                           uint32_t num_n,
+                                           uint64_t estimated_dots,
+                                           uint64_t results,
+                                           uint64_t overflows,
+                                           uint64_t failures,
+                                           double submit_sec,
+                                           double wait_sec,
+                                           double copy_sec,
+                                           double total_sec)
+{
+    if (!bgj_cuda_bucket_profile_requested()) return;
+
+    bgj_cuda_bucket_profile_entry_t entry = {};
+    entry.kind = kind;
+    entry.device = device;
+    entry.batch_size = batch_size;
+    entry.batch_index = batch_index;
+    entry.num_p = num_p;
+    entry.num_n = num_n;
+    entry.estimated_dots = estimated_dots;
+    entry.results = results;
+    entry.overflows = overflows;
+    entry.failures = failures;
+    entry.submit_sec = submit_sec;
+    entry.wait_sec = wait_sec;
+    entry.copy_sec = copy_sec;
+    entry.total_sec = total_sec;
+
+    int should_dump = 0;
+    const int limit = bgj_cuda_bucket_profile_limit();
+    pthread_mutex_lock(&bgj_cuda_bucket_profile.lock);
+    entry.seq = ++bgj_cuda_bucket_profile.next_seq;
+    entry.score = (uint64_t)(total_sec * 1000000.0);
+    bgj_cuda_bucket_profile_insert_top(bgj_cuda_bucket_profile.slow,
+                                       &bgj_cuda_bucket_profile.slow_count,
+                                       entry,
+                                       limit);
+    entry.score = estimated_dots;
+    bgj_cuda_bucket_profile_insert_top(bgj_cuda_bucket_profile.work,
+                                       &bgj_cuda_bucket_profile.work_count,
+                                       entry,
+                                       limit);
+    if (bgj_cuda_bucket_profile.dump_every &&
+        entry.seq >= bgj_cuda_bucket_profile.next_dump_seq) {
+        bgj_cuda_bucket_profile.next_dump_seq = entry.seq + bgj_cuda_bucket_profile.dump_every;
+        should_dump = 1;
+    }
+    pthread_mutex_unlock(&bgj_cuda_bucket_profile.lock);
+
+    if (should_dump) bgj_cuda_bucket_profile_dump_snapshot("periodic");
 }
 
 static int bgj_cuda_add_execution_device(int *devices, int *count, int runtime_count, long device)
@@ -5951,6 +6216,20 @@ static int bgj_cuda_search_bucket_raw_impl(const int8_t *p_vecs,
                                            result_capacity,
                                            &h_result_count,
                                            &h_overflow)) {
+        bgj_cuda_bucket_profile_record(BGJ_CUDA_BUCKET_PROFILE_SINGLE,
+                                       scratch->device,
+                                       1,
+                                       0,
+                                       num_p,
+                                       num_n,
+                                       estimated_dots,
+                                       0,
+                                       0,
+                                       1,
+                                       bgj_cuda_wall_time() - submit_t0,
+                                       0.0,
+                                       0.0,
+                                       bgj_cuda_wall_time() - total_t0);
         bgj_cuda_device_profile_record(scratch->device,
                                        1,
                                        estimated_dots,
@@ -5977,6 +6256,20 @@ static int bgj_cuda_search_bucket_raw_impl(const int8_t *p_vecs,
                                           h_overflow,
                                           result_count,
                                           overflow)) {
+        bgj_cuda_bucket_profile_record(BGJ_CUDA_BUCKET_PROFILE_SINGLE,
+                                       scratch->device,
+                                       1,
+                                       0,
+                                       num_p,
+                                       num_n,
+                                       estimated_dots,
+                                       h_result_count,
+                                       h_overflow ? 1 : 0,
+                                       1,
+                                       submit_sec,
+                                       wait_sec,
+                                       bgj_cuda_wall_time() - copy_t0,
+                                       bgj_cuda_wall_time() - total_t0);
         bgj_cuda_device_profile_record(scratch->device,
                                        1,
                                        estimated_dots,
@@ -5993,6 +6286,20 @@ static int bgj_cuda_search_bucket_raw_impl(const int8_t *p_vecs,
     copy_sec = bgj_cuda_wall_time() - copy_t0;
 
     set_plain_error("no CUDA error");
+    bgj_cuda_bucket_profile_record(BGJ_CUDA_BUCKET_PROFILE_SINGLE,
+                                   scratch->device,
+                                   1,
+                                   0,
+                                   num_p,
+                                   num_n,
+                                   estimated_dots,
+                                   *result_count,
+                                   *overflow ? 1 : 0,
+                                   0,
+                                   submit_sec,
+                                   wait_sec,
+                                   copy_sec,
+                                   bgj_cuda_wall_time() - total_t0);
     bgj_cuda_device_profile_record(scratch->device,
                                    1,
                                    estimated_dots,
@@ -6006,6 +6313,20 @@ static int bgj_cuda_search_bucket_raw_impl(const int8_t *p_vecs,
     return 1;
 
 fail:
+    bgj_cuda_bucket_profile_record(BGJ_CUDA_BUCKET_PROFILE_SINGLE,
+                                   scratch->device,
+                                   1,
+                                   0,
+                                   num_p,
+                                   num_n,
+                                   estimated_dots,
+                                   h_result_count,
+                                   h_overflow ? 1 : 0,
+                                   1,
+                                   submit_sec,
+                                   wait_sec,
+                                   copy_sec,
+                                   bgj_cuda_wall_time() - total_t0);
     bgj_cuda_device_profile_record(scratch->device,
                                    1,
                                    estimated_dots,
@@ -6077,6 +6398,20 @@ extern "C" int bgj_cuda_search_bucket_pool_raw_submit_async(const int8_t *pool_v
                                            submitted_result_count,
                                            submitted_overflow)) {
         if (scratch->stream_ready) cudaStreamSynchronize(scratch->stream);
+        bgj_cuda_bucket_profile_record(BGJ_CUDA_BUCKET_PROFILE_ASYNC,
+                                       scratch->device,
+                                       1,
+                                       0,
+                                       num_p,
+                                       num_n,
+                                       estimated_dots,
+                                       0,
+                                       0,
+                                       1,
+                                       bgj_cuda_wall_time() - submit_t0,
+                                       0.0,
+                                       0.0,
+                                       bgj_cuda_wall_time() - total_t0);
         bgj_cuda_device_profile_record(scratch->device,
                                        1,
                                        estimated_dots,
@@ -6092,6 +6427,8 @@ extern "C" int bgj_cuda_search_bucket_pool_raw_submit_async(const int8_t *pool_v
 
     bgj_cuda_raw_async_state.active = 1;
     bgj_cuda_raw_async_state.estimated_dots = estimated_dots;
+    bgj_cuda_raw_async_state.num_p = num_p;
+    bgj_cuda_raw_async_state.num_n = num_n;
     bgj_cuda_raw_async_state.total_t0 = total_t0;
     bgj_cuda_raw_async_state.submit_sec = bgj_cuda_wall_time() - submit_t0;
     set_plain_error("no CUDA error");
@@ -6155,6 +6492,20 @@ extern "C" int bgj_cuda_search_bucket_raw_finish_async(bgj_cuda_result_t *result
                                           h_overflow,
                                           result_count,
                                           overflow)) {
+        bgj_cuda_bucket_profile_record(BGJ_CUDA_BUCKET_PROFILE_ASYNC,
+                                       scratch->device,
+                                       1,
+                                       0,
+                                       bgj_cuda_raw_async_state.num_p,
+                                       bgj_cuda_raw_async_state.num_n,
+                                       bgj_cuda_raw_async_state.estimated_dots,
+                                       h_result_count,
+                                       h_overflow ? 1 : 0,
+                                       1,
+                                       bgj_cuda_raw_async_state.submit_sec,
+                                       wait_sec,
+                                       bgj_cuda_wall_time() - copy_t0,
+                                       bgj_cuda_wall_time() - bgj_cuda_raw_async_state.total_t0);
         bgj_cuda_device_profile_record(scratch->device,
                                        1,
                                        bgj_cuda_raw_async_state.estimated_dots,
@@ -6172,6 +6523,20 @@ extern "C" int bgj_cuda_search_bucket_raw_finish_async(bgj_cuda_result_t *result
     copy_sec = bgj_cuda_wall_time() - copy_t0;
 
     set_plain_error("no CUDA error");
+    bgj_cuda_bucket_profile_record(BGJ_CUDA_BUCKET_PROFILE_ASYNC,
+                                   scratch->device,
+                                   1,
+                                   0,
+                                   bgj_cuda_raw_async_state.num_p,
+                                   bgj_cuda_raw_async_state.num_n,
+                                   bgj_cuda_raw_async_state.estimated_dots,
+                                   result_count ? *result_count : 0,
+                                   overflow && *overflow ? 1 : 0,
+                                   0,
+                                   bgj_cuda_raw_async_state.submit_sec,
+                                   wait_sec,
+                                   copy_sec,
+                                   bgj_cuda_wall_time() - bgj_cuda_raw_async_state.total_t0);
     bgj_cuda_device_profile_record(scratch->device,
                                    1,
                                    bgj_cuda_raw_async_state.estimated_dots,
@@ -6186,6 +6551,20 @@ extern "C" int bgj_cuda_search_bucket_raw_finish_async(bgj_cuda_result_t *result
     return 1;
 
 fail:
+    bgj_cuda_bucket_profile_record(BGJ_CUDA_BUCKET_PROFILE_ASYNC,
+                                   scratch->device,
+                                   1,
+                                   0,
+                                   bgj_cuda_raw_async_state.num_p,
+                                   bgj_cuda_raw_async_state.num_n,
+                                   bgj_cuda_raw_async_state.estimated_dots,
+                                   submitted_result_count ? *submitted_result_count : 0,
+                                   submitted_overflow && *submitted_overflow ? 1 : 0,
+                                   1,
+                                   bgj_cuda_raw_async_state.submit_sec,
+                                   wait_sec,
+                                   copy_sec,
+                                   bgj_cuda_wall_time() - bgj_cuda_raw_async_state.total_t0);
     bgj_cuda_device_profile_record(scratch->device,
                                    1,
                                    bgj_cuda_raw_async_state.estimated_dots,
@@ -6338,6 +6717,8 @@ extern "C" int bgj_cuda_search_bucket_pool_batch_raw(const int8_t *pool_vecs,
     uint64_t estimated_dots = 0;
     uint64_t total_results = 0;
     uint64_t total_overflows = 0;
+    uint32_t max_num_p = 0;
+    uint32_t max_num_n = 0;
     const double total_t0 = bgj_cuda_wall_time();
     double submit_sec = 0.0;
     double wait_sec = 0.0;
@@ -6350,6 +6731,8 @@ extern "C" int bgj_cuda_search_bucket_pool_batch_raw(const int8_t *pool_vecs,
         result_count[i] = 0;
         overflow[i] = 0;
         estimated_dots += bgj_cuda_estimated_pair_dots(num_p[i], num_n[i]);
+        if (num_p[i] > max_num_p) max_num_p = num_p[i];
+        if (num_n[i] > max_num_n) max_num_n = num_n[i];
         bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get(i);
         if (!scratch) {
             set_plain_error("out of host memory");
@@ -6429,6 +6812,37 @@ extern "C" int bgj_cuda_search_bucket_pool_batch_raw(const int8_t *pool_vecs,
     }
 
     set_plain_error("no CUDA error");
+    for (uint32_t i = 0; i < submitted; i++) {
+        bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get(i);
+        bgj_cuda_bucket_profile_record(BGJ_CUDA_BUCKET_PROFILE_BATCH_ITEM,
+                                       scratch ? scratch->device : selected_device,
+                                       submitted,
+                                       i,
+                                       num_p[i],
+                                       num_n[i],
+                                       bgj_cuda_estimated_pair_dots(num_p[i], num_n[i]),
+                                       result_count[i],
+                                       overflow[i] ? 1 : 0,
+                                       0,
+                                       0.0,
+                                       0.0,
+                                       0.0,
+                                       0.0);
+    }
+    bgj_cuda_bucket_profile_record(BGJ_CUDA_BUCKET_PROFILE_BATCH,
+                                   selected_device,
+                                   submitted,
+                                   0,
+                                   max_num_p,
+                                   max_num_n,
+                                   estimated_dots,
+                                   total_results,
+                                   total_overflows,
+                                   0,
+                                   submit_sec,
+                                   wait_sec,
+                                   copy_sec,
+                                   bgj_cuda_wall_time() - total_t0);
     bgj_cuda_device_profile_record(selected_device,
                                    submitted,
                                    estimated_dots,
@@ -6450,6 +6864,37 @@ fail_sync:
         total_results += result_count[i];
         if (overflow[i]) total_overflows++;
     }
+    for (uint32_t i = 0; i < submitted; i++) {
+        bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get(i);
+        bgj_cuda_bucket_profile_record(BGJ_CUDA_BUCKET_PROFILE_BATCH_ITEM,
+                                       scratch ? scratch->device : selected_device,
+                                       submitted,
+                                       i,
+                                       num_p[i],
+                                       num_n[i],
+                                       bgj_cuda_estimated_pair_dots(num_p[i], num_n[i]),
+                                       result_count[i],
+                                       overflow[i] ? 1 : 0,
+                                       1,
+                                       0.0,
+                                       0.0,
+                                       0.0,
+                                       0.0);
+    }
+    bgj_cuda_bucket_profile_record(BGJ_CUDA_BUCKET_PROFILE_BATCH,
+                                   selected_device,
+                                   submitted,
+                                   0,
+                                   max_num_p,
+                                   max_num_n,
+                                   estimated_dots,
+                                   total_results,
+                                   total_overflows,
+                                   1,
+                                   submit_sec,
+                                   wait_sec,
+                                   copy_sec,
+                                   bgj_cuda_wall_time() - total_t0);
     bgj_cuda_device_profile_record(selected_device,
                                    submitted,
                                    estimated_dots,
