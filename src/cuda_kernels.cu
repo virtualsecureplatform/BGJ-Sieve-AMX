@@ -46,6 +46,30 @@ union bgj_cuda_i8_b_frag_u {
     uint64_t word[BGJ_CUDA_I8_B_FRAG_WORDS];
 };
 
+enum bgj_cuda_search_phase_t {
+    BGJ_CUDA_SEARCH_PHASE_H2D = 0,
+    BGJ_CUDA_SEARCH_PHASE_PACK = 1,
+    BGJ_CUDA_SEARCH_PHASE_CRED = 2,
+    BGJ_CUDA_SEARCH_PHASE_DET_COUNT = 3,
+    BGJ_CUDA_SEARCH_PHASE_DET_FILL = 4,
+    BGJ_CUDA_SEARCH_PHASE_TENSOR_NP = 5,
+    BGJ_CUDA_SEARCH_PHASE_TENSOR_PP = 6,
+    BGJ_CUDA_SEARCH_PHASE_TENSOR_NN = 7,
+    BGJ_CUDA_SEARCH_PHASE_SCALAR = 8,
+    BGJ_CUDA_SEARCH_PHASE_COUNT_COPY = 9,
+    BGJ_CUDA_SEARCH_PHASE_RESULT_COPY = 10,
+    BGJ_CUDA_SEARCH_PHASE_COUNT = 11
+};
+
+struct bgj_cuda_search_phase_profile_t {
+    double sec[BGJ_CUDA_SEARCH_PHASE_COUNT];
+
+    bgj_cuda_search_phase_profile_t()
+        : sec()
+    {
+    }
+};
+
 struct bgj_cuda_raw_scratch_t {
     int8_t *p_vecs;
     int8_t *n_vecs;
@@ -66,6 +90,10 @@ struct bgj_cuda_raw_scratch_t {
     int *overflow;
     cudaStream_t stream;
     cudaEvent_t dot_copy_done;
+    cudaEvent_t profile_start[BGJ_CUDA_SEARCH_PHASE_COUNT];
+    cudaEvent_t profile_stop[BGJ_CUDA_SEARCH_PHASE_COUNT];
+    unsigned char profile_ran[BGJ_CUDA_SEARCH_PHASE_COUNT];
+    bgj_cuda_search_phase_profile_t last_phase_profile;
     int device;
 
     size_t p_vec_capacity;
@@ -87,6 +115,8 @@ struct bgj_cuda_raw_scratch_t {
     size_t overflow_capacity;
     int stream_ready;
     int dot_event_ready;
+    int profile_events_ready;
+    int phase_profile_active;
 
     bgj_cuda_raw_scratch_t()
         : p_vecs(NULL),
@@ -108,6 +138,10 @@ struct bgj_cuda_raw_scratch_t {
           overflow(NULL),
           stream(NULL),
           dot_copy_done(NULL),
+          profile_start(),
+          profile_stop(),
+          profile_ran(),
+          last_phase_profile(),
           device(-1),
           p_vec_capacity(0),
           n_vec_capacity(0),
@@ -127,7 +161,9 @@ struct bgj_cuda_raw_scratch_t {
           det_offset_capacity(0),
           overflow_capacity(0),
           stream_ready(0),
-          dot_event_ready(0)
+          dot_event_ready(0),
+          profile_events_ready(0),
+          phase_profile_active(0)
     {
     }
 
@@ -153,6 +189,12 @@ struct bgj_cuda_raw_scratch_t {
         cudaFree(det_offsets);
         cudaFree(overflow);
         if (dot_event_ready) cudaEventDestroy(dot_copy_done);
+        if (profile_events_ready) {
+            for (int i = 0; i < BGJ_CUDA_SEARCH_PHASE_COUNT; i++) {
+                cudaEventDestroy(profile_start[i]);
+                cudaEventDestroy(profile_stop[i]);
+            }
+        }
         if (stream_ready) cudaStreamDestroy(stream);
         p_vecs = NULL;
         n_vecs = NULL;
@@ -173,6 +215,12 @@ struct bgj_cuda_raw_scratch_t {
         overflow = NULL;
         stream = NULL;
         dot_copy_done = NULL;
+        for (int i = 0; i < BGJ_CUDA_SEARCH_PHASE_COUNT; i++) {
+            profile_start[i] = NULL;
+            profile_stop[i] = NULL;
+            profile_ran[i] = 0;
+            last_phase_profile.sec[i] = 0.0;
+        }
         p_vec_capacity = 0;
         n_vec_capacity = 0;
         p_tensor_a_frag_capacity = 0;
@@ -192,6 +240,8 @@ struct bgj_cuda_raw_scratch_t {
         overflow_capacity = 0;
         stream_ready = 0;
         dot_event_ready = 0;
+        profile_events_ready = 0;
+        phase_profile_active = 0;
         device = -1;
     }
 
@@ -491,6 +541,131 @@ static double bgj_cuda_wall_time()
     return (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
 }
 
+static const char *bgj_cuda_search_phase_name(int phase)
+{
+    switch (phase) {
+    case BGJ_CUDA_SEARCH_PHASE_H2D:
+        return "h2d";
+    case BGJ_CUDA_SEARCH_PHASE_PACK:
+        return "pack";
+    case BGJ_CUDA_SEARCH_PHASE_CRED:
+        return "cred";
+    case BGJ_CUDA_SEARCH_PHASE_DET_COUNT:
+        return "det_count";
+    case BGJ_CUDA_SEARCH_PHASE_DET_FILL:
+        return "det_fill";
+    case BGJ_CUDA_SEARCH_PHASE_TENSOR_NP:
+        return "tensor_np";
+    case BGJ_CUDA_SEARCH_PHASE_TENSOR_PP:
+        return "tensor_pp";
+    case BGJ_CUDA_SEARCH_PHASE_TENSOR_NN:
+        return "tensor_nn";
+    case BGJ_CUDA_SEARCH_PHASE_SCALAR:
+        return "scalar";
+    case BGJ_CUDA_SEARCH_PHASE_COUNT_COPY:
+        return "count_copy";
+    case BGJ_CUDA_SEARCH_PHASE_RESULT_COPY:
+        return "result_copy";
+    default:
+        return "unknown";
+    }
+}
+
+struct bgj_cuda_phase_profile_state_t {
+    pthread_mutex_t lock;
+    int registered;
+    uint64_t calls;
+    uint64_t buckets;
+    uint64_t estimated_dots;
+    uint64_t results;
+    uint64_t overflows;
+    uint64_t failures;
+    double sec[BGJ_CUDA_SEARCH_PHASE_COUNT];
+
+    bgj_cuda_phase_profile_state_t()
+        : registered(0),
+          calls(0),
+          buckets(0),
+          estimated_dots(0),
+          results(0),
+          overflows(0),
+          failures(0),
+          sec()
+    {
+        pthread_mutex_init(&lock, NULL);
+    }
+
+    ~bgj_cuda_phase_profile_state_t()
+    {
+        pthread_mutex_destroy(&lock);
+    }
+};
+
+static bgj_cuda_phase_profile_state_t bgj_cuda_phase_profile;
+
+static int bgj_cuda_phase_profile_requested()
+{
+    const char *env = getenv("BGJ_CUDA_PHASE_PROFILE");
+    return env && env[0] && env[0] != '0';
+}
+
+static void bgj_cuda_phase_profile_dump()
+{
+    if (!bgj_cuda_phase_profile_requested()) return;
+
+    pthread_mutex_lock(&bgj_cuda_phase_profile.lock);
+    fprintf(stderr,
+            "cuda_phase_profile: calls=%lu buckets=%lu dots=%lu results=%lu "
+            "overflows=%lu failures=%lu",
+            (unsigned long)bgj_cuda_phase_profile.calls,
+            (unsigned long)bgj_cuda_phase_profile.buckets,
+            (unsigned long)bgj_cuda_phase_profile.estimated_dots,
+            (unsigned long)bgj_cuda_phase_profile.results,
+            (unsigned long)bgj_cuda_phase_profile.overflows,
+            (unsigned long)bgj_cuda_phase_profile.failures);
+    for (int i = 0; i < BGJ_CUDA_SEARCH_PHASE_COUNT; i++) {
+        fprintf(stderr, " %s=%.6fs",
+                bgj_cuda_search_phase_name(i),
+                bgj_cuda_phase_profile.sec[i]);
+    }
+    fprintf(stderr, "\n");
+    pthread_mutex_unlock(&bgj_cuda_phase_profile.lock);
+}
+
+static void bgj_cuda_phase_profile_register()
+{
+    if (!bgj_cuda_phase_profile_requested()) return;
+    pthread_mutex_lock(&bgj_cuda_phase_profile.lock);
+    if (!bgj_cuda_phase_profile.registered) {
+        bgj_cuda_phase_profile.registered = 1;
+        atexit(bgj_cuda_phase_profile_dump);
+    }
+    pthread_mutex_unlock(&bgj_cuda_phase_profile.lock);
+}
+
+static void bgj_cuda_phase_profile_record(uint64_t buckets,
+                                          uint64_t estimated_dots,
+                                          uint64_t results,
+                                          uint64_t overflows,
+                                          uint64_t failures,
+                                          const bgj_cuda_search_phase_profile_t *profile)
+{
+    if (!bgj_cuda_phase_profile_requested() || !profile) return;
+    bgj_cuda_phase_profile_register();
+
+    pthread_mutex_lock(&bgj_cuda_phase_profile.lock);
+    bgj_cuda_phase_profile.calls++;
+    bgj_cuda_phase_profile.buckets += buckets;
+    bgj_cuda_phase_profile.estimated_dots += estimated_dots;
+    bgj_cuda_phase_profile.results += results;
+    bgj_cuda_phase_profile.overflows += overflows;
+    bgj_cuda_phase_profile.failures += failures;
+    for (int i = 0; i < BGJ_CUDA_SEARCH_PHASE_COUNT; i++) {
+        bgj_cuda_phase_profile.sec[i] += profile->sec[i];
+    }
+    pthread_mutex_unlock(&bgj_cuda_phase_profile.lock);
+}
+
 static uint64_t bgj_cuda_estimated_pair_dots(uint32_t num_p, uint32_t num_n)
 {
     return (uint64_t)num_p * (uint64_t)num_n +
@@ -591,6 +766,7 @@ struct bgj_cuda_bucket_profile_entry_t {
     double wait_sec;
     double copy_sec;
     double total_sec;
+    double phase_sec[BGJ_CUDA_SEARCH_PHASE_COUNT];
 };
 
 struct bgj_cuda_bucket_profile_state_t {
@@ -706,7 +882,7 @@ static void bgj_cuda_bucket_profile_dump_list(const char *label,
                 "%s: rank=%d seq=%lu kind=%s device=%d batch=%u/%u "
                 "num_p=%u num_n=%u dots=%lu results=%lu overflows=%lu "
                 "failures=%lu submit=%.6fs wait=%.6fs copy=%.6fs total=%.6fs "
-                "score=%lu\n",
+                "score=%lu",
                 label,
                 i + 1,
                 (unsigned long)e->seq,
@@ -725,6 +901,14 @@ static void bgj_cuda_bucket_profile_dump_list(const char *label,
                 e->copy_sec,
                 e->total_sec,
                 (unsigned long)e->score);
+        for (int phase = 0; phase < BGJ_CUDA_SEARCH_PHASE_COUNT; phase++) {
+            if (e->phase_sec[phase] > 0.0) {
+                fprintf(stderr, " %s=%.6fs",
+                        bgj_cuda_search_phase_name(phase),
+                        e->phase_sec[phase]);
+            }
+        }
+        fprintf(stderr, "\n");
     }
 }
 
@@ -783,7 +967,8 @@ static void bgj_cuda_bucket_profile_record(int kind,
                                            double submit_sec,
                                            double wait_sec,
                                            double copy_sec,
-                                           double total_sec)
+                                           double total_sec,
+                                           const bgj_cuda_search_phase_profile_t *phase_profile = NULL)
 {
     if (!bgj_cuda_bucket_profile_requested()) return;
 
@@ -802,6 +987,11 @@ static void bgj_cuda_bucket_profile_record(int kind,
     entry.wait_sec = wait_sec;
     entry.copy_sec = copy_sec;
     entry.total_sec = total_sec;
+    if (phase_profile) {
+        for (int i = 0; i < BGJ_CUDA_SEARCH_PHASE_COUNT; i++) {
+            entry.phase_sec[i] = phase_profile->sec[i];
+        }
+    }
 
     int should_dump = 0;
     const int limit = bgj_cuda_bucket_profile_limit();
@@ -3107,6 +3297,101 @@ static int bgj_cuda_prepare_dot_event(bgj_cuda_raw_scratch_t *scratch)
     return 1;
 }
 
+static int bgj_cuda_prepare_search_profile_events(bgj_cuda_raw_scratch_t *scratch)
+{
+    if (scratch->profile_events_ready) return 1;
+    for (int i = 0; i < BGJ_CUDA_SEARCH_PHASE_COUNT; i++) {
+        cudaError_t err = cudaEventCreate(&scratch->profile_start[i]);
+        if (err != cudaSuccess) {
+            set_cuda_error("cudaEventCreate search profile start", err);
+            for (int j = 0; j < i; j++) {
+                cudaEventDestroy(scratch->profile_start[j]);
+                cudaEventDestroy(scratch->profile_stop[j]);
+                scratch->profile_start[j] = NULL;
+                scratch->profile_stop[j] = NULL;
+            }
+            return 0;
+        }
+        err = cudaEventCreate(&scratch->profile_stop[i]);
+        if (err != cudaSuccess) {
+            set_cuda_error("cudaEventCreate search profile stop", err);
+            cudaEventDestroy(scratch->profile_start[i]);
+            scratch->profile_start[i] = NULL;
+            for (int j = 0; j < i; j++) {
+                cudaEventDestroy(scratch->profile_start[j]);
+                cudaEventDestroy(scratch->profile_stop[j]);
+                scratch->profile_start[j] = NULL;
+                scratch->profile_stop[j] = NULL;
+            }
+            return 0;
+        }
+    }
+    scratch->profile_events_ready = 1;
+    return 1;
+}
+
+static int bgj_cuda_search_profile_reset(bgj_cuda_raw_scratch_t *scratch)
+{
+    scratch->phase_profile_active = bgj_cuda_phase_profile_requested();
+    for (int i = 0; i < BGJ_CUDA_SEARCH_PHASE_COUNT; i++) {
+        scratch->profile_ran[i] = 0;
+        scratch->last_phase_profile.sec[i] = 0.0;
+    }
+    if (!scratch->phase_profile_active) return 1;
+    return bgj_cuda_prepare_search_profile_events(scratch);
+}
+
+static int bgj_cuda_search_profile_begin(bgj_cuda_raw_scratch_t *scratch,
+                                         int phase)
+{
+    if (!scratch->phase_profile_active) return 1;
+    cudaError_t err = cudaEventRecord(scratch->profile_start[phase], scratch->stream);
+    if (err != cudaSuccess) {
+        set_cuda_error("cudaEventRecord search profile begin", err);
+        return 0;
+    }
+    return 1;
+}
+
+static int bgj_cuda_search_profile_end(bgj_cuda_raw_scratch_t *scratch,
+                                       int phase)
+{
+    if (!scratch->phase_profile_active) return 1;
+    cudaError_t err = cudaEventRecord(scratch->profile_stop[phase], scratch->stream);
+    if (err != cudaSuccess) {
+        set_cuda_error("cudaEventRecord search profile end", err);
+        return 0;
+    }
+    scratch->profile_ran[phase] = 1;
+    return 1;
+}
+
+static int bgj_cuda_search_profile_collect(bgj_cuda_raw_scratch_t *scratch)
+{
+    if (!scratch->phase_profile_active) return 1;
+    for (int i = 0; i < BGJ_CUDA_SEARCH_PHASE_COUNT; i++) {
+        if (!scratch->profile_ran[i]) continue;
+        float ms = 0.0f;
+        cudaError_t err =
+            cudaEventElapsedTime(&ms, scratch->profile_start[i], scratch->profile_stop[i]);
+        if (err != cudaSuccess) {
+            set_cuda_error("cudaEventElapsedTime search profile", err);
+            return 0;
+        }
+        scratch->last_phase_profile.sec[i] = (double)ms * 0.001;
+    }
+    return 1;
+}
+
+static void bgj_cuda_search_phase_profile_add(bgj_cuda_search_phase_profile_t *dst,
+                                              const bgj_cuda_search_phase_profile_t *src)
+{
+    if (!dst || !src) return;
+    for (int i = 0; i < BGJ_CUDA_SEARCH_PHASE_COUNT; i++) {
+        dst->sec[i] += src->sec[i];
+    }
+}
+
 static int bgj_cuda_prepare_bucket_stream(bgj_cuda_bucket_scratch_t *scratch)
 {
     int device = 0;
@@ -5242,6 +5527,7 @@ static int bgj_cuda_search_bucket_raw_submit(bgj_cuda_raw_scratch_t *scratch,
     }
     if (!bgj_cuda_prepare_stream(scratch)) return 0;
     cudaStream_t stream = scratch->stream;
+    if (!bgj_cuda_search_profile_reset(scratch)) return 0;
 
     const size_t p_vec_bytes = (size_t)num_p * (size_t)vec_length * sizeof(int8_t);
     const size_t n_vec_bytes = (size_t)num_n * (size_t)vec_length * sizeof(int8_t);
@@ -5261,6 +5547,7 @@ static int bgj_cuda_search_bucket_raw_submit(bgj_cuda_raw_scratch_t *scratch,
                                                 &pool_vecs_device)) goto fail;
     }
 
+    if (!bgj_cuda_search_profile_begin(scratch, BGJ_CUDA_SEARCH_PHASE_H2D)) goto fail;
     if (num_p) {
         CUDA_ENSURE(scratch->p_vecs, scratch->p_vec_capacity, p_vec_bytes);
         CUDA_ENSURE(scratch->p_ids, scratch->p_id_capacity, p_id_bytes);
@@ -5284,12 +5571,14 @@ static int bgj_cuda_search_bucket_raw_submit(bgj_cuda_raw_scratch_t *scratch,
             CUDA_TRY(cudaMemcpyAsync(scratch->n_dot, n_dot, n_i32_bytes, cudaMemcpyHostToDevice, stream));
         }
     }
+    if (!bgj_cuda_search_profile_end(scratch, BGJ_CUDA_SEARCH_PHASE_H2D)) goto fail;
 
     if (record_dot_copy_event && record_dp) {
         if (!bgj_cuda_prepare_dot_event(scratch)) goto fail;
         CUDA_TRY(cudaEventRecord(scratch->dot_copy_done, stream));
     }
 
+    if (!bgj_cuda_search_profile_begin(scratch, BGJ_CUDA_SEARCH_PHASE_PACK)) goto fail;
     if (num_p) {
         if (use_pool) {
             const uint32_t threads = 256;
@@ -5323,6 +5612,7 @@ static int bgj_cuda_search_bucket_raw_submit(bgj_cuda_raw_scratch_t *scratch,
             CUDA_TRY(cudaMemcpyAsync(scratch->n_vecs, n_vecs, n_vec_bytes, cudaMemcpyHostToDevice, stream));
         }
     }
+    if (!bgj_cuda_search_profile_end(scratch, BGJ_CUDA_SEARCH_PHASE_PACK)) goto fail;
 
     CUDA_ENSURE(scratch->results, scratch->result_capacity, (size_t)result_capacity * sizeof(bgj_cuda_result_t));
     CUDA_ENSURE(scratch->result_count, scratch->result_count_capacity, sizeof(uint32_t));
@@ -5335,6 +5625,7 @@ static int bgj_cuda_search_bucket_raw_submit(bgj_cuda_raw_scratch_t *scratch,
             set_plain_error("CUDA cred transform is not supported with deterministic results");
             goto fail;
         }
+        if (!bgj_cuda_search_profile_begin(scratch, BGJ_CUDA_SEARCH_PHASE_CRED)) goto fail;
         const uint32_t threads = 256;
         const uint64_t total = (uint64_t)num_p + (uint64_t)num_n;
         uint32_t blocks = (uint32_t)((total + threads - 1u) / threads);
@@ -5355,9 +5646,11 @@ static int bgj_cuda_search_bucket_raw_submit(bgj_cuda_raw_scratch_t *scratch,
                                                                                     scratch->result_count,
                                                                                     scratch->overflow);
         CUDA_TRY(cudaGetLastError());
+        if (!bgj_cuda_search_profile_end(scratch, BGJ_CUDA_SEARCH_PHASE_CRED)) goto fail;
     }
 
     if (device_transform_dp && record_dp && (num_p || num_n)) {
+        if (!bgj_cuda_search_profile_begin(scratch, BGJ_CUDA_SEARCH_PHASE_CRED)) goto fail;
         const uint32_t threads = 256;
         const uint64_t total = (uint64_t)num_p + (uint64_t)num_n;
         uint32_t blocks = (uint32_t)((total + threads - 1u) / threads);
@@ -5370,6 +5663,7 @@ static int bgj_cuda_search_bucket_raw_submit(bgj_cuda_raw_scratch_t *scratch,
                                                                      num_p,
                                                                      num_n);
         CUDA_TRY(cudaGetLastError());
+        if (!bgj_cuda_search_profile_end(scratch, BGJ_CUDA_SEARCH_PHASE_CRED)) goto fail;
     }
 
     if (bgj_cuda_deterministic_results_requested()) {
@@ -5408,6 +5702,7 @@ static int bgj_cuda_search_bucket_raw_submit(bgj_cuda_raw_scratch_t *scratch,
         CUDA_ENSURE(scratch->det_offsets, scratch->det_offset_capacity, count_bytes);
 
         {
+            if (!bgj_cuda_search_profile_begin(scratch, BGJ_CUDA_SEARCH_PHASE_DET_COUNT)) goto fail;
             uint32_t grid = pair_slots > 65535ull ? 65535u : (uint32_t)pair_slots;
             if (grid == 0) grid = 1;
             bgj_cuda_search_det_pair_count_kernel<<<grid,
@@ -5449,6 +5744,7 @@ static int bgj_cuda_search_bucket_raw_submit(bgj_cuda_raw_scratch_t *scratch,
                                  count_bytes,
                                  cudaMemcpyDeviceToHost,
                                  stream));
+        if (!bgj_cuda_search_profile_end(scratch, BGJ_CUDA_SEARCH_PHASE_DET_COUNT)) goto fail;
         CUDA_TRY(cudaStreamSynchronize(stream));
 
         uint64_t total_results = 0;
@@ -5457,6 +5753,7 @@ static int bgj_cuda_search_bucket_raw_submit(bgj_cuda_raw_scratch_t *scratch,
             total_results += (uint64_t)h_det_counts[i];
         }
 
+        if (!bgj_cuda_search_profile_begin(scratch, BGJ_CUDA_SEARCH_PHASE_DET_FILL)) goto fail;
         CUDA_TRY(cudaMemcpyAsync(scratch->det_offsets,
                                  h_det_offsets,
                                  count_bytes,
@@ -5506,6 +5803,7 @@ static int bgj_cuda_search_bucket_raw_submit(bgj_cuda_raw_scratch_t *scratch,
                                      sizeof(int),
                                      cudaMemcpyDeviceToHost,
                                      stream));
+            if (!bgj_cuda_search_profile_end(scratch, BGJ_CUDA_SEARCH_PHASE_DET_FILL)) goto fail;
             CUDA_TRY(cudaStreamSynchronize(stream));
             *submitted_result_count = total_results > 0xffffffffull ? 0xffffffffu : (uint32_t)total_results;
             *submitted_overflow =
@@ -5527,6 +5825,7 @@ static int bgj_cuda_search_bucket_raw_submit(bgj_cuda_raw_scratch_t *scratch,
         tensor_np_min_tiles = bgj_cuda_tensor_np_min_tiles();
         tensor_same_min_tiles = bgj_cuda_tensor_same_min_tiles();
         if (num_p >= 16 && num_n >= 16) {
+            if (!bgj_cuda_search_profile_begin(scratch, BGJ_CUDA_SEARCH_PHASE_TENSOR_NP)) goto fail;
             tensor_np_num_p = (num_p / 16u) * 16u;
             tensor_np_num_n = (num_n / 16u) * 16u;
             const uint32_t tensor_blocks_p = tensor_np_num_p / 16u;
@@ -5874,9 +6173,11 @@ static int bgj_cuda_search_bucket_raw_submit(bgj_cuda_raw_scratch_t *scratch,
                 tensor_np_num_p = 0;
                 tensor_np_num_n = 0;
             }
+            if (!bgj_cuda_search_profile_end(scratch, BGJ_CUDA_SEARCH_PHASE_TENSOR_NP)) goto fail;
         }
 
         if (bgj_cuda_tensor_same_requested() && num_p >= 16) {
+            if (!bgj_cuda_search_profile_begin(scratch, BGJ_CUDA_SEARCH_PHASE_TENSOR_PP)) goto fail;
             tensor_same_num_p = (num_p / 16u) * 16u;
             const uint32_t tensor_blocks_p = tensor_same_num_p / 16u;
             const uint64_t tensor_tiles_p = ((uint64_t)tensor_blocks_p * (tensor_blocks_p + 1u)) / 2u;
@@ -5969,9 +6270,11 @@ static int bgj_cuda_search_bucket_raw_submit(bgj_cuda_raw_scratch_t *scratch,
             } else {
                 tensor_same_num_p = 0;
             }
+            if (!bgj_cuda_search_profile_end(scratch, BGJ_CUDA_SEARCH_PHASE_TENSOR_PP)) goto fail;
         }
 
         if (bgj_cuda_tensor_same_requested() && num_n >= 16) {
+            if (!bgj_cuda_search_profile_begin(scratch, BGJ_CUDA_SEARCH_PHASE_TENSOR_NN)) goto fail;
             tensor_same_num_n = (num_n / 16u) * 16u;
             const uint32_t tensor_blocks_n = tensor_same_num_n / 16u;
             const uint64_t tensor_tiles_n = ((uint64_t)tensor_blocks_n * (tensor_blocks_n + 1u)) / 2u;
@@ -6064,6 +6367,7 @@ static int bgj_cuda_search_bucket_raw_submit(bgj_cuda_raw_scratch_t *scratch,
             } else {
                 tensor_same_num_n = 0;
             }
+            if (!bgj_cuda_search_profile_end(scratch, BGJ_CUDA_SEARCH_PHASE_TENSOR_NN)) goto fail;
         }
     }
 
@@ -6088,6 +6392,7 @@ static int bgj_cuda_search_bucket_raw_submit(bgj_cuda_raw_scratch_t *scratch,
         if (blocks == 0) blocks = 1;
         if (blocks > 65535) blocks = 65535;
         if (total) {
+            if (!bgj_cuda_search_profile_begin(scratch, BGJ_CUDA_SEARCH_PHASE_SCALAR)) goto fail;
             bgj_cuda_search_bucket_kernel<<<blocks, threads, 0, stream>>>(scratch->p_vecs,
                                                                           scratch->n_vecs,
                                                                           scratch->p_ids,
@@ -6112,11 +6417,14 @@ static int bgj_cuda_search_bucket_raw_submit(bgj_cuda_raw_scratch_t *scratch,
                                                                           scratch->result_count,
                                                                           scratch->overflow);
             CUDA_TRY(cudaGetLastError());
+            if (!bgj_cuda_search_profile_end(scratch, BGJ_CUDA_SEARCH_PHASE_SCALAR)) goto fail;
         }
     }
 
+    if (!bgj_cuda_search_profile_begin(scratch, BGJ_CUDA_SEARCH_PHASE_COUNT_COPY)) goto fail;
     CUDA_TRY(cudaMemcpyAsync(submitted_result_count, scratch->result_count, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
     CUDA_TRY(cudaMemcpyAsync(submitted_overflow, scratch->overflow, sizeof(int), cudaMemcpyDeviceToHost, stream));
+    if (!bgj_cuda_search_profile_end(scratch, BGJ_CUDA_SEARCH_PHASE_COUNT_COPY)) goto fail;
     set_plain_error("no CUDA error");
     return 1;
 
@@ -6139,11 +6447,13 @@ static int bgj_cuda_finish_submitted_bucket(bgj_cuda_raw_scratch_t *scratch,
     *overflow = submitted_overflow || (submitted_result_count > result_capacity);
     *result_count = submitted_result_count > result_capacity ? result_capacity : submitted_result_count;
     if (*result_count) {
+        if (!bgj_cuda_search_profile_begin(scratch, BGJ_CUDA_SEARCH_PHASE_RESULT_COPY)) goto fail;
         CUDA_TRY(cudaMemcpyAsync(results,
                                  scratch->results,
                                  (size_t)(*result_count) * sizeof(bgj_cuda_result_t),
                                  cudaMemcpyDeviceToHost,
                                  stream));
+        if (!bgj_cuda_search_profile_end(scratch, BGJ_CUDA_SEARCH_PHASE_RESULT_COPY)) goto fail;
     }
 
     set_plain_error("no CUDA error");
@@ -6188,6 +6498,7 @@ static int bgj_cuda_search_bucket_raw_impl(const int8_t *p_vecs,
     double copy_sec = 0.0;
     double wait_t0 = 0.0;
     double copy_t0 = 0.0;
+    const bgj_cuda_search_phase_profile_t *phase_profile = NULL;
 
     const double submit_t0 = bgj_cuda_wall_time();
     if (!bgj_cuda_search_bucket_raw_submit(scratch,
@@ -6284,6 +6595,8 @@ static int bgj_cuda_search_bucket_raw_impl(const int8_t *p_vecs,
     }
     CUDA_TRY(cudaStreamSynchronize(stream));
     copy_sec = bgj_cuda_wall_time() - copy_t0;
+    if (!bgj_cuda_search_profile_collect(scratch)) goto fail;
+    phase_profile = scratch->phase_profile_active ? &scratch->last_phase_profile : NULL;
 
     set_plain_error("no CUDA error");
     bgj_cuda_bucket_profile_record(BGJ_CUDA_BUCKET_PROFILE_SINGLE,
@@ -6299,7 +6612,8 @@ static int bgj_cuda_search_bucket_raw_impl(const int8_t *p_vecs,
                                    submit_sec,
                                    wait_sec,
                                    copy_sec,
-                                   bgj_cuda_wall_time() - total_t0);
+                                   bgj_cuda_wall_time() - total_t0,
+                                   phase_profile);
     bgj_cuda_device_profile_record(scratch->device,
                                    1,
                                    estimated_dots,
@@ -6310,6 +6624,12 @@ static int bgj_cuda_search_bucket_raw_impl(const int8_t *p_vecs,
                                    wait_sec,
                                    copy_sec,
                                    bgj_cuda_wall_time() - total_t0);
+    bgj_cuda_phase_profile_record(1,
+                                  estimated_dots,
+                                  *result_count,
+                                  *overflow ? 1 : 0,
+                                  0,
+                                  phase_profile);
     return 1;
 
 fail:
@@ -6476,6 +6796,7 @@ extern "C" int bgj_cuda_search_bucket_raw_finish_async(bgj_cuda_result_t *result
     double copy_t0 = 0.0;
     uint32_t h_result_count = 0;
     int h_overflow = 1;
+    const bgj_cuda_search_phase_profile_t *phase_profile = NULL;
 
     const double wait_t0 = bgj_cuda_wall_time();
     CUDA_TRY(cudaStreamSynchronize(stream));
@@ -6521,6 +6842,8 @@ extern "C" int bgj_cuda_search_bucket_raw_finish_async(bgj_cuda_result_t *result
     }
     CUDA_TRY(cudaStreamSynchronize(stream));
     copy_sec = bgj_cuda_wall_time() - copy_t0;
+    if (!bgj_cuda_search_profile_collect(scratch)) goto fail;
+    phase_profile = scratch->phase_profile_active ? &scratch->last_phase_profile : NULL;
 
     set_plain_error("no CUDA error");
     bgj_cuda_bucket_profile_record(BGJ_CUDA_BUCKET_PROFILE_ASYNC,
@@ -6536,7 +6859,8 @@ extern "C" int bgj_cuda_search_bucket_raw_finish_async(bgj_cuda_result_t *result
                                    bgj_cuda_raw_async_state.submit_sec,
                                    wait_sec,
                                    copy_sec,
-                                   bgj_cuda_wall_time() - bgj_cuda_raw_async_state.total_t0);
+                                   bgj_cuda_wall_time() - bgj_cuda_raw_async_state.total_t0,
+                                   phase_profile);
     bgj_cuda_device_profile_record(scratch->device,
                                    1,
                                    bgj_cuda_raw_async_state.estimated_dots,
@@ -6547,6 +6871,12 @@ extern "C" int bgj_cuda_search_bucket_raw_finish_async(bgj_cuda_result_t *result
                                    wait_sec,
                                    copy_sec,
                                    bgj_cuda_wall_time() - bgj_cuda_raw_async_state.total_t0);
+    bgj_cuda_phase_profile_record(1,
+                                  bgj_cuda_raw_async_state.estimated_dots,
+                                  result_count ? *result_count : 0,
+                                  overflow && *overflow ? 1 : 0,
+                                  0,
+                                  phase_profile);
     bgj_cuda_raw_async_state.active = 0;
     return 1;
 
@@ -6725,6 +7055,8 @@ extern "C" int bgj_cuda_search_bucket_pool_batch_raw(const int8_t *pool_vecs,
     double copy_sec = 0.0;
     double wait_t0 = 0.0;
     double copy_t0 = 0.0;
+    bgj_cuda_search_phase_profile_t phase_profile_sum;
+    const bgj_cuda_search_phase_profile_t *batch_phase_profile = NULL;
 
     const double submit_t0 = bgj_cuda_wall_time();
     for (uint32_t i = 0; i < batch_size; i++) {
@@ -6804,16 +7136,24 @@ extern "C" int bgj_cuda_search_bucket_pool_batch_raw(const int8_t *pool_vecs,
             set_cuda_error("cudaStreamSynchronize batch results", err);
             goto fail_sync;
         }
+        if (!bgj_cuda_search_profile_collect(scratch)) goto fail_sync;
+        if (scratch->phase_profile_active) {
+            bgj_cuda_search_phase_profile_add(&phase_profile_sum,
+                                              &scratch->last_phase_profile);
+        }
     }
     copy_sec = bgj_cuda_wall_time() - copy_t0;
     for (uint32_t i = 0; i < submitted; i++) {
         total_results += result_count[i];
         if (overflow[i]) total_overflows++;
     }
+    batch_phase_profile = bgj_cuda_phase_profile_requested() ? &phase_profile_sum : NULL;
 
     set_plain_error("no CUDA error");
     for (uint32_t i = 0; i < submitted; i++) {
         bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get(i);
+        const bgj_cuda_search_phase_profile_t *item_phase_profile =
+            scratch && scratch->phase_profile_active ? &scratch->last_phase_profile : NULL;
         bgj_cuda_bucket_profile_record(BGJ_CUDA_BUCKET_PROFILE_BATCH_ITEM,
                                        scratch ? scratch->device : selected_device,
                                        submitted,
@@ -6827,7 +7167,8 @@ extern "C" int bgj_cuda_search_bucket_pool_batch_raw(const int8_t *pool_vecs,
                                        0.0,
                                        0.0,
                                        0.0,
-                                       0.0);
+                                       0.0,
+                                       item_phase_profile);
     }
     bgj_cuda_bucket_profile_record(BGJ_CUDA_BUCKET_PROFILE_BATCH,
                                    selected_device,
@@ -6842,7 +7183,8 @@ extern "C" int bgj_cuda_search_bucket_pool_batch_raw(const int8_t *pool_vecs,
                                    submit_sec,
                                    wait_sec,
                                    copy_sec,
-                                   bgj_cuda_wall_time() - total_t0);
+                                   bgj_cuda_wall_time() - total_t0,
+                                   batch_phase_profile);
     bgj_cuda_device_profile_record(selected_device,
                                    submitted,
                                    estimated_dots,
@@ -6853,6 +7195,12 @@ extern "C" int bgj_cuda_search_bucket_pool_batch_raw(const int8_t *pool_vecs,
                                    wait_sec,
                                    copy_sec,
                                    bgj_cuda_wall_time() - total_t0);
+    bgj_cuda_phase_profile_record(submitted,
+                                  estimated_dots,
+                                  total_results,
+                                  total_overflows,
+                                  0,
+                                  batch_phase_profile);
     return 1;
 
 fail_sync:
