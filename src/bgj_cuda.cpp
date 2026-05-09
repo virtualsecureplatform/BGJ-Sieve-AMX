@@ -74,8 +74,109 @@ const char *bgj_cuda_last_error()
 #include "../include/bucket_epi8.h"
 
 #include <algorithm>
+#include <limits>
 #include <unordered_set>
 #include <vector>
+
+static_assert((UidHashTable::NUM_UID_LOCK & (UidHashTable::NUM_UID_LOCK - 1)) == 0,
+              "CUDA UID fast path assumes power-of-two UID lock count");
+
+struct bgj_cuda_uid_candidate_t {
+    uint64_t uid;
+    uint32_t x;
+    uint32_t y;
+    uint32_t type;
+    uint16_t slot;
+    uint8_t accepted;
+};
+
+static inline void bgj_cuda_normalize_uid(uint64_t &uid)
+{
+    if (uid > std::numeric_limits<uint64_t>::max() / 2 + 1) uid = -uid;
+}
+
+static inline bool bgj_cuda_insert_uid_fast(UidHashTable *uid_table, uint64_t uid)
+{
+    bgj_cuda_normalize_uid(uid);
+    const unsigned slot = (unsigned)(uid & (UidHashTable::NUM_UID_LOCK - 1));
+    pthread_spin_lock(&uid_table->uid_lock[slot].a);
+    const bool success = uid_table->uid_table[slot].a.insert(uid).second;
+    pthread_spin_unlock(&uid_table->uid_lock[slot].a);
+    return success;
+}
+
+static int bgj_cuda_uid_batch_requested()
+{
+    static const int requested = []() {
+        const char *env = getenv("BGJ_CUDA_UID_BATCH");
+        if (env && env[0]) return env[0] != '0' ? 1 : 0;
+        return 1;
+    }();
+    return requested;
+}
+
+static uint32_t bgj_cuda_uid_batch_min_results()
+{
+    static const uint32_t min_results = []() {
+        const char *env = getenv("BGJ_CUDA_UID_BATCH_MIN_RESULTS");
+        if (env && env[0]) {
+            char *end = NULL;
+            const unsigned long parsed = strtoul(env, &end, 10);
+            if (end != env && parsed > 0 && parsed <= 0xfffffffful) {
+                return (uint32_t)parsed;
+            }
+        }
+        return (uint32_t)4096;
+    }();
+    return min_results;
+}
+
+static inline void bgj_cuda_add_uid_candidate(std::vector<bgj_cuda_uid_candidate_t> &candidates,
+                                              std::vector<uint32_t> &touched_slots,
+                                              std::vector<uint32_t> &slot_counts,
+                                              uint64_t uid,
+                                              uint32_t type,
+                                              uint32_t x,
+                                              uint32_t y)
+{
+    bgj_cuda_normalize_uid(uid);
+    const uint16_t slot = (uint16_t)(uid & (UidHashTable::NUM_UID_LOCK - 1));
+    if (slot_counts[slot]++ == 0) touched_slots.push_back(slot);
+
+    bgj_cuda_uid_candidate_t candidate;
+    candidate.uid = uid;
+    candidate.x = x;
+    candidate.y = y;
+    candidate.type = type;
+    candidate.slot = slot;
+    candidate.accepted = 0;
+    candidates.push_back(candidate);
+}
+
+static inline void bgj_cuda_add_accepted_solution(sol_list_epi8_t *sol,
+                                                  uint32_t center,
+                                                  const bgj_cuda_uid_candidate_t &candidate)
+{
+    switch (candidate.type) {
+    case BGJ_CUDA_SOL_A:
+        sol->add_sol_a(candidate.x, candidate.y);
+        break;
+    case BGJ_CUDA_SOL_S:
+        sol->add_sol_s(candidate.x, candidate.y);
+        break;
+    case BGJ_CUDA_SOL_AA:
+        sol->add_sol_aa(center, candidate.x, candidate.y);
+        break;
+    case BGJ_CUDA_SOL_SA:
+        sol->add_sol_sa(center, candidate.x, candidate.y);
+        break;
+    case BGJ_CUDA_SOL_SS:
+        sol->add_sol_ss(center, candidate.x, candidate.y);
+        break;
+    default:
+        break;
+    }
+}
 
 struct bgj_cuda_host_profile_state_t {
     pthread_mutex_t lock;
@@ -601,7 +702,7 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
                 const uint64_t u = pool->vu[x] + pool->vu[y];
                 profile_bucket_uid(u);
                 double t0 = bgj_cuda_host_wall_time();
-                const int inserted = pool->uid->insert_uid(u);
+                const int inserted = bgj_cuda_insert_uid_fast(pool->uid, u);
                 uid_sec += bgj_cuda_host_wall_time() - t0;
                 if (inserted) {
                     succ_add2++;
@@ -616,7 +717,7 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
                 const uint64_t u = pool->vu[x] - pool->vu[y];
                 profile_bucket_uid(u);
                 double t0 = bgj_cuda_host_wall_time();
-                const int inserted = pool->uid->insert_uid(u);
+                const int inserted = bgj_cuda_insert_uid_fast(pool->uid, u);
                 uid_sec += bgj_cuda_host_wall_time() - t0;
                 if (inserted) {
                     succ_add2++;
@@ -631,7 +732,7 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
                 const uint64_t u = bkt->center_u + pool->vu[x] + pool->vu[y];
                 profile_bucket_uid(u);
                 double t0 = bgj_cuda_host_wall_time();
-                const int inserted = pool->uid->insert_uid(u);
+                const int inserted = bgj_cuda_insert_uid_fast(pool->uid, u);
                 uid_sec += bgj_cuda_host_wall_time() - t0;
                 if (inserted) {
                     succ_add3++;
@@ -646,7 +747,7 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
                 const uint64_t u = bkt->center_u - pool->vu[x] + pool->vu[y];
                 profile_bucket_uid(u);
                 double t0 = bgj_cuda_host_wall_time();
-                const int inserted = pool->uid->insert_uid(u);
+                const int inserted = bgj_cuda_insert_uid_fast(pool->uid, u);
                 uid_sec += bgj_cuda_host_wall_time() - t0;
                 if (inserted) {
                     succ_add3++;
@@ -661,7 +762,7 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
                 const uint64_t u = bkt->center_u - pool->vu[x] - pool->vu[y];
                 profile_bucket_uid(u);
                 double t0 = bgj_cuda_host_wall_time();
-                const int inserted = pool->uid->insert_uid(u);
+                const int inserted = bgj_cuda_insert_uid_fast(pool->uid, u);
                 uid_sec += bgj_cuda_host_wall_time() - t0;
                 if (inserted) {
                     succ_add3++;
@@ -676,57 +777,189 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
             }
         }
     } else {
-        for (uint32_t i = 0; i < result_count; i++) {
-            const uint32_t x = results[i].x;
-            const uint32_t y = results[i].y;
-            switch (results[i].type) {
-            case BGJ_CUDA_SOL_A: {
-                try_add2++;
-                const uint64_t u = pool->vu[x] + pool->vu[y];
-                if (pool->uid->insert_uid(u)) {
-                    succ_add2++;
-                    sol->add_sol_a(x, y);
+        int use_uid_batch = bgj_cuda_uid_batch_requested() &&
+                            result_count >= bgj_cuda_uid_batch_min_results();
+        if (use_uid_batch) {
+            static thread_local std::vector<bgj_cuda_uid_candidate_t> candidates;
+            static thread_local std::vector<uint32_t> order;
+            static thread_local std::vector<uint32_t> touched_slots;
+            static thread_local std::vector<uint32_t> slot_counts;
+            static thread_local std::vector<uint32_t> slot_offsets;
+            static thread_local std::vector<uint32_t> slot_cursor;
+
+            try {
+                if (slot_counts.size() != UidHashTable::NUM_UID_LOCK) {
+                    slot_counts.assign(UidHashTable::NUM_UID_LOCK, 0);
+                    slot_offsets.assign(UidHashTable::NUM_UID_LOCK, 0);
+                    slot_cursor.assign(UidHashTable::NUM_UID_LOCK, 0);
                 }
-                break;
+                candidates.clear();
+                touched_slots.clear();
+                candidates.reserve(result_count);
+                touched_slots.reserve(UidHashTable::NUM_UID_LOCK);
+                order.resize(result_count);
+            } catch (...) {
+                use_uid_batch = 0;
             }
-            case BGJ_CUDA_SOL_S: {
-                try_add2++;
-                const uint64_t u = pool->vu[x] - pool->vu[y];
-                if (pool->uid->insert_uid(u)) {
-                    succ_add2++;
-                    sol->add_sol_s(x, y);
+
+            if (use_uid_batch) {
+                for (uint32_t i = 0; i < result_count; i++) {
+                    const uint32_t x = results[i].x;
+                    const uint32_t y = results[i].y;
+                    switch (results[i].type) {
+                    case BGJ_CUDA_SOL_A:
+                        try_add2++;
+                        bgj_cuda_add_uid_candidate(candidates,
+                                                   touched_slots,
+                                                   slot_counts,
+                                                   pool->vu[x] + pool->vu[y],
+                                                   BGJ_CUDA_SOL_A,
+                                                   x,
+                                                   y);
+                        break;
+                    case BGJ_CUDA_SOL_S:
+                        try_add2++;
+                        bgj_cuda_add_uid_candidate(candidates,
+                                                   touched_slots,
+                                                   slot_counts,
+                                                   pool->vu[x] - pool->vu[y],
+                                                   BGJ_CUDA_SOL_S,
+                                                   x,
+                                                   y);
+                        break;
+                    case BGJ_CUDA_SOL_AA:
+                        try_add3++;
+                        bgj_cuda_add_uid_candidate(candidates,
+                                                   touched_slots,
+                                                   slot_counts,
+                                                   bkt->center_u + pool->vu[x] + pool->vu[y],
+                                                   BGJ_CUDA_SOL_AA,
+                                                   x,
+                                                   y);
+                        break;
+                    case BGJ_CUDA_SOL_SA:
+                        try_add3++;
+                        bgj_cuda_add_uid_candidate(candidates,
+                                                   touched_slots,
+                                                   slot_counts,
+                                                   bkt->center_u - pool->vu[x] + pool->vu[y],
+                                                   BGJ_CUDA_SOL_SA,
+                                                   x,
+                                                   y);
+                        break;
+                    case BGJ_CUDA_SOL_SS:
+                        try_add3++;
+                        bgj_cuda_add_uid_candidate(candidates,
+                                                   touched_slots,
+                                                   slot_counts,
+                                                   bkt->center_u - pool->vu[x] - pool->vu[y],
+                                                   BGJ_CUDA_SOL_SS,
+                                                   x,
+                                                   y);
+                        break;
+                    default:
+                        break;
+                    }
                 }
-                break;
-            }
-            case BGJ_CUDA_SOL_AA: {
-                try_add3++;
-                const uint64_t u = bkt->center_u + pool->vu[x] + pool->vu[y];
-                if (pool->uid->insert_uid(u)) {
-                    succ_add3++;
-                    sol->add_sol_aa(bkt->center_ind, x, y);
+
+                uint32_t offset = 0;
+                for (uint32_t i = 0; i < touched_slots.size(); i++) {
+                    const uint32_t slot = touched_slots[i];
+                    slot_offsets[slot] = offset;
+                    slot_cursor[slot] = offset;
+                    offset += slot_counts[slot];
                 }
-                break;
-            }
-            case BGJ_CUDA_SOL_SA: {
-                try_add3++;
-                const uint64_t u = bkt->center_u - pool->vu[x] + pool->vu[y];
-                if (pool->uid->insert_uid(u)) {
-                    succ_add3++;
-                    sol->add_sol_sa(bkt->center_ind, x, y);
+                for (uint32_t i = 0; i < candidates.size(); i++) {
+                    const uint32_t slot = candidates[i].slot;
+                    order[slot_cursor[slot]++] = i;
                 }
-                break;
-            }
-            case BGJ_CUDA_SOL_SS: {
-                try_add3++;
-                const uint64_t u = bkt->center_u - pool->vu[x] - pool->vu[y];
-                if (pool->uid->insert_uid(u)) {
-                    succ_add3++;
-                    sol->add_sol_ss(bkt->center_ind, x, y);
+
+                for (uint32_t i = 0; i < touched_slots.size(); i++) {
+                    const uint32_t slot = touched_slots[i];
+                    const uint32_t begin = slot_offsets[slot];
+                    const uint32_t end = begin + slot_counts[slot];
+                    pthread_spin_lock(&pool->uid->uid_lock[slot].a);
+                    for (uint32_t j = begin; j < end; j++) {
+                        bgj_cuda_uid_candidate_t &candidate = candidates[order[j]];
+                        candidate.accepted =
+                            pool->uid->uid_table[slot].a.insert(candidate.uid).second ? 1 : 0;
+                    }
+                    pthread_spin_unlock(&pool->uid->uid_lock[slot].a);
                 }
-                break;
+
+                for (uint32_t i = 0; i < candidates.size(); i++) {
+                    if (!candidates[i].accepted) continue;
+                    if (candidates[i].type == BGJ_CUDA_SOL_A ||
+                        candidates[i].type == BGJ_CUDA_SOL_S) {
+                        succ_add2++;
+                    } else {
+                        succ_add3++;
+                    }
+                    bgj_cuda_add_accepted_solution(sol, bkt->center_ind, candidates[i]);
+                }
+
+                for (uint32_t i = 0; i < touched_slots.size(); i++) {
+                    const uint32_t slot = touched_slots[i];
+                    slot_counts[slot] = 0;
+                    slot_offsets[slot] = 0;
+                    slot_cursor[slot] = 0;
+                }
             }
-            default:
-                break;
+        }
+
+        if (!use_uid_batch) {
+            for (uint32_t i = 0; i < result_count; i++) {
+                const uint32_t x = results[i].x;
+                const uint32_t y = results[i].y;
+                switch (results[i].type) {
+                case BGJ_CUDA_SOL_A: {
+                    try_add2++;
+                    const uint64_t u = pool->vu[x] + pool->vu[y];
+                    if (bgj_cuda_insert_uid_fast(pool->uid, u)) {
+                        succ_add2++;
+                        sol->add_sol_a(x, y);
+                    }
+                    break;
+                }
+                case BGJ_CUDA_SOL_S: {
+                    try_add2++;
+                    const uint64_t u = pool->vu[x] - pool->vu[y];
+                    if (bgj_cuda_insert_uid_fast(pool->uid, u)) {
+                        succ_add2++;
+                        sol->add_sol_s(x, y);
+                    }
+                    break;
+                }
+                case BGJ_CUDA_SOL_AA: {
+                    try_add3++;
+                    const uint64_t u = bkt->center_u + pool->vu[x] + pool->vu[y];
+                    if (bgj_cuda_insert_uid_fast(pool->uid, u)) {
+                        succ_add3++;
+                        sol->add_sol_aa(bkt->center_ind, x, y);
+                    }
+                    break;
+                }
+                case BGJ_CUDA_SOL_SA: {
+                    try_add3++;
+                    const uint64_t u = bkt->center_u - pool->vu[x] + pool->vu[y];
+                    if (bgj_cuda_insert_uid_fast(pool->uid, u)) {
+                        succ_add3++;
+                        sol->add_sol_sa(bkt->center_ind, x, y);
+                    }
+                    break;
+                }
+                case BGJ_CUDA_SOL_SS: {
+                    try_add3++;
+                    const uint64_t u = bkt->center_u - pool->vu[x] - pool->vu[y];
+                    if (bgj_cuda_insert_uid_fast(pool->uid, u)) {
+                        succ_add3++;
+                        sol->add_sol_ss(bkt->center_ind, x, y);
+                    }
+                    break;
+                }
+                default:
+                    break;
+                }
             }
         }
     }
