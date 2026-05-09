@@ -85,6 +85,7 @@ struct bgj_cuda_uid_candidate_t {
     uint64_t uid;
     uint32_t x;
     uint32_t y;
+    uint32_t center;
     uint32_t type;
     uint16_t slot;
     uint8_t accepted;
@@ -131,11 +132,36 @@ static uint32_t bgj_cuda_uid_batch_min_results()
     return min_results;
 }
 
+static int bgj_cuda_uid_coalesce_requested()
+{
+    static const int requested = []() {
+        const char *env = getenv("BGJ_CUDA_UID_COALESCE");
+        if (env && env[0]) return env[0] != '0' ? 1 : 0;
+        return 0;
+    }();
+    return requested;
+}
+
+static uint64_t bgj_cuda_uid_coalesce_min_results()
+{
+    static const uint64_t min_results = []() {
+        const char *env = getenv("BGJ_CUDA_UID_COALESCE_MIN_RESULTS");
+        if (env && env[0]) {
+            char *end = NULL;
+            const unsigned long long parsed = strtoull(env, &end, 10);
+            if (end != env && parsed > 0) return (uint64_t)parsed;
+        }
+        return (uint64_t)4096;
+    }();
+    return min_results;
+}
+
 static inline void bgj_cuda_add_uid_candidate(std::vector<bgj_cuda_uid_candidate_t> &candidates,
                                               std::vector<uint32_t> &touched_slots,
                                               std::vector<uint32_t> &slot_counts,
                                               uint64_t uid,
                                               uint32_t type,
+                                              uint32_t center,
                                               uint32_t x,
                                               uint32_t y)
 {
@@ -147,6 +173,7 @@ static inline void bgj_cuda_add_uid_candidate(std::vector<bgj_cuda_uid_candidate
     candidate.uid = uid;
     candidate.x = x;
     candidate.y = y;
+    candidate.center = center;
     candidate.type = type;
     candidate.slot = slot;
     candidate.accepted = 0;
@@ -154,7 +181,6 @@ static inline void bgj_cuda_add_uid_candidate(std::vector<bgj_cuda_uid_candidate
 }
 
 static inline void bgj_cuda_add_accepted_solution(sol_list_epi8_t *sol,
-                                                  uint32_t center,
                                                   const bgj_cuda_uid_candidate_t &candidate)
 {
     switch (candidate.type) {
@@ -165,13 +191,13 @@ static inline void bgj_cuda_add_accepted_solution(sol_list_epi8_t *sol,
         sol->add_sol_s(candidate.x, candidate.y);
         break;
     case BGJ_CUDA_SOL_AA:
-        sol->add_sol_aa(center, candidate.x, candidate.y);
+        sol->add_sol_aa(candidate.center, candidate.x, candidate.y);
         break;
     case BGJ_CUDA_SOL_SA:
-        sol->add_sol_sa(center, candidate.x, candidate.y);
+        sol->add_sol_sa(candidate.center, candidate.x, candidate.y);
         break;
     case BGJ_CUDA_SOL_SS:
-        sol->add_sol_ss(center, candidate.x, candidate.y);
+        sol->add_sol_ss(candidate.center, candidate.x, candidate.y);
         break;
     default:
         break;
@@ -415,7 +441,8 @@ static void bgj_cuda_host_profile_record(uint32_t result_count,
 }
 
 static void bgj_cuda_uid_batch_profile_record(int used_batch,
-                                              uint32_t result_count,
+                                              uint64_t bucket_count,
+                                              uint64_t result_count,
                                               uint64_t candidates,
                                               uint64_t accepted,
                                               uint64_t touched_locks,
@@ -430,12 +457,12 @@ static void bgj_cuda_uid_batch_profile_record(int used_batch,
     bgj_cuda_uid_batch_profile_register();
 
     pthread_mutex_lock(&bgj_cuda_uid_batch_profile.lock);
-    bgj_cuda_uid_batch_profile.buckets++;
+    bgj_cuda_uid_batch_profile.buckets += bucket_count;
     if (used_batch) {
-        bgj_cuda_uid_batch_profile.batched_buckets++;
+        bgj_cuda_uid_batch_profile.batched_buckets += bucket_count;
         bgj_cuda_uid_batch_profile.batched_candidates += candidates;
     } else {
-        bgj_cuda_uid_batch_profile.scalar_buckets++;
+        bgj_cuda_uid_batch_profile.scalar_buckets += bucket_count;
         bgj_cuda_uid_batch_profile.scalar_candidates += candidates;
     }
     bgj_cuda_uid_batch_profile.results += result_count;
@@ -975,6 +1002,7 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
                                                    slot_counts,
                                                    pool->vu[x] + pool->vu[y],
                                                    BGJ_CUDA_SOL_A,
+                                                   bkt->center_ind,
                                                    x,
                                                    y);
                         break;
@@ -985,6 +1013,7 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
                                                    slot_counts,
                                                    pool->vu[x] - pool->vu[y],
                                                    BGJ_CUDA_SOL_S,
+                                                   bkt->center_ind,
                                                    x,
                                                    y);
                         break;
@@ -995,6 +1024,7 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
                                                    slot_counts,
                                                    bkt->center_u + pool->vu[x] + pool->vu[y],
                                                    BGJ_CUDA_SOL_AA,
+                                                   bkt->center_ind,
                                                    x,
                                                    y);
                         break;
@@ -1005,6 +1035,7 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
                                                    slot_counts,
                                                    bkt->center_u - pool->vu[x] + pool->vu[y],
                                                    BGJ_CUDA_SOL_SA,
+                                                   bkt->center_ind,
                                                    x,
                                                    y);
                         break;
@@ -1015,6 +1046,7 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
                                                    slot_counts,
                                                    bkt->center_u - pool->vu[x] - pool->vu[y],
                                                    BGJ_CUDA_SOL_SS,
+                                                   bkt->center_ind,
                                                    x,
                                                    y);
                         break;
@@ -1072,7 +1104,7 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
                     } else {
                         succ_add3++;
                     }
-                    bgj_cuda_add_accepted_solution(sol, bkt->center_ind, candidates[i]);
+                    bgj_cuda_add_accepted_solution(sol, candidates[i]);
                 }
                 uid_profile_accepted = uid_profile_batch_accepted;
                 if (uid_batch_profile) {
@@ -1159,6 +1191,7 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
         }
         if (uid_batch_profile) {
             bgj_cuda_uid_batch_profile_record(uid_profile_used_batch,
+                                              1,
                                               result_count,
                                               uid_profile_candidates,
                                               uid_profile_accepted,
@@ -1396,6 +1429,217 @@ int Pool_epi8_t<nb>::_search_bgj1_cuda_overlap(bucket_epi8_t<record_dp> *bkt,
                                                                     result_count);
 }
 
+template <uint32_t nb, bool record_dp, bool profiling>
+static int bgj_cuda_consume_bgj1_result_batch_coalesced(Pool_epi8_t<nb> *pool,
+                                                        bucket_epi8_t<record_dp> **buckets,
+                                                        long num_bucket,
+                                                        sol_list_epi8_t *sol,
+                                                        bgj_profile_data_t<nb> *prof,
+                                                        bgj_cuda_result_t **result_ptrs,
+                                                        const uint32_t *result_counts)
+{
+    if (num_bucket <= 1) return 0;
+    if (!bgj_cuda_uid_batch_requested() || !bgj_cuda_uid_coalesce_requested()) return 0;
+    if (bgj_cuda_host_profile_requested() || bgj_cuda_sort_results_requested()) return 0;
+
+    uint64_t total_results = 0;
+    for (long i = 0; i < num_bucket; i++) {
+        total_results += result_counts[i];
+    }
+    if (total_results < bgj_cuda_uid_coalesce_min_results()) return 0;
+    if (total_results > 0xffffffffULL) return 0;
+
+    static thread_local std::vector<bgj_cuda_uid_candidate_t> candidates;
+    static thread_local std::vector<uint32_t> order;
+    static thread_local std::vector<uint32_t> touched_slots;
+    static thread_local std::vector<uint32_t> slot_counts;
+    static thread_local std::vector<uint32_t> slot_offsets;
+    static thread_local std::vector<uint32_t> slot_cursor;
+
+    try {
+        if (slot_counts.size() != UidHashTable::NUM_UID_LOCK) {
+            slot_counts.assign(UidHashTable::NUM_UID_LOCK, 0);
+            slot_offsets.assign(UidHashTable::NUM_UID_LOCK, 0);
+            slot_cursor.assign(UidHashTable::NUM_UID_LOCK, 0);
+        }
+        candidates.clear();
+        touched_slots.clear();
+        candidates.reserve((size_t)total_results);
+        touched_slots.reserve(UidHashTable::NUM_UID_LOCK);
+        order.resize((size_t)total_results);
+    } catch (...) {
+        return 0;
+    }
+
+    const int uid_batch_profile = bgj_cuda_uid_batch_profile_requested();
+    const double uid_profile_total_t0 = uid_batch_profile ? bgj_cuda_host_wall_time() : 0.0;
+    double uid_profile_build_sec = 0.0;
+    double uid_profile_group_sec = 0.0;
+    double uid_profile_insert_sec = 0.0;
+    double uid_profile_sol_sec = 0.0;
+    uint64_t try_add2 = 0;
+    uint64_t try_add3 = 0;
+    uint64_t succ_add2 = 0;
+    uint64_t succ_add3 = 0;
+
+    double uid_profile_phase_t0 = uid_batch_profile ? bgj_cuda_host_wall_time() : 0.0;
+    for (long bucket_index = 0; bucket_index < num_bucket; bucket_index++) {
+        bucket_epi8_t<record_dp> *bkt = buckets[bucket_index];
+        bgj_cuda_result_t *results = result_ptrs[bucket_index];
+        const uint32_t result_count = result_counts[bucket_index];
+        const uint32_t center = bkt->center_ind;
+        const uint64_t center_u = bkt->center_u;
+        for (uint32_t i = 0; i < result_count; i++) {
+            const uint32_t x = results[i].x;
+            const uint32_t y = results[i].y;
+            switch (results[i].type) {
+            case BGJ_CUDA_SOL_A:
+                try_add2++;
+                bgj_cuda_add_uid_candidate(candidates,
+                                           touched_slots,
+                                           slot_counts,
+                                           pool->vu[x] + pool->vu[y],
+                                           BGJ_CUDA_SOL_A,
+                                           center,
+                                           x,
+                                           y);
+                break;
+            case BGJ_CUDA_SOL_S:
+                try_add2++;
+                bgj_cuda_add_uid_candidate(candidates,
+                                           touched_slots,
+                                           slot_counts,
+                                           pool->vu[x] - pool->vu[y],
+                                           BGJ_CUDA_SOL_S,
+                                           center,
+                                           x,
+                                           y);
+                break;
+            case BGJ_CUDA_SOL_AA:
+                try_add3++;
+                bgj_cuda_add_uid_candidate(candidates,
+                                           touched_slots,
+                                           slot_counts,
+                                           center_u + pool->vu[x] + pool->vu[y],
+                                           BGJ_CUDA_SOL_AA,
+                                           center,
+                                           x,
+                                           y);
+                break;
+            case BGJ_CUDA_SOL_SA:
+                try_add3++;
+                bgj_cuda_add_uid_candidate(candidates,
+                                           touched_slots,
+                                           slot_counts,
+                                           center_u - pool->vu[x] + pool->vu[y],
+                                           BGJ_CUDA_SOL_SA,
+                                           center,
+                                           x,
+                                           y);
+                break;
+            case BGJ_CUDA_SOL_SS:
+                try_add3++;
+                bgj_cuda_add_uid_candidate(candidates,
+                                           touched_slots,
+                                           slot_counts,
+                                           center_u - pool->vu[x] - pool->vu[y],
+                                           BGJ_CUDA_SOL_SS,
+                                           center,
+                                           x,
+                                           y);
+                break;
+            default:
+                break;
+            }
+        }
+    }
+    if (uid_batch_profile) {
+        uid_profile_build_sec += bgj_cuda_host_wall_time() - uid_profile_phase_t0;
+    }
+
+    uid_profile_phase_t0 = uid_batch_profile ? bgj_cuda_host_wall_time() : 0.0;
+    uint32_t offset = 0;
+    for (uint32_t i = 0; i < touched_slots.size(); i++) {
+        const uint32_t slot = touched_slots[i];
+        slot_offsets[slot] = offset;
+        slot_cursor[slot] = offset;
+        offset += slot_counts[slot];
+    }
+    for (uint32_t i = 0; i < candidates.size(); i++) {
+        const uint32_t slot = candidates[i].slot;
+        order[slot_cursor[slot]++] = i;
+    }
+    if (uid_batch_profile) {
+        uid_profile_group_sec += bgj_cuda_host_wall_time() - uid_profile_phase_t0;
+    }
+
+    uid_profile_phase_t0 = uid_batch_profile ? bgj_cuda_host_wall_time() : 0.0;
+    for (uint32_t i = 0; i < touched_slots.size(); i++) {
+        const uint32_t slot = touched_slots[i];
+        const uint32_t begin = slot_offsets[slot];
+        const uint32_t end = begin + slot_counts[slot];
+        pthread_spin_lock(&pool->uid->uid_lock[slot].a);
+        for (uint32_t j = begin; j < end; j++) {
+            bgj_cuda_uid_candidate_t &candidate = candidates[order[j]];
+            candidate.accepted =
+                pool->uid->uid_table[slot].a.insert(candidate.uid).second ? 1 : 0;
+        }
+        pthread_spin_unlock(&pool->uid->uid_lock[slot].a);
+    }
+    if (uid_batch_profile) {
+        uid_profile_insert_sec += bgj_cuda_host_wall_time() - uid_profile_phase_t0;
+    }
+
+    uid_profile_phase_t0 = uid_batch_profile ? bgj_cuda_host_wall_time() : 0.0;
+    uint64_t accepted = 0;
+    for (uint32_t i = 0; i < candidates.size(); i++) {
+        if (!candidates[i].accepted) continue;
+        accepted++;
+        if (candidates[i].type == BGJ_CUDA_SOL_A ||
+            candidates[i].type == BGJ_CUDA_SOL_S) {
+            succ_add2++;
+        } else {
+            succ_add3++;
+        }
+        bgj_cuda_add_accepted_solution(sol, candidates[i]);
+    }
+    if (uid_batch_profile) {
+        uid_profile_sol_sec += bgj_cuda_host_wall_time() - uid_profile_phase_t0;
+    }
+
+    for (uint32_t i = 0; i < touched_slots.size(); i++) {
+        const uint32_t slot = touched_slots[i];
+        slot_counts[slot] = 0;
+        slot_offsets[slot] = 0;
+        slot_cursor[slot] = 0;
+    }
+
+    if (profiling && prof) {
+        pthread_spin_lock(&prof->profile_lock);
+        prof->try_add2 += try_add2;
+        prof->try_add3 += try_add3;
+        prof->succ_add2 += succ_add2;
+        prof->succ_add3 += succ_add3;
+        pthread_spin_unlock(&prof->profile_lock);
+    }
+
+    if (uid_batch_profile) {
+        bgj_cuda_uid_batch_profile_record(1,
+                                          (uint64_t)num_bucket,
+                                          total_results,
+                                          (uint64_t)candidates.size(),
+                                          accepted,
+                                          (uint64_t)touched_slots.size(),
+                                          uid_profile_build_sec,
+                                          uid_profile_group_sec,
+                                          uid_profile_insert_sec,
+                                          uid_profile_sol_sec,
+                                          0.0,
+                                          bgj_cuda_host_wall_time() - uid_profile_total_t0);
+    }
+    return 1;
+}
+
 template <uint32_t nb>
 template <bool record_dp, bool profiling>
 int Pool_epi8_t<nb>::_search_bgj1_cuda_batch(bucket_epi8_t<record_dp> **buckets,
@@ -1505,6 +1749,15 @@ int Pool_epi8_t<nb>::_search_bgj1_cuda_batch(bucket_epi8_t<record_dp> **buckets,
 
     for (uint32_t i = 0; i < batch_size; i++) {
         if (overflows[i] && bgj_cuda_overflow_fallback_requested()) return 0;
+    }
+    if (bgj_cuda_consume_bgj1_result_batch_coalesced<nb, record_dp, profiling>(this,
+                                                                                buckets,
+                                                                                num_bucket,
+                                                                                sol,
+                                                                                prof,
+                                                                                result_ptrs.data(),
+                                                                                result_counts.data())) {
+        return 1;
     }
     for (uint32_t i = 0; i < batch_size; i++) {
         if (!bgj_cuda_consume_bgj1_results<nb, record_dp, profiling>(this,
