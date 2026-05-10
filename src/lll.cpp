@@ -148,6 +148,7 @@ int Lattice_QP::trans_to(long ind_l, long ind_r, Lattice_QP *L){
 
 	if (fperr){
 		std::cerr << "[Error] Lattice_QP::trans_to: floating point precision error, aborted.\n";
+        FREE_MAT((void **)A);
         return 0;
 	}
 	if (fpwarn){

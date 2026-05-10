@@ -5,6 +5,7 @@
 #include "../include/bgj_amx.h"
 #endif
 
+#include <cmath>
 #include <cstdlib>
 
 #define POOL_EPI8_RATIO_ADJ ( CSD < 80 ? pow(1.01, CSD - 80) : 1.0)
@@ -1282,17 +1283,63 @@ int Pool_epi8_t<nb>::tail_LLL(double delta, long n) {
 
     // create a new Lattice_QP and LLL
     uint8_t *_b_dual_old = (uint8_t *) NEW_VEC(CSD * vec_length, sizeof(uint8_t));
-    int32_t _dhalf_old;
-    int32_t _dshift_old;
-    do {
-        // LLL
+    if (!_b_dual_old) return 0;
+    int32_t _dhalf_old = 0;
+    int32_t _dshift_old = 0;
+    const int tail_use_fplll = bgj_tail_lll_use_fplll();
+    const int tail_use_custom_deep = bgj_tail_deep_lll_use_custom();
+    const double tail_max_abs = 1.0e18;
+    const double tail_min_row_abs = 1.0e-30;
+
+    auto lattice_entries_are_sane = [&](Lattice_QP *L, const char **reason) -> int {
+        if (L == NULL) {
+            if (reason) *reason = "null lattice";
+            return 0;
+        }
+        MAT_QP b = L->get_b();
+        for (long i = 0; i < L->NumRows(); i++) {
+            double row_max = 0.0;
+            for (long j = 0; j < L->NumCols(); j++) {
+                const double hi = b.hi[i][j];
+                const double lo = b.lo[i][j];
+                if (!std::isfinite(hi) || !std::isfinite(lo)) {
+                    if (reason) *reason = "non-finite local basis entry";
+                    return 0;
+                }
+                const double abs_hi = fabs(hi);
+                if (abs_hi > tail_max_abs) {
+                    if (reason) *reason = "oversized local basis entry";
+                    return 0;
+                }
+                if (abs_hi > row_max) row_max = abs_hi;
+            }
+            if (row_max <= tail_min_row_abs) {
+                if (reason) *reason = "zero local basis row";
+                return 0;
+            }
+        }
+        return 1;
+    };
+
+    auto prepare_tail_basis = [&](int force_custom_tail, const char **reason) -> int {
         Lattice_QP *L_tmp = new Lattice_QP(CSD, CSD);
+        Lattice_QP *L_src = NULL;
+        Lattice_QP *L_tmp_dual = NULL;
+        if (!L_tmp) {
+            if (reason) *reason = "failed to allocate local lattice";
+            return 0;
+        }
         for (long i = 0; i < CSD; i++) {
             for (long j = 0; j < CSD; j++) {
                 L_tmp->get_b().hi[i][j] = _b_local[i][j];
             }
         }
-        Lattice_QP *L_src = this->basis->b_loc_QP(this->index_l, this->index_r);
+        L_src = this->basis->b_loc_QP(this->index_l, this->index_r);
+        if (!L_src) {
+            if (reason) *reason = "failed to create projected source lattice";
+            delete L_tmp;
+            return 0;
+        }
         do {
             NTL::quad_float _ratio_qp(_ratio);
             for (long i = 0; i < CSD; i++) {
@@ -1304,55 +1351,143 @@ int Pool_epi8_t<nb>::tail_LLL(double delta, long n) {
                 }
             }
         } while (0);
-        
-        L_tmp->reconstruct(L_src);
+
+        if (!L_tmp->reconstruct(L_src)) {
+            if (reason) *reason = "reconstruct failed";
+            delete L_src;
+            delete L_tmp;
+            return 0;
+        }
         delete L_src;
+        L_src = NULL;
         int fplll_tail_status = -1;
-        if (bgj_tail_lll_use_fplll()) {
+        if (!force_custom_tail && tail_use_fplll) {
             fplll_tail_status = bgj_fplll_lll_qp(*L_tmp, delta, CSD-n, CSD, 0);
         }
-        if (fplll_tail_status != 0) {
+        if (force_custom_tail || fplll_tail_status != 0) {
             L_tmp->LLL_QP(delta, CSD-n, CSD);
         }
-        if (fplll_tail_status != 0 || bgj_tail_deep_lll_use_custom()) {
+        if (force_custom_tail || fplll_tail_status != 0 || tail_use_custom_deep) {
             L_tmp->LLL_DEEP_QP(delta-0.03, CSD-n, CSD);
         }
-        L_tmp->dual_size_red();
-        Lattice_QP *L_tmp_dual = L_tmp->dual_QP();
-        
+        if (!lattice_entries_are_sane(L_tmp, reason)) {
+            delete L_tmp;
+            return 0;
+        }
+        if (L_tmp->dual_size_red() != 1) {
+            if (reason) *reason = "dual size reduction failed";
+            delete L_tmp;
+            return 0;
+        }
+        if (!lattice_entries_are_sane(L_tmp, reason)) {
+            delete L_tmp;
+            return 0;
+        }
+        L_tmp_dual = L_tmp->dual_QP();
+        if (!lattice_entries_are_sane(L_tmp_dual, reason)) {
+            delete L_tmp;
+            delete L_tmp_dual;
+            return 0;
+        }
+
+        // prepare b_dual_old before changing the global basis.
+        double mdd = 0.0;
+        for (long i = 0; i < CSD; i++) {
+            for (long j = 0; j < CSD; j++) {
+                const double v = L_tmp_dual->get_b().hi[i][j];
+                if (!std::isfinite(v)) {
+                    if (reason) *reason = "non-finite dual basis entry";
+                    delete L_tmp;
+                    delete L_tmp_dual;
+                    return 0;
+                }
+                if (fabs(v) > mdd) mdd = fabs(v);
+            }
+        }
+        const double dhalf_floor = (mdd > 0.0) ? floor(127.0 / mdd) : 0.0;
+        if (!std::isfinite(mdd) || !std::isfinite(dhalf_floor) ||
+            dhalf_floor < 2.0 || dhalf_floor > 2147483647.0) {
+            if (reason) *reason = "dual basis too coarse for int8 scaling";
+            delete L_tmp;
+            delete L_tmp_dual;
+            return 0;
+        }
+        const uint32_t dhalf_candidate = (uint32_t)dhalf_floor;
+        _dshift_old = 31 - __builtin_clz(dhalf_candidate);
+        if (_dshift_old <= 0) {
+            if (reason) *reason = "invalid dual scaling shift";
+            delete L_tmp;
+            delete L_tmp_dual;
+            return 0;
+        }
+        _dhalf_old = 1 << (_dshift_old-1);
+        if (_dhalf_old < 1) {
+            if (reason) *reason = "invalid dual scaling half-width";
+            delete L_tmp;
+            delete L_tmp_dual;
+            return 0;
+        }
+        const double dual_scale = ((_dhalf_old << 1) + 0.0);
+        for (long i = 0; i < CSD; i++) {
+            mul_avx2(L_tmp_dual->get_b().hi[i], dual_scale, CSD);
+            for (long j = 0; j < CSD; j++) {
+                const double scaled = L_tmp_dual->get_b().hi[i][j] + 128.0;
+                const long rounded = (long)round(scaled);
+                if (!std::isfinite(scaled) || rounded < 0 || rounded > 255) {
+                    if (reason) *reason = "dual basis int8 scaling overflow";
+                    delete L_tmp;
+                    delete L_tmp_dual;
+                    return 0;
+                }
+                _b_dual_old[i*vec_length+j] = (uint8_t)rounded;
+            }
+        }
+
         // process basis
         NTL::quad_float q(1.0/_ratio);
         for (long i = 0; i < CSD; i++){
             mul(L_tmp->get_b().hi[i], L_tmp->get_b().lo[i], q, CSD);
         }
-        basis->trans_to(index_l, index_r, L_tmp);
+        if (!lattice_entries_are_sane(L_tmp, reason)) {
+            delete L_tmp;
+            delete L_tmp_dual;
+            return 0;
+        }
+        if (!basis->trans_to(index_l, index_r, L_tmp)) {
+            if (reason) *reason = "basis transfer failed";
+            delete L_tmp;
+            delete L_tmp_dual;
+            return 0;
+        }
         basis->compute_gso_QP();
 
-        // prepare b_dual_old
-        double mdd = 0.0;
-        for (long i = 0; i < CSD; i++) {
-            for (long j = 0; j < CSD; j++) {
-                if (fabs(L_tmp_dual->get_b().hi[i][j]) > mdd) mdd = fabs(L_tmp_dual->get_b().hi[i][j]);
-            }
-        }
-        _dhalf_old = floor(127.0 / mdd);
-        _dshift_old = 31 - __builtin_clz(_dhalf_old);
-        _dhalf_old = 1 << (_dshift_old-1);
-        if (_dhalf_old < 1) {
-            fprintf(stderr, "[Error] Pool_epi8_t<%u>::tail_LLL: _dhalf < 1, the basis too coarse???", nb);
-        }
-        mdd = ((_dhalf_old << 1) + 0.0);
-
-        for (long i = 0; i < CSD; i++) {
-            mul_avx2(L_tmp_dual->get_b().hi[i], mdd, CSD);
-            for (long j = 0; j < CSD; j++) {
-                _b_dual_old[i*vec_length+j] = round(L_tmp_dual->get_b().hi[i][j] + 128.0);
-            }
-        }
-        
         delete L_tmp;
         delete L_tmp_dual;
-    } while (0);
+        return 1;
+    };
+
+    const char *tail_fail_reason = "unknown failure";
+    if (!prepare_tail_basis(0, &tail_fail_reason)) {
+        if (tail_use_fplll) {
+            fprintf(stderr,
+                    "[Warning] Pool_epi8_t<%u>::tail_LLL: fast tail reduction failed on [%ld,%ld) (%s), retrying with custom deep-LLL.\n",
+                    nb, index_l, index_r, tail_fail_reason);
+            const char *fallback_fail_reason = "unknown failure";
+            if (!prepare_tail_basis(1, &fallback_fail_reason)) {
+                fprintf(stderr,
+                        "[Error] Pool_epi8_t<%u>::tail_LLL: custom deep-LLL fallback failed on [%ld,%ld) (%s), keeping current basis and pool.\n",
+                        nb, index_l, index_r, fallback_fail_reason);
+                FREE_VEC(_b_dual_old);
+                return 0;
+            }
+        } else {
+            fprintf(stderr,
+                    "[Error] Pool_epi8_t<%u>::tail_LLL: tail reduction failed on [%ld,%ld) (%s), keeping current basis and pool.\n",
+                    nb, index_l, index_r, tail_fail_reason);
+            FREE_VEC(_b_dual_old);
+            return 0;
+        }
+    }
 
     float **b_normal = (float **) NEW_MAT(CSD, vec_length, sizeof(float));
     do {
