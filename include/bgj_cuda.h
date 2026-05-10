@@ -77,6 +77,17 @@ extern "C" int bgj_cuda_lsh_search_raw(const uint8_t *sh,
                                         uint32_t result_capacity,
                                         uint32_t *result_count,
                                         int *overflow);
+extern "C" uint64_t bgj_cuda_lsh_total_tile_slots(uint32_t mbound);
+extern "C" int bgj_cuda_lsh_search_range_raw(const uint8_t *sh,
+                                              uint32_t mbound,
+                                              uint32_t shsize,
+                                              int32_t threshold,
+                                              uint64_t tile_slot_begin,
+                                              uint64_t tile_slot_count,
+                                              bgj_cuda_result_t *results,
+                                              uint32_t result_capacity,
+                                              uint32_t *result_count,
+                                              int *overflow);
 
 extern "C" int bgj_cuda_materialize_sol_list_raw(const int8_t *pool_vecs,
                                                   uint64_t pool_epoch,

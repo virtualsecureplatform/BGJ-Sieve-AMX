@@ -1340,6 +1340,7 @@ __global__ __launch_bounds__(BGJ_CUDA_LSH_THREADS, 2)
 void bgj_cuda_lsh_search_kernel(const uint64_t *sh,
                                 uint32_t mbound,
                                 int32_t threshold,
+                                uint64_t tile_slot_begin,
                                 uint64_t tile_slots,
                                 bgj_cuda_result_t *results,
                                 uint32_t result_capacity,
@@ -1351,7 +1352,8 @@ void bgj_cuda_lsh_search_kernel(const uint64_t *sh,
     const uint32_t num_tiles = (mbound + BGJ_CUDA_LSH_TILE - 1u) / BGJ_CUDA_LSH_TILE;
     const int32_t upper_threshold = 512 - threshold;
 
-    for (uint64_t tile_slot = blockIdx.x; tile_slot < tile_slots; tile_slot += gridDim.x) {
+    for (uint64_t tile_slot_offset = blockIdx.x; tile_slot_offset < tile_slots; tile_slot_offset += gridDim.x) {
+        const uint64_t tile_slot = tile_slot_begin + tile_slot_offset;
         uint32_t tile_i = 0;
         uint32_t tile_j = 0;
         bgj_cuda_lsh_tile_pair(tile_slot, num_tiles, &tile_i, &tile_j);
@@ -3462,14 +3464,22 @@ static int bgj_cuda_prepare_bucket_stream(bgj_cuda_bucket_scratch_t *scratch)
         if (!ensure_cuda_capacity((void **)&(ptr), &(capacity), requested)) goto fail; \
     } while (0)
 
-extern "C" int bgj_cuda_lsh_search_raw(const uint8_t *sh,
-                                        uint32_t mbound,
-                                        uint32_t shsize,
-                                        int32_t threshold,
-                                        bgj_cuda_result_t *results,
-                                        uint32_t result_capacity,
-                                        uint32_t *result_count,
-                                        int *overflow)
+extern "C" uint64_t bgj_cuda_lsh_total_tile_slots(uint32_t mbound)
+{
+    const uint32_t num_tiles = (mbound + BGJ_CUDA_LSH_TILE - 1u) / BGJ_CUDA_LSH_TILE;
+    return (uint64_t)num_tiles * (uint64_t)(num_tiles + 1u) / 2u;
+}
+
+extern "C" int bgj_cuda_lsh_search_range_raw(const uint8_t *sh,
+                                              uint32_t mbound,
+                                              uint32_t shsize,
+                                              int32_t threshold,
+                                              uint64_t tile_slot_begin,
+                                              uint64_t tile_slot_count,
+                                              bgj_cuda_result_t *results,
+                                              uint32_t result_capacity,
+                                              uint32_t *result_count,
+                                              int *overflow)
 {
     if (!bgj_cuda_select_thread_device()) return 0;
     bgj_cuda_raw_scratch_t *scratch = &bgj_cuda_raw_scratch;
@@ -3487,6 +3497,16 @@ extern "C" int bgj_cuda_lsh_search_raw(const uint8_t *sh,
         set_plain_error("no CUDA error");
         return 1;
     }
+    const uint64_t total_tile_slots = bgj_cuda_lsh_total_tile_slots(mbound);
+    if (tile_slot_begin >= total_tile_slots || tile_slot_count == 0u) {
+        *result_count = 0;
+        *overflow = 0;
+        set_plain_error("no CUDA error");
+        return 1;
+    }
+    if (tile_slot_count > total_tile_slots - tile_slot_begin) {
+        tile_slot_count = total_tile_slots - tile_slot_begin;
+    }
     if (!bgj_cuda_prepare_stream(scratch)) return 0;
 
     cudaStream_t stream = scratch->stream;
@@ -3501,9 +3521,7 @@ extern "C" int bgj_cuda_lsh_search_raw(const uint8_t *sh,
     CUDA_TRY(cudaMemsetAsync(scratch->overflow, 0, sizeof(int), stream));
 
     {
-        const uint32_t num_tiles = (mbound + BGJ_CUDA_LSH_TILE - 1u) / BGJ_CUDA_LSH_TILE;
-        const uint64_t tile_slots = (uint64_t)num_tiles * (uint64_t)(num_tiles + 1u) / 2u;
-        uint32_t grid = tile_slots > 65535ull ? 65535u : (uint32_t)tile_slots;
+        uint32_t grid = tile_slot_count > 65535ull ? 65535u : (uint32_t)tile_slot_count;
         if (grid == 0) grid = 1;
         bgj_cuda_lsh_search_kernel<<<grid,
                                       BGJ_CUDA_LSH_THREADS,
@@ -3511,7 +3529,8 @@ extern "C" int bgj_cuda_lsh_search_raw(const uint8_t *sh,
                                       stream>>>((const uint64_t *)scratch->p_vecs,
                                                 mbound,
                                                 threshold,
-                                                tile_slots,
+                                                tile_slot_begin,
+                                                tile_slot_count,
                                                 scratch->results,
                                                 result_capacity,
                                                 scratch->result_count,
@@ -3540,6 +3559,27 @@ extern "C" int bgj_cuda_lsh_search_raw(const uint8_t *sh,
 
 fail:
     return 0;
+}
+
+extern "C" int bgj_cuda_lsh_search_raw(const uint8_t *sh,
+                                        uint32_t mbound,
+                                        uint32_t shsize,
+                                        int32_t threshold,
+                                        bgj_cuda_result_t *results,
+                                        uint32_t result_capacity,
+                                        uint32_t *result_count,
+                                        int *overflow)
+{
+    return bgj_cuda_lsh_search_range_raw(sh,
+                                         mbound,
+                                         shsize,
+                                         threshold,
+                                         0u,
+                                         bgj_cuda_lsh_total_tile_slots(mbound),
+                                         results,
+                                         result_capacity,
+                                         result_count,
+                                         overflow);
 }
 
 struct bgj_cuda_materialize_scratch_t {

@@ -379,6 +379,9 @@ struct lsh_mblock_t;
 struct nsh_profile_data_t;
 struct lsh_profile_data_t;
 
+void bgj_lsh_best_solution_reset();
+int bgj_lsh_best_solution_get(double *length, double *vec, long capacity, long *dimension);
+
 #if defined(__AMX_INT8__) && BOOST_AMX_SIEVE
 struct booster_amx160_t;
 #endif

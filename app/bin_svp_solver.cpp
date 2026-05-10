@@ -1,6 +1,9 @@
 #include <iostream>
 #include <fstream>
 #include <string>
+#include <cstdlib>
+#include <strings.h>
+#include <vector>
 #include <omp.h>
 
 #include <sys/time.h>
@@ -67,6 +70,59 @@ static int solver_use_fplll_initial_lll()
     if (!strcasecmp(backend, "fplll") || !strcasecmp(backend, "1") ||
         !strcasecmp(backend, "true") || !strcasecmp(backend, "yes")) return 1;
     return 0;
+}
+
+static int solver_env_is_set(const char *name)
+{
+    const char *env = getenv(name);
+    return env != NULL && env[0] != '\0';
+}
+
+static long solver_env_long(const char *name, long default_value)
+{
+    const char *env = getenv(name);
+    if (env == NULL || env[0] == '\0') return default_value;
+    char *end = NULL;
+    long value = strtol(env, &end, 10);
+    return (end != env) ? value : default_value;
+}
+
+static double solver_env_double(const char *name, double default_value)
+{
+    const char *env = getenv(name);
+    if (env == NULL || env[0] == '\0') return default_value;
+    char *end = NULL;
+    double value = strtod(env, &end);
+    return (end != env) ? value : default_value;
+}
+
+static int solver_env_flag(const char *name, int default_value)
+{
+    const char *env = getenv(name);
+    if (env == NULL || env[0] == '\0') return default_value;
+    if (!strcasecmp(env, "0") || !strcasecmp(env, "false") ||
+        !strcasecmp(env, "no") || !strcasecmp(env, "off")) return 0;
+    return 1;
+}
+
+struct solver_best_row_t {
+    long index;
+    double length;
+};
+
+static solver_best_row_t solver_find_best_basis_row(Lattice_QP *L)
+{
+    solver_best_row_t best;
+    best.index = 0;
+    best.length = 0.0;
+    for (long i = 0; i < L->NumRows(); ++i) {
+        const double len = sqrt(dot_avx2(L->get_b().hi[i], L->get_b().hi[i], L->NumCols()));
+        if (i == 0 || len < best.length) {
+            best.index = i;
+            best.length = len;
+        }
+    }
+    return best;
 }
 
 #define SOLVER_PROFILE_DO(label, stmt) do {               \
@@ -195,7 +251,21 @@ int _svp_solver_red(Lattice_QP* L, long algo) {
             SOLVER_PROFILE_DO(label, __local_pump(L, 75, 15, l, l + 90));
         }
         SOLVER_PROFILE_DO("120t95 LLL_after_pump75", L->LLL_QP());
-        SOLVER_PROFILE_DO("120t95 lsh_pump_85_35_q02", __lsh_pump_red_epi8(L, num_threads, 1.1, 0.2, 85, 35, 24, 0, 24, 0, 0, 45));
+        if (solver_env_is_set("BGJ_120T95_FIRST_LSH_QRATIO") ||
+            solver_env_is_set("BGJ_120T95_FIRST_LSH_MSD") ||
+            solver_env_is_set("BGJ_120T95_FIRST_LSH_F") ||
+            solver_env_is_set("BGJ_120T95_FIRST_LSH_MINSD")) {
+            const double first_lsh_qratio = solver_env_double("BGJ_120T95_FIRST_LSH_QRATIO", 0.2);
+            const long first_lsh_msd = solver_env_long("BGJ_120T95_FIRST_LSH_MSD", 85);
+            const long first_lsh_f = solver_env_long("BGJ_120T95_FIRST_LSH_F",
+                                                     solver_env_long("BGJ_120T95_FIRST_LSH_MINSD", 35));
+            char first_lsh_label[96];
+            snprintf(first_lsh_label, sizeof(first_lsh_label), "120t95 lsh_pump_env_%ld_%ld_q%.3f",
+                     first_lsh_msd, first_lsh_f, first_lsh_qratio);
+            SOLVER_PROFILE_DO(first_lsh_label, __lsh_pump_red_epi8(L, num_threads, 1.1, first_lsh_qratio, first_lsh_msd, first_lsh_f, 24, 0, 24, 0, 0, 45));
+        } else {
+            SOLVER_PROFILE_DO("120t95 lsh_pump_85_35_q02", __lsh_pump_red_epi8(L, num_threads, 1.1, 0.2, 85, 35, 24, 0, 24, 0, 0, 45));
+        }
         SOLVER_PROFILE_DO("120t95 local_lsh_80_10_120", __local_lsh_pump(L, 80, 30, 10, 120));
         SOLVER_PROFILE_DO("120t95 local_lsh_75_20_120", __local_lsh_pump(L, 75, 25, 20, 120));
         SOLVER_PROFILE_DO("120t95 lsh_pump_88_32_q04", __lsh_pump_red_epi8(L, num_threads, 1.1, 0.4, 88, 32, 24, 0, 24, 0, 0, 45));
@@ -206,8 +276,32 @@ int _svp_solver_red(Lattice_QP* L, long algo) {
         SOLVER_PROFILE_DO("120t95 lsh_pump_92_28_q035", __lsh_pump_red_epi8(L, num_threads, 1.1, 0.35, 92, 28, 24, 0, 24, 0, 0, 45));
         SOLVER_PROFILE_DO("120t95 local_pump_85_15_120_b", __local_pump(L, 85, 20, 15, 120));
         // the final sieve do not insert to the basis, it only print the short vectors
-        // now we run this part manually
-        // __last_lsh_pump_epi8(L, num_threads, 0.6, 0.6, 102, 0, 3, 0, 40);
+        if (solver_env_flag("BGJ_SVP_FINAL_LSH", 0)) {
+            const double final_qratio = solver_env_double("BGJ_120T95_FINAL_LSH_QRATIO", 0.6);
+            const double final_ext_qratio = solver_env_double("BGJ_120T95_FINAL_LSH_EXT_QRATIO", final_qratio);
+            const long final_msd = solver_env_long("BGJ_120T95_FINAL_LSH_MSD", 102);
+            const long final_ext_d = solver_env_long("BGJ_120T95_FINAL_LSH_EXT_D", 0);
+            const long final_log = solver_env_long("BGJ_120T95_FINAL_LSH_LOG", 3);
+            const long final_shuffle = solver_env_long("BGJ_120T95_FINAL_LSH_SHUFFLE_FIRST", 0);
+            const long final_minsd = solver_env_long("BGJ_120T95_FINAL_LSH_MINSD", 40);
+            double final_lsh_length = 0.0;
+            char final_lsh_label[128];
+            snprintf(final_lsh_label, sizeof(final_lsh_label),
+                     "120t95 final_lsh_%ld_%ld_q%.3f",
+                     final_msd, final_ext_d, final_qratio);
+            SOLVER_PROFILE_DO(final_lsh_label,
+                              final_lsh_length = __last_lsh_pump_epi8(L, num_threads,
+                                                                       final_qratio,
+                                                                       final_ext_qratio,
+                                                                       final_msd,
+                                                                       final_ext_d,
+                                                                       final_log,
+                                                                       final_shuffle,
+                                                                       final_minsd));
+            if (final_lsh_length > 0.0) {
+                printf("final_lsh_best: algo=120t95 length=%.9g\n", final_lsh_length);
+            }
+        }
 
         return 1;
     }
@@ -478,6 +572,7 @@ int main(int argc, char** argv) {
     Lattice_QP L(L_ZZ);
     solver_profile_line("lattice_init", solver_now() - profile_t0);
     SetSamplerSeed((uint64_t)seed);
+    bgj_lsh_best_solution_reset();
     if (bkz_pre) {
         if (bkz_pre_msd <= 0 || bkz_pre_d4f < 0 || bkz_pre_msd + bkz_pre_d4f >= L.NumRows()) {
             fprintf(stderr, "Error: --bkz-pre requires msd > 0, d4f >= 0, and msd + d4f < dimension.\n");
@@ -492,11 +587,29 @@ int main(int argc, char** argv) {
     solver_profile_line("solver_red_total", solver_now() - profile_t0);
     TIMER_END;
     
-    double min_len = sqrt(dot_avx2(L.get_b().hi[0], L.get_b().hi[0], L.NumRows()));
+    const solver_best_row_t best_row = solver_find_best_basis_row(&L);
+    std::vector<double> lsh_best_vec((size_t)L.NumCols());
+    double lsh_best_len = 0.0;
+    long lsh_best_dim = 0;
+    const int has_lsh_best = bgj_lsh_best_solution_get(&lsh_best_len,
+                                                       lsh_best_vec.data(),
+                                                       L.NumCols(),
+                                                       &lsh_best_dim) &&
+                             lsh_best_dim == L.NumCols();
+    double min_len = best_row.length;
+    const int use_lsh_best = has_lsh_best && lsh_best_len < min_len;
+    if (use_lsh_best) min_len = lsh_best_len;
     if (goal_length == 0.0) goal_length = L.gh() * 1.00;
     if (min_len < goal_length) {
-        printf("possible sol: %s, length = %.2f, time = %.2fs, vec = ", argv[filename_place], min_len, CURRENT_TIME);
-        PRINT_VEC(L.get_b().hi[0], L.NumRows());
+        if (use_lsh_best) {
+            printf("possible sol: %s, source = lsh_insert, length = %.2f, time = %.2fs, vec = ",
+                   argv[filename_place], min_len, CURRENT_TIME);
+            PRINT_VEC(lsh_best_vec.data(), lsh_best_dim);
+        } else {
+            printf("possible sol: %s, row = %ld, length = %.2f, time = %.2fs, vec = ",
+                   argv[filename_place], best_row.index, min_len, CURRENT_TIME);
+            PRINT_VEC(L.get_b().hi[best_row.index], L.NumCols());
+        }
     }
     profile_t0 = solver_now();
     L.store(output);

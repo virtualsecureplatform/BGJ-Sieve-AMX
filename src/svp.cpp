@@ -671,16 +671,16 @@ void __lsh_pump_red_epi8(Lattice_QP *L, long num_threads, double eta, double qra
              total_time, num_threads, (total_time * num_threads), dPot);
 }
 
-void __last_lsh_pump_epi8(Lattice_QP *L, long num_threads, double qratio, double ext_qratio, long msd, long ext_d, long log_level, long shuffle_first, long minsd) {
+double __last_lsh_pump_epi8(Lattice_QP *L, long num_threads, double qratio, double ext_qratio, long msd, long ext_d, long log_level, long shuffle_first, long minsd) {
     if (min(msd, L->NumRows()) < minsd){
         fprintf(stderr, "[Warning] sieving dimension too small, may get stuck, nothing done.\nYou can use Enum based algorithms instead.\n");
-        return;
+        return 0.0;
     }
     if (msd + ext_d > 96 + COMPILE_POOL_EPI8_128 * 32 + COMPILE_POOL_EPI8_160 * 32) {
         fprintf(stderr, "[Warning] sieving dimension(%ld+%ld) >= %d, nothing done\n"
-                "change COMPILE_POOL_EPI8_** in include/config.h to enable higher sieving dimension.\n", 
+                "change COMPILE_POOL_EPI8_** in include/config.h to enable higher sieving dimension.\n",
                 msd, ext_d, 96 + COMPILE_POOL_EPI8_128 * 32 + COMPILE_POOL_EPI8_160 * 32);
-        return;
+        return 0.0;
     }
 
     struct timeval start, end;
@@ -689,6 +689,7 @@ void __last_lsh_pump_epi8(Lattice_QP *L, long num_threads, double qratio, double
     const long n = L->NumRows();
     if (msd > n) msd = n;
     if (msd + ext_d > n) ext_d = n - msd;
+    double best_lift_length = 0.0;
 
     constexpr double pool_size_ratio = 3.2;
 
@@ -742,6 +743,10 @@ void __last_lsh_pump_epi8(Lattice_QP *L, long num_threads, double qratio, double
                     } else {                                                                                \
                         p.show_min_lift(0);                                                                 \
                     }                                                                                       \
+                    if (p.last_lift_valid &&                                                                \
+                        (best_lift_length == 0.0 || p.last_lift_euclidean_norm < best_lift_length)) {       \
+                        best_lift_length = p.last_lift_euclidean_norm;                                      \
+                    }                                                                                       \
                 }                                                                                           \
                 if (ret) {                                                                                  \
                     num_stuck++;                                                                            \
@@ -770,11 +775,15 @@ void __last_lsh_pump_epi8(Lattice_QP *L, long num_threads, double qratio, double
 
 
     L->LLL_QP(0.99);
-    if (log_level < 2) return;
+    if (best_lift_length > 0.0) {
+        fprintf(stdout, "__last_lsh_pump_epi8 best_lift_length = %.9g\n", best_lift_length);
+    }
+    if (log_level < 2) return best_lift_length;
     gettimeofday(&end, NULL);
     double total_time = (end.tv_sec-start.tv_sec)+(double)(end.tv_usec-start.tv_usec)/1000000.0;
     fprintf(stdout, "__last_lsh_pump_epi8 done: runtime = %fs, num_threads = %ld, total_cost = %fTs\n",
              total_time, num_threads, (total_time * num_threads));
+    return best_lift_length;
 }
 
 

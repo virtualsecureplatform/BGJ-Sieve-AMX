@@ -68,6 +68,46 @@ int main()
         std::fprintf(stderr, "mismatch: cpu=%zu gpu=%zu\n", cpu.size(), gpu.size());
         return 2;
     }
-    std::printf("lsh_cuda_smoketest ok: results=%zu\n", cpu.size());
+    if (cpu.size() > 1) {
+        std::vector<bgj_cuda_result_t> tiny(1);
+        uint32_t tiny_count = 0;
+        int tiny_overflow = 0;
+        ok = bgj_cuda_lsh_search_raw(sh.data(), mbound, shsize, threshold,
+                                     tiny.data(), (uint32_t)tiny.size(), &tiny_count, &tiny_overflow);
+        if (!ok || !tiny_overflow) {
+            std::fprintf(stderr, "expected overflow: ok=%d overflow=%d count=%u error=%s\n",
+                         ok, tiny_overflow, tiny_count, bgj_cuda_last_error());
+            return 3;
+        }
+    }
+
+    std::vector<bgj_cuda_result_t> gpu_chunked;
+    const uint64_t total_slots = bgj_cuda_lsh_total_tile_slots(mbound);
+    const uint64_t chunk_slots = 17;
+    for (uint64_t begin = 0; begin < total_slots; begin += chunk_slots) {
+        const uint64_t count = std::min(chunk_slots, total_slots - begin);
+        std::vector<bgj_cuda_result_t> chunk(cpu.size() + 1024);
+        uint32_t chunk_count = 0;
+        int chunk_overflow = 0;
+        ok = bgj_cuda_lsh_search_range_raw(sh.data(), mbound, shsize, threshold,
+                                           begin, count, chunk.data(), (uint32_t)chunk.size(),
+                                           &chunk_count, &chunk_overflow);
+        if (!ok || chunk_overflow) {
+            std::fprintf(stderr, "CUDA LSH range call failed: ok=%d overflow=%d begin=%llu count=%llu error=%s\n",
+                         ok, chunk_overflow, (unsigned long long)begin,
+                         (unsigned long long)count, bgj_cuda_last_error());
+            return 4;
+        }
+        chunk.resize(chunk_count);
+        gpu_chunked.insert(gpu_chunked.end(), chunk.begin(), chunk.end());
+    }
+    std::sort(gpu_chunked.begin(), gpu_chunked.end(), result_less);
+    if (cpu.size() != gpu_chunked.size() || !std::equal(cpu.begin(), cpu.end(), gpu_chunked.begin(), result_equal)) {
+        std::fprintf(stderr, "range mismatch: cpu=%zu gpu=%zu\n", cpu.size(), gpu_chunked.size());
+        return 5;
+    }
+
+    std::printf("lsh_cuda_smoketest ok: results=%zu tile_slots=%llu\n",
+                cpu.size(), (unsigned long long)total_slots);
     return 0;
 }

@@ -1556,7 +1556,11 @@ int Pool_epi8_t<nb>::bgj2_Sieve(long log_level, long lps_auto_adj){
             const uint64_t cuda_batch_min_dots = bgj2_epi8_cuda_batch_min_dots();
             const int cuda_bgj2_search = bgj_epi8_env_flag("BGJ_CUDA_BGJ2_SEARCH", 1);
             const int cuda_bgj2_search0 = cuda_bgj2_search ? bgj_epi8_env_flag("BGJ_CUDA_BGJ2_SEARCH0", 1) : 0;
-            const int cuda_bgj2_search1 = cuda_bgj2_search ? bgj_epi8_env_flag("BGJ_CUDA_BGJ2_SEARCH1", 1) : 0;
+            // The second-level BGJ2 CUDA path can perturb the solution insertion
+            // order enough to degrade SVP-120 quality, while saving little time.
+            // Keep it available for explicit speed experiments but do not use it
+            // by default.
+            const int cuda_bgj2_search1 = cuda_bgj2_search ? bgj_epi8_env_flag("BGJ_CUDA_BGJ2_SEARCH1", 0) : 0;
             #endif
 
             ///////////////// search0 /////////////////

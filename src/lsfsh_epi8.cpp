@@ -42,11 +42,95 @@ static inline double lsh_wall_time()
     return tv.tv_sec + (double) tv.tv_usec / 1000000.0;
 }
 
+static pthread_mutex_t lsh_best_solution_lock = PTHREAD_MUTEX_INITIALIZER;
+
+struct lsh_best_solution_record_t {
+    double length;
+    std::vector<double> vec;
+};
+
+static std::vector<lsh_best_solution_record_t> lsh_best_solution_records;
+
+void bgj_lsh_best_solution_reset()
+{
+    pthread_mutex_lock(&lsh_best_solution_lock);
+    lsh_best_solution_records.clear();
+    pthread_mutex_unlock(&lsh_best_solution_lock);
+}
+
+int bgj_lsh_best_solution_get(double *length, double *vec, long capacity, long *dimension)
+{
+    pthread_mutex_lock(&lsh_best_solution_lock);
+    const lsh_best_solution_record_t *best = NULL;
+    for (size_t i = 0; i < lsh_best_solution_records.size(); ++i) {
+        const lsh_best_solution_record_t &record = lsh_best_solution_records[i];
+        if ((long)record.vec.size() != capacity) continue;
+        if (best == NULL || record.length < best->length) best = &record;
+    }
+    if (best == NULL) {
+        for (size_t i = 0; i < lsh_best_solution_records.size(); ++i) {
+            const lsh_best_solution_record_t &record = lsh_best_solution_records[i];
+            if ((long)record.vec.size() > capacity) continue;
+            if (best == NULL || record.length < best->length) best = &record;
+        }
+    }
+    const int valid = best != NULL;
+    if (valid) {
+        if (length) *length = best->length;
+        if (dimension) *dimension = (long)best->vec.size();
+        if (vec) {
+            for (long i = 0; i < (long)best->vec.size(); ++i) {
+                vec[i] = best->vec[i];
+            }
+        }
+    }
+    pthread_mutex_unlock(&lsh_best_solution_lock);
+    return valid;
+}
+
+static int lsh_record_best_solution(double length, const double *vec, long dimension)
+{
+    if (length <= 0.0 || vec == NULL || dimension <= 0) return 0;
+    int updated = 0;
+    pthread_mutex_lock(&lsh_best_solution_lock);
+    lsh_best_solution_record_t *record = NULL;
+    for (size_t i = 0; i < lsh_best_solution_records.size(); ++i) {
+        if ((long)lsh_best_solution_records[i].vec.size() == dimension) {
+            record = &lsh_best_solution_records[i];
+            break;
+        }
+    }
+    if (record == NULL) {
+        lsh_best_solution_record_t new_record;
+        new_record.length = length;
+        new_record.vec.assign(vec, vec + dimension);
+        lsh_best_solution_records.push_back(new_record);
+        updated = 1;
+    } else if (length < record->length) {
+        record->length = length;
+        record->vec.assign(vec, vec + dimension);
+        updated = 1;
+    }
+    pthread_mutex_unlock(&lsh_best_solution_lock);
+    return updated;
+}
+
 static inline int lsh_env_profile_enabled()
 {
     const char *env = getenv("BGJ_LSH_PROFILE");
     if (env == NULL) env = getenv("BGJ_PUMP_PROFILE");
     return env != NULL && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
+}
+
+static inline int lsh_env_trace_mblock_enabled()
+{
+    const char *env = getenv("BGJ_LSH_TRACE_MBLOCK");
+    return env != NULL && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
+}
+
+static inline uint64_t lsh_pair_count(long mbound)
+{
+    return ((uint64_t)mbound * (uint64_t)(mbound + 1)) / 2;
 }
 
 #if defined(HAVE_CUDA)
@@ -65,6 +149,48 @@ static inline uint32_t lsh_cuda_max_results()
         if (value > 0 && value <= 0xffffffffUL) return (uint32_t)value;
     }
     return 8u << 20;
+}
+
+static inline int lsh_cuda_chunked_enabled()
+{
+    const char *env = getenv("BGJ_CUDA_LSH_CHUNKED");
+    return env == NULL || env[0] == '\0' || !(env[0] == '0' && env[1] == '\0');
+}
+
+static inline uint64_t lsh_cuda_chunk_tiles()
+{
+    const char *env = getenv("BGJ_CUDA_LSH_CHUNK_TILES");
+    if (env != NULL && env[0] != '\0') {
+        unsigned long long value = strtoull(env, NULL, 10);
+        if (value > 0) return (uint64_t)value;
+    }
+    return 65536u;
+}
+
+static inline int lsh_append_cuda_results(uint32_t **ptr_buffer,
+                                          long *ptr_buffer_size,
+                                          long *ptr_buffer_num,
+                                          const bgj_cuda_result_t *cuda_results,
+                                          uint32_t result_count)
+{
+    uint32_t *_ptr_buffer = *ptr_buffer;
+    long _ptr_buffer_size = *ptr_buffer_size;
+    long _ptr_buffer_num = *ptr_buffer_num;
+    if (_ptr_buffer_num + result_count > _ptr_buffer_size) {
+        _ptr_buffer_size = _ptr_buffer_num + result_count + 64;
+        uint32_t *new_ptr_buffer = (uint32_t *) realloc(_ptr_buffer, 3 * _ptr_buffer_size * sizeof(uint32_t));
+        if (new_ptr_buffer == NULL) return 0;
+        _ptr_buffer = new_ptr_buffer;
+    }
+    for (uint32_t i = 0; i < result_count; i++) {
+        _ptr_buffer[(_ptr_buffer_num + i) * 3] = (cuda_results[i].type == BGJ_CUDA_SOL_A) ? 0u : 1u;
+        _ptr_buffer[(_ptr_buffer_num + i) * 3 + 1] = cuda_results[i].x;
+        _ptr_buffer[(_ptr_buffer_num + i) * 3 + 2] = cuda_results[i].y;
+    }
+    *ptr_buffer = _ptr_buffer;
+    *ptr_buffer_size = _ptr_buffer_size;
+    *ptr_buffer_num = _ptr_buffer_num + result_count;
+    return 1;
 }
 #endif
 
@@ -198,6 +324,12 @@ struct lsh_profile_data_t {
     uint64_t bucketing_ops, dp_ops, lift_ops, init_ops;
     double bucketing_time, dp_time, lift_time, init_time;
     uint64_t num_mblock, total_mblock;
+    uint64_t cuda_attempts, cuda_successes, cuda_overflows, cuda_errors, cuda_skips;
+    uint64_t cuda_chunk_calls, cuda_chunk_successes, cuda_chunk_overflows;
+    uint64_t cuda_pairs, cpu_pairs, cpu_mblocks;
+    uint64_t lift_flushes, max_buffer_entries;
+    uint64_t worst_mbound, worst_candidates;
+    double cuda_time, inline_lift_time, worst_search_time, worst_lift_time;
     pthread_spinlock_t profile_lock;
 
     void init(long _log_level) {
@@ -211,11 +343,46 @@ struct lsh_profile_data_t {
         dp_time = 0.0;
         lift_time = 0.0;
         init_time = 0.0;
+        cuda_attempts = 0;
+        cuda_successes = 0;
+        cuda_overflows = 0;
+        cuda_errors = 0;
+        cuda_skips = 0;
+        cuda_chunk_calls = 0;
+        cuda_chunk_successes = 0;
+        cuda_chunk_overflows = 0;
+        cuda_pairs = 0;
+        cpu_pairs = 0;
+        cpu_mblocks = 0;
+        lift_flushes = 0;
+        max_buffer_entries = 0;
+        worst_mbound = 0;
+        worst_candidates = 0;
+        cuda_time = 0.0;
+        inline_lift_time = 0.0;
+        worst_search_time = 0.0;
+        worst_lift_time = 0.0;
         pthread_spin_init(&profile_lock, PTHREAD_PROCESS_SHARED);
+    }
+    void observe_buffer(uint64_t entries) {
+        pthread_spin_lock(&profile_lock);
+        if (entries > max_buffer_entries) max_buffer_entries = entries;
+        pthread_spin_unlock(&profile_lock);
+    }
+    void observe_mblock(long mbound, double search_time, double lift_time, uint64_t candidates) {
+        pthread_spin_lock(&profile_lock);
+        if (search_time + lift_time > worst_search_time + worst_lift_time) {
+            worst_mbound = (uint64_t)mbound;
+            worst_candidates = candidates;
+            worst_search_time = search_time;
+            worst_lift_time = lift_time;
+        }
+        if (candidates > max_buffer_entries) max_buffer_entries = candidates;
+        pthread_spin_unlock(&profile_lock);
     }
     void init_log(float *min_norm, long ID) {
         if (log_level >= 1) {
-            fprintf(stdout, "init: pool lifting done, time = %fs(%.2f M), speed = %f Mops, total_num_buckets = %lu\n", 
+            fprintf(stdout, "init: pool lifting done, time = %fs(%.2f M), speed = %f Mops, total_num_buckets = %lu\n",
                         init_time, init_ops/1048576.0, init_ops / init_time / 1048576.0, total_mblock);
             if (log_level >= 2) {
                 fprintf(stdout, "min_norm = [");
@@ -888,8 +1055,23 @@ int Pool_epi8_t<nb>::__mblock_sh_search(lsh_mblock_t mb, int32_t threshold, uint
     uint32_t *_ptr_buffer = *ptr_buffer;
     long _ptr_buffer_num = *ptr_buffer_num;
     long _ptr_buffer_size = *ptr_buffer_size;
+    const uint64_t mb_pairs = lsh_pair_count(mb.Mbound);
+    const int profile_enabled = lsh_env_profile_enabled();
+    const int trace_enabled = lsh_env_trace_mblock_enabled();
+    const int detailed_profile = profile_enabled || trace_enabled;
 #if defined(HAVE_CUDA)
-    if (shsize == 64 && lsh_cuda_search_enabled() && mb.Mbound >= 4096) {
+    const int cuda_enabled = lsh_cuda_search_enabled();
+    if (shsize != 64 || !cuda_enabled || mb.Mbound < 4096) {
+        pthread_spin_lock(&profile_data->profile_lock);
+        profile_data->cuda_skips++;
+        pthread_spin_unlock(&profile_data->profile_lock);
+        if (trace_enabled) {
+            const char *reason = (shsize != 64) ? "shsize" : (!cuda_enabled ? "disabled" : "small_mbound");
+            fprintf(stderr, "lsh_cuda_skip: reason=%s mbound=%ld shsize=%u threshold=%d\n",
+                    reason, mb.Mbound, shsize, threshold);
+        }
+    }
+    if (shsize == 64 && cuda_enabled && mb.Mbound >= 4096) {
         const uint32_t result_capacity = lsh_cuda_max_results();
         static thread_local std::vector<bgj_cuda_result_t> cuda_results;
         try {
@@ -900,7 +1082,7 @@ int Pool_epi8_t<nb>::__mblock_sh_search(lsh_mblock_t mb, int32_t threshold, uint
         if (!cuda_results.empty()) {
             uint32_t result_count = 0;
             int overflow = 0;
-            double cuda_start = lsh_env_profile_enabled() ? lsh_wall_time() : 0.0;
+            double cuda_start = detailed_profile ? lsh_wall_time() : 0.0;
             int cuda_ok = bgj_cuda_lsh_search_raw(mb.sh,
                                                   (uint32_t)mb.Mbound,
                                                   shsize,
@@ -909,39 +1091,166 @@ int Pool_epi8_t<nb>::__mblock_sh_search(lsh_mblock_t mb, int32_t threshold, uint
                                                   result_capacity,
                                                   &result_count,
                                                   &overflow);
+            const double cuda_elapsed = detailed_profile ? lsh_wall_time() - cuda_start : 0.0;
+            pthread_spin_lock(&profile_data->profile_lock);
+            profile_data->cuda_attempts++;
+            profile_data->cuda_time += cuda_elapsed;
             if (cuda_ok && !overflow) {
-                if (_ptr_buffer_num + result_count > _ptr_buffer_size) {
-                    _ptr_buffer_size = _ptr_buffer_num + result_count + 64;
-                    uint32_t *new_ptr_buffer = (uint32_t *) realloc(_ptr_buffer, 3 * _ptr_buffer_size * sizeof(uint32_t));
-                    if (new_ptr_buffer == NULL) return 0;
-                    _ptr_buffer = new_ptr_buffer;
-                }
-                for (uint32_t i = 0; i < result_count; i++) {
-                    _ptr_buffer[(_ptr_buffer_num + i) * 3] = (cuda_results[i].type == BGJ_CUDA_SOL_A) ? 0u : 1u;
-                    _ptr_buffer[(_ptr_buffer_num + i) * 3 + 1] = cuda_results[i].x;
-                    _ptr_buffer[(_ptr_buffer_num + i) * 3 + 2] = cuda_results[i].y;
-                }
-                _ptr_buffer_num += result_count;
+                profile_data->cuda_successes++;
+                profile_data->cuda_pairs += mb_pairs;
+            } else if (cuda_ok && overflow) {
+                profile_data->cuda_overflows++;
+            } else {
+                profile_data->cuda_errors++;
+            }
+            pthread_spin_unlock(&profile_data->profile_lock);
+            if (cuda_ok && !overflow) {
+                if (!lsh_append_cuda_results(&_ptr_buffer, &_ptr_buffer_size, &_ptr_buffer_num,
+                                             cuda_results.data(), result_count)) return 0;
+                profile_data->observe_buffer(_ptr_buffer_num);
                 pthread_spin_lock(&profile_data->profile_lock);
-                profile_data->dp_ops += mb.Mbound * (mb.Mbound + 1) / 2;
+                profile_data->dp_ops += mb_pairs;
                 profile_data->num_mblock++;
                 pthread_spin_unlock(&profile_data->profile_lock);
                 *ptr_buffer = _ptr_buffer;
                 *ptr_buffer_size = _ptr_buffer_size;
                 *ptr_buffer_num = _ptr_buffer_num;
-                if (lsh_env_profile_enabled()) {
+                if (detailed_profile) {
                     fprintf(stderr,
                             "lsh_cuda_search: mbound=%ld threshold=%d results=%u elapsed=%.6fs\n",
-                            mb.Mbound, threshold, result_count, lsh_wall_time() - cuda_start);
+                            mb.Mbound, threshold, result_count, cuda_elapsed);
                 }
                 return 1;
             }
-            if (lsh_env_profile_enabled()) {
+            if (detailed_profile) {
                 fprintf(stderr,
                         "lsh_cuda_search_fallback: mbound=%ld threshold=%d ok=%d overflow=%d results=%u error=%s\n",
                         mb.Mbound, threshold, cuda_ok, overflow, result_count, bgj_cuda_last_error());
             }
+            if (cuda_ok && overflow && lsh_cuda_chunked_enabled()) {
+                const uint64_t total_tile_slots = bgj_cuda_lsh_total_tile_slots((uint32_t)mb.Mbound);
+                const uint64_t default_chunk_slots = lsh_cuda_chunk_tiles();
+                uint64_t chunk_slots = default_chunk_slots < total_tile_slots ? default_chunk_slots : total_tile_slots;
+                uint64_t tile_begin = 0;
+                uint64_t chunk_results_total = 0;
+                int chunk_failed = 0;
+                while (tile_begin < total_tile_slots) {
+                    uint64_t tile_count = chunk_slots;
+                    if (tile_count > total_tile_slots - tile_begin) tile_count = total_tile_slots - tile_begin;
+                    uint32_t chunk_result_count = 0;
+                    int chunk_overflow = 0;
+                    double chunk_start = detailed_profile ? lsh_wall_time() : 0.0;
+                    int chunk_ok = bgj_cuda_lsh_search_range_raw(mb.sh,
+                                                                 (uint32_t)mb.Mbound,
+                                                                 shsize,
+                                                                 threshold,
+                                                                 tile_begin,
+                                                                 tile_count,
+                                                                 cuda_results.data(),
+                                                                 result_capacity,
+                                                                 &chunk_result_count,
+                                                                 &chunk_overflow);
+                    const double chunk_elapsed = detailed_profile ? lsh_wall_time() - chunk_start : 0.0;
+                    pthread_spin_lock(&profile_data->profile_lock);
+                    profile_data->cuda_chunk_calls++;
+                    profile_data->cuda_time += chunk_elapsed;
+                    if (chunk_ok && !chunk_overflow) {
+                        profile_data->cuda_chunk_successes++;
+                    } else if (chunk_ok && chunk_overflow) {
+                        profile_data->cuda_chunk_overflows++;
+                    } else {
+                        profile_data->cuda_errors++;
+                    }
+                    pthread_spin_unlock(&profile_data->profile_lock);
+                    if (!chunk_ok) {
+                        chunk_failed = 1;
+                        if (detailed_profile) {
+                            fprintf(stderr,
+                                    "lsh_cuda_chunk_error: mbound=%ld begin=%llu count=%llu error=%s\n",
+                                    mb.Mbound, (unsigned long long)tile_begin,
+                                    (unsigned long long)tile_count, bgj_cuda_last_error());
+                        }
+                        break;
+                    }
+                    if (chunk_overflow) {
+                        if (tile_count > 1) {
+                            chunk_slots = tile_count / 2;
+                            if (chunk_slots == 0) chunk_slots = 1;
+                            if (detailed_profile) {
+                                fprintf(stderr,
+                                        "lsh_cuda_chunk_reduce: mbound=%ld begin=%llu count=%llu next_count=%llu results=%u\n",
+                                        mb.Mbound, (unsigned long long)tile_begin,
+                                        (unsigned long long)tile_count,
+                                        (unsigned long long)chunk_slots, chunk_result_count);
+                            }
+                            continue;
+                        }
+                        chunk_failed = 1;
+                        if (detailed_profile) {
+                            fprintf(stderr,
+                                    "lsh_cuda_chunk_fallback: mbound=%ld begin=%llu count=%llu results=%u\n",
+                                    mb.Mbound, (unsigned long long)tile_begin,
+                                    (unsigned long long)tile_count, chunk_result_count);
+                        }
+                        break;
+                    }
+                    if (!lsh_append_cuda_results(&_ptr_buffer, &_ptr_buffer_size, &_ptr_buffer_num,
+                                                 cuda_results.data(), chunk_result_count)) return 0;
+                    chunk_results_total += chunk_result_count;
+                    profile_data->observe_buffer(_ptr_buffer_num);
+                    if (_ptr_buffer_num > 1048576) {
+                        const uint64_t flushed = _ptr_buffer_num;
+                        const double lift_start = detailed_profile ? lsh_wall_time() : 0.0;
+                        __lift_buffer(mb, target_index, dh_dim, b_full_fp,
+                                      &_ptr_buffer, (uint64_t *)(&_ptr_buffer_size), (uint64_t *)(&_ptr_buffer_num),
+                                      min_norm, min_vec, min_lock, profile_data);
+                        const double lift_elapsed = detailed_profile ? lsh_wall_time() - lift_start : 0.0;
+                        pthread_spin_lock(&profile_data->profile_lock);
+                        profile_data->lift_flushes++;
+                        profile_data->inline_lift_time += lift_elapsed;
+                        if (flushed > profile_data->max_buffer_entries) profile_data->max_buffer_entries = flushed;
+                        pthread_spin_unlock(&profile_data->profile_lock);
+                    }
+                    tile_begin += tile_count;
+                }
+                if (!chunk_failed) {
+                    pthread_spin_lock(&profile_data->profile_lock);
+                    profile_data->cuda_successes++;
+                    profile_data->cuda_pairs += mb_pairs;
+                    profile_data->dp_ops += mb_pairs;
+                    profile_data->num_mblock++;
+                    pthread_spin_unlock(&profile_data->profile_lock);
+                    *ptr_buffer = _ptr_buffer;
+                    *ptr_buffer_size = _ptr_buffer_size;
+                    *ptr_buffer_num = _ptr_buffer_num;
+                    if (detailed_profile) {
+                        fprintf(stderr,
+                                "lsh_cuda_chunked_search: mbound=%ld threshold=%d total_slots=%llu chunk_slots=%llu results=%llu\n",
+                                mb.Mbound, threshold, (unsigned long long)total_tile_slots,
+                                (unsigned long long)default_chunk_slots,
+                                (unsigned long long)chunk_results_total);
+                    }
+                    return 1;
+                }
+            }
+        } else {
+            pthread_spin_lock(&profile_data->profile_lock);
+            profile_data->cuda_errors++;
+            pthread_spin_unlock(&profile_data->profile_lock);
+            if (detailed_profile) {
+                fprintf(stderr,
+                        "lsh_cuda_search_fallback: mbound=%ld threshold=%d ok=0 overflow=0 results=0 error=result_allocation_failed\n",
+                        mb.Mbound, threshold);
+            }
         }
+    }
+#else
+    pthread_spin_lock(&profile_data->profile_lock);
+    profile_data->cuda_skips++;
+    pthread_spin_unlock(&profile_data->profile_lock);
+    if (trace_enabled) {
+        fprintf(stderr, "lsh_cuda_skip: reason=no_cuda_build mbound=%ld shsize=%u threshold=%d\n",
+                mb.Mbound, shsize, threshold);
     }
 #endif
     for (long Ind = 0; Ind < mb.Mbound; Ind += l2_block) {
@@ -1012,14 +1321,25 @@ int Pool_epi8_t<nb>::__mblock_sh_search(lsh_mblock_t mb, int32_t threshold, uint
                 }
             }
             if (_ptr_buffer_num > 1048576) {
-                __lift_buffer(mb, target_index, dh_dim, b_full_fp, 
-                        &_ptr_buffer, (uint64_t *)(&_ptr_buffer_size), (uint64_t *)&_ptr_buffer_num, 
+                const uint64_t flushed = _ptr_buffer_num;
+                const double lift_start = detailed_profile ? lsh_wall_time() : 0.0;
+                __lift_buffer(mb, target_index, dh_dim, b_full_fp,
+                        &_ptr_buffer, (uint64_t *)(&_ptr_buffer_size), (uint64_t *)&_ptr_buffer_num,
                         min_norm, min_vec, min_lock, profile_data);
+                const double lift_elapsed = detailed_profile ? lsh_wall_time() - lift_start : 0.0;
+                pthread_spin_lock(&profile_data->profile_lock);
+                profile_data->lift_flushes++;
+                profile_data->inline_lift_time += lift_elapsed;
+                if (flushed > profile_data->max_buffer_entries) profile_data->max_buffer_entries = flushed;
+                pthread_spin_unlock(&profile_data->profile_lock);
             }
         }
     }
+    profile_data->observe_buffer(_ptr_buffer_num);
     pthread_spin_lock(&profile_data->profile_lock);
-    profile_data->dp_ops += mb.Mbound * (mb.Mbound + 1) / 2;
+    profile_data->dp_ops += mb_pairs;
+    profile_data->cpu_pairs += mb_pairs;
+    profile_data->cpu_mblocks++;
     profile_data->num_mblock++;
     pthread_spin_unlock(&profile_data->profile_lock);
     *ptr_buffer = _ptr_buffer;
@@ -1209,8 +1529,9 @@ int Pool_epi8_t<nb>::_lsfsh_insert(long target_index, double eta, long log_level
     lsh_mblock_t mb[LSH_MBLOCK_BATCH];
     const long LSH_RBATCH = ((LSH_MBLOCK_BATCH / num_threads) * num_threads) > 0 ? ((LSH_MBLOCK_BATCH / num_threads) * num_threads) : LSH_MBLOCK_BATCH;
     const int env_profile = lsh_env_profile_enabled();
+    const int env_trace = lsh_env_trace_mblock_enabled();
     long profile_batch_id = 0;
-    if (env_profile) {
+    if (env_profile || env_trace) {
         fprintf(stderr,
                 "lsh_insert_begin: nb=%u target=%ld fd=%ld id=%ld csd=%ld nvec=%ld threads=%ld rbatch=%ld total_buckets=%ld exp_bucket=%.2f max_bucket=%ld hbits=%d threshold=%d target_ratio=%.6f target_length=%.6f qratio=%.6f\n",
                 nb, target_index, FD, ID, CSD, num_vec, num_threads, LSH_RBATCH, mblock_provider.num_total_buckets,
@@ -1251,18 +1572,41 @@ int Pool_epi8_t<nb>::_lsfsh_insert(long target_index, double eta, long log_level
             double _lift_time = 0.0;
             double _search_time = 0.0;
             for (long ind = begin_ind; ind < end_ind; ind++) {
+                const uint64_t buffer_before = ptr_buffer_num[thread];
                 TIMER_START;
                 __mblock_sh_search<shsize, LSH_L1_BLOCK, LSH_L2_BLOCK>(
                     mb[ind], threshold, ptr_buffer+thread, ptr_buffer_size+thread, ptr_buffer_num+thread, &profile_data,
                     target_index, dh_dim, b_full_fp, min_norm, min_vec, min_lock);
                 TIMER_END;
-                _search_time += CURRENT_TIME;
+                const double search_elapsed = CURRENT_TIME;
+                const uint64_t buffer_after_search = ptr_buffer_num[thread];
+                _search_time += search_elapsed;
                 TIMER_START;
-                __lift_buffer(mb[ind], target_index, dh_dim, b_full_fp, 
-                        ptr_buffer+thread, ptr_buffer_size+thread, ptr_buffer_num+thread, 
+                __lift_buffer(mb[ind], target_index, dh_dim, b_full_fp,
+                        ptr_buffer+thread, ptr_buffer_size+thread, ptr_buffer_num+thread,
                         min_norm, min_vec, min_lock, &profile_data);
                 TIMER_END;
-                _lift_time += CURRENT_TIME;
+                const double lift_elapsed = CURRENT_TIME;
+                const uint64_t buffer_after_lift = ptr_buffer_num[thread];
+                _lift_time += lift_elapsed;
+                profile_data.observe_mblock(mb[ind].Mbound, search_elapsed, lift_elapsed, buffer_after_search);
+                if (env_trace) {
+                    double min0_snapshot = 0.0;
+                    pthread_spin_lock(&min_lock);
+                    min0_snapshot = sqrt(min_norm[0]);
+                    pthread_spin_unlock(&min_lock);
+                    pthread_spin_lock(&profile_data.profile_lock);
+                    fprintf(stderr,
+                            "lsh_mblock_trace: batch=%ld thread=%ld index=%ld mbound=%ld pairs=%llu search=%.6fs lift=%.6fs buffer_before=%llu buffer_after_search=%llu buffer_after_lift=%llu min0=%.6f\n",
+                            profile_batch_id + 1, thread, ind, mb[ind].Mbound,
+                            (unsigned long long)lsh_pair_count(mb[ind].Mbound),
+                            search_elapsed, lift_elapsed,
+                            (unsigned long long)buffer_before,
+                            (unsigned long long)buffer_after_search,
+                            (unsigned long long)buffer_after_lift,
+                            min0_snapshot);
+                    pthread_spin_unlock(&profile_data.profile_lock);
+                }
             }
             pthread_spin_lock(&min_lock);
             if (_lift_time > lift_time) lift_time = _lift_time;
@@ -1272,24 +1616,46 @@ int Pool_epi8_t<nb>::_lsfsh_insert(long target_index, double eta, long log_level
         profile_data.lift_time += lift_time;
         profile_data.dp_time += search_time;
         profile_data.mblock_log(min_norm, ID);
+        ++profile_batch_id;
         if (env_profile) {
             const double profile_batch_time = lsh_wall_time() - profile_batch_start;
             fprintf(stderr,
-                    "lsh_insert_batch: batch=%ld num_mb=%ld wild=%d pop=%.6fs search=%.6fs lift=%.6fs post=%.6fs total=%.6fs mblock=%lu/%lu cum_bucket=%.6fs cum_search=%.6fs cum_lift=%.6fs min0=%.6f\n",
-                    ++profile_batch_id, num_mb, wild_mb, profile_pop_time, search_time, lift_time,
+                    "lsh_insert_batch: batch=%ld num_mb=%ld wild=%d pop=%.6fs search=%.6fs lift=%.6fs post=%.6fs total=%.6fs mblock=%lu/%lu cum_bucket=%.6fs cum_search=%.6fs cum_lift=%.6fs inline_lift=%.6fs min0=%.6f\n",
+                    profile_batch_id, num_mb, wild_mb, profile_pop_time, search_time, lift_time,
                     profile_batch_time - search_time - lift_time, profile_pop_time + profile_batch_time,
                     profile_data.num_mblock, profile_data.total_mblock, profile_data.bucketing_time,
-                    profile_data.dp_time, profile_data.lift_time, sqrt(min_norm[0]));
+                    profile_data.dp_time, profile_data.lift_time, profile_data.inline_lift_time, sqrt(min_norm[0]));
         }
         profile_pop_start = env_profile ? lsh_wall_time() : 0.0;
     }
 
     profile_data.final_log(min_norm, ID);
-    if (env_profile) {
+    if (env_profile || env_trace) {
         fprintf(stderr,
                 "lsh_insert_done: batches=%ld target=%ld mblock=%lu/%lu bucket=%.6fs search=%.6fs lift=%.6fs init=%.6fs\n",
                 profile_batch_id, target_index, profile_data.num_mblock, profile_data.total_mblock,
                 profile_data.bucketing_time, profile_data.dp_time, profile_data.lift_time, profile_data.init_time);
+        fprintf(stderr,
+                "lsh_insert_cuda_profile: cuda_attempts=%llu cuda_successes=%llu cuda_overflows=%llu cuda_errors=%llu cuda_skips=%llu chunk_calls=%llu chunk_successes=%llu chunk_overflows=%llu cuda_pairs=%llu cpu_mblocks=%llu cpu_pairs=%llu cuda_time=%.6fs inline_lift=%.6fs lift_flushes=%llu max_buffer=%llu worst_mbound=%llu worst_candidates=%llu worst_search=%.6fs worst_lift=%.6fs\n",
+                (unsigned long long)profile_data.cuda_attempts,
+                (unsigned long long)profile_data.cuda_successes,
+                (unsigned long long)profile_data.cuda_overflows,
+                (unsigned long long)profile_data.cuda_errors,
+                (unsigned long long)profile_data.cuda_skips,
+                (unsigned long long)profile_data.cuda_chunk_calls,
+                (unsigned long long)profile_data.cuda_chunk_successes,
+                (unsigned long long)profile_data.cuda_chunk_overflows,
+                (unsigned long long)profile_data.cuda_pairs,
+                (unsigned long long)profile_data.cpu_mblocks,
+                (unsigned long long)profile_data.cpu_pairs,
+                profile_data.cuda_time,
+                profile_data.inline_lift_time,
+                (unsigned long long)profile_data.lift_flushes,
+                (unsigned long long)profile_data.max_buffer_entries,
+                (unsigned long long)profile_data.worst_mbound,
+                (unsigned long long)profile_data.worst_candidates,
+                profile_data.worst_search_time,
+                profile_data.worst_lift_time);
     }
     mblock_provider.clear();
     for (long i = 0; i < num_threads; i++) free(ptr_buffer[i]);
@@ -1324,7 +1690,20 @@ int Pool_epi8_t<nb>::_lsfsh_insert(long target_index, double eta, long log_level
     copy_avx2(v_fp, min_vec[min_place - target_index], FD);
     FREE_MAT(min_vec);
     int ret = __basis_insert(min_place, v_fp, FD, b_full_fp);
-    FREE_MAT(b_full_fp); 
+    if (ret > 0 && min_place >= 0 && min_place < basis->NumRows()) {
+        const double exact_length = sqrt(dot_avx2(basis->get_b().hi[min_place],
+                                                  basis->get_b().hi[min_place],
+                                                  basis->NumCols()));
+        const int updated = lsh_record_best_solution(exact_length,
+                                                     basis->get_b().hi[min_place],
+                                                     basis->NumCols());
+        if (updated && lsh_env_profile_enabled()) {
+            fprintf(stderr,
+                    "lsh_best_solution: source=insert dim=%ld target=%ld row=%ld length=%.9g\n",
+                    basis->NumCols(), target_index, min_place, exact_length);
+        }
+    }
+    FREE_MAT(b_full_fp);
 
     return 0;
 }
@@ -1472,11 +1851,17 @@ int Pool_epi8_t<nb>::lsfsh_insert(long target_index, double eta, long log_level,
 
 template <uint32_t nb>
 template <uint32_t shsize, uint32_t dh_dim>
-int Pool_epi8_t<nb>::_show_lsfsh_insert(long target_index, double eta, long log_level, 
+int Pool_epi8_t<nb>::_show_lsfsh_insert(long target_index, double eta, long log_level,
                             float *dual_vec, uint32_t *compress_pos, int32_t num_hbits, int32_t threshold, double target_ratio, double target_length, double qratio) {
+    last_lift_valid = 0;
+    last_lift_euclidean_norm = 0.0;
+    last_lift_lift_norm = 0.0;
+    last_lift_gh = 0.0;
+    last_lift_approx_factor = 0.0;
+
     /////// check params ///////
     if (target_index + dh_dim > index_l) {
-        fprintf(stderr, "[Warning] Pool_epi8_t<%u>::lsfsh_insert: target_index(%ld) + dh_dim(%u) > index_l(%ld), nothing done.\n", 
+        fprintf(stderr, "[Warning] Pool_epi8_t<%u>::lsfsh_insert: target_index(%ld) + dh_dim(%u) > index_l(%ld), nothing done.\n",
                 nb, target_index, dh_dim, index_l);
         return -1;
     }
@@ -1601,6 +1986,7 @@ int Pool_epi8_t<nb>::_show_lsfsh_insert(long target_index, double eta, long log_
     }
 
     __attribute__ ((aligned (32))) float v_fp[256];
+    const double lift_norm = sqrt(min_norm[min_place - target_index]);
     copy_avx2(v_fp, min_vec[min_place - target_index], FD);
     FREE_MAT(min_vec);
     do {
@@ -1620,11 +2006,23 @@ int Pool_epi8_t<nb>::_show_lsfsh_insert(long target_index, double eta, long log_
             }
         } while (0);
 
+        const double euclidean_norm = sqrt(dot_avx2(v_QP.hi, v_QP.hi, basis->NumCols()));
+        const double gh = basis->gh(target_index, index_r);
+        const double approx = (gh > 0.0) ? euclidean_norm / gh : 0.0;
+        last_lift_valid = 1;
+        last_lift_euclidean_norm = euclidean_norm;
+        last_lift_lift_norm = lift_norm;
+        last_lift_gh = gh;
+        last_lift_approx_factor = approx;
+        if (target_index == 0 && min_place == 0) {
+            lsh_record_best_solution(euclidean_norm, v_QP.hi, basis->NumCols());
+        }
         if (target_index != 0 || (target_index == 0 && min_place == 0)) {
-            fprintf(stderr, "\nlength = %f, vec = ", sqrt(dot_avx2(v_QP.hi, v_QP.hi, basis->NumCols())));
-            do { 
-                std::cerr << "["; 
-                for (long __i = 0; __i < basis->NumCols()-1; __i++) { 
+            fprintf(stderr, "\nlength = %.9g(%.9g), gh = %.9g, approx = %.9g, vec = ",
+                    euclidean_norm, lift_norm, gh, approx);
+            do {
+                std::cerr << "[";
+                for (long __i = 0; __i < basis->NumCols()-1; __i++) {
                     std::cerr << v_QP.hi[__i] << " "; 
                 } 
                 if (basis->NumCols() > 0) { 
