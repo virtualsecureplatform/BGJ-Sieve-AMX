@@ -88,6 +88,8 @@ struct bgj_cuda_raw_scratch_t {
     uint32_t *det_counts;
     uint32_t *det_offsets;
     int *overflow;
+    uint32_t *host_result_count;
+    int *host_overflow;
     cudaStream_t stream;
     cudaEvent_t dot_copy_done;
     cudaEvent_t profile_start[BGJ_CUDA_SEARCH_PHASE_COUNT];
@@ -113,6 +115,8 @@ struct bgj_cuda_raw_scratch_t {
     size_t det_count_capacity;
     size_t det_offset_capacity;
     size_t overflow_capacity;
+    size_t host_result_count_capacity;
+    size_t host_overflow_capacity;
     int stream_ready;
     int dot_event_ready;
     int profile_events_ready;
@@ -136,6 +140,8 @@ struct bgj_cuda_raw_scratch_t {
           det_counts(NULL),
           det_offsets(NULL),
           overflow(NULL),
+          host_result_count(NULL),
+          host_overflow(NULL),
           stream(NULL),
           dot_copy_done(NULL),
           profile_start(),
@@ -160,6 +166,8 @@ struct bgj_cuda_raw_scratch_t {
           det_count_capacity(0),
           det_offset_capacity(0),
           overflow_capacity(0),
+          host_result_count_capacity(0),
+          host_overflow_capacity(0),
           stream_ready(0),
           dot_event_ready(0),
           profile_events_ready(0),
@@ -188,6 +196,8 @@ struct bgj_cuda_raw_scratch_t {
         cudaFree(det_counts);
         cudaFree(det_offsets);
         cudaFree(overflow);
+        if (host_result_count) cudaFreeHost(host_result_count);
+        if (host_overflow) cudaFreeHost(host_overflow);
         if (dot_event_ready) cudaEventDestroy(dot_copy_done);
         if (profile_events_ready) {
             for (int i = 0; i < BGJ_CUDA_SEARCH_PHASE_COUNT; i++) {
@@ -213,6 +223,8 @@ struct bgj_cuda_raw_scratch_t {
         det_counts = NULL;
         det_offsets = NULL;
         overflow = NULL;
+        host_result_count = NULL;
+        host_overflow = NULL;
         stream = NULL;
         dot_copy_done = NULL;
         for (int i = 0; i < BGJ_CUDA_SEARCH_PHASE_COUNT; i++) {
@@ -238,6 +250,8 @@ struct bgj_cuda_raw_scratch_t {
         det_count_capacity = 0;
         det_offset_capacity = 0;
         overflow_capacity = 0;
+        host_result_count_capacity = 0;
+        host_overflow_capacity = 0;
         stream_ready = 0;
         dot_event_ready = 0;
         profile_events_ready = 0;
@@ -3160,6 +3174,39 @@ static int ensure_cuda_host_capacity(void **ptr, size_t *capacity, size_t reques
     return 1;
 }
 
+static void bgj_cuda_get_submitted_counts(bgj_cuda_raw_scratch_t *scratch,
+                                          uint32_t *submitted_result_count,
+                                          int *submitted_overflow)
+{
+    if (submitted_result_count) {
+        *submitted_result_count = scratch->host_result_count ?
+                                  *scratch->host_result_count : 0;
+    }
+    if (submitted_overflow) {
+        *submitted_overflow = scratch->host_overflow ?
+                              *scratch->host_overflow : 1;
+    }
+}
+
+extern "C" void *bgj_cuda_alloc_pinned_host_raw(size_t bytes)
+{
+    if (bytes == 0) return NULL;
+    void *ptr = NULL;
+    cudaError_t err = cudaHostAlloc(&ptr, bytes, cudaHostAllocDefault);
+    if (err != cudaSuccess) {
+        set_cuda_error("cudaHostAlloc", err);
+        return NULL;
+    }
+    set_plain_error("no CUDA error");
+    return ptr;
+}
+
+extern "C" void bgj_cuda_free_pinned_host_raw(void *ptr)
+{
+    if (!ptr) return;
+    cudaFreeHost(ptr);
+}
+
 static uint64_t bgj_cuda_hash_bytes(const void *data, size_t size)
 {
     const uint8_t *bytes = (const uint8_t *)data;
@@ -5617,6 +5664,18 @@ static int bgj_cuda_search_bucket_raw_submit(bgj_cuda_raw_scratch_t *scratch,
     CUDA_ENSURE(scratch->results, scratch->result_capacity, (size_t)result_capacity * sizeof(bgj_cuda_result_t));
     CUDA_ENSURE(scratch->result_count, scratch->result_count_capacity, sizeof(uint32_t));
     CUDA_ENSURE(scratch->overflow, scratch->overflow_capacity, sizeof(int));
+    if (!ensure_cuda_host_capacity((void **)&scratch->host_result_count,
+                                   &scratch->host_result_count_capacity,
+                                   sizeof(uint32_t)) ||
+        !ensure_cuda_host_capacity((void **)&scratch->host_overflow,
+                                   &scratch->host_overflow_capacity,
+                                   sizeof(int))) {
+        goto fail;
+    }
+    *scratch->host_result_count = 0;
+    *scratch->host_overflow = 0;
+    if (submitted_result_count) *submitted_result_count = 0;
+    if (submitted_overflow) *submitted_overflow = 0;
     CUDA_TRY(cudaMemsetAsync(scratch->result_count, 0, sizeof(uint32_t), stream));
     CUDA_TRY(cudaMemsetAsync(scratch->overflow, 0, sizeof(int), stream));
 
@@ -6422,8 +6481,8 @@ static int bgj_cuda_search_bucket_raw_submit(bgj_cuda_raw_scratch_t *scratch,
     }
 
     if (!bgj_cuda_search_profile_begin(scratch, BGJ_CUDA_SEARCH_PHASE_COUNT_COPY)) goto fail;
-    CUDA_TRY(cudaMemcpyAsync(submitted_result_count, scratch->result_count, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
-    CUDA_TRY(cudaMemcpyAsync(submitted_overflow, scratch->overflow, sizeof(int), cudaMemcpyDeviceToHost, stream));
+    CUDA_TRY(cudaMemcpyAsync(scratch->host_result_count, scratch->result_count, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_TRY(cudaMemcpyAsync(scratch->host_overflow, scratch->overflow, sizeof(int), cudaMemcpyDeviceToHost, stream));
     if (!bgj_cuda_search_profile_end(scratch, BGJ_CUDA_SEARCH_PHASE_COUNT_COPY)) goto fail;
     set_plain_error("no CUDA error");
     return 1;
@@ -6558,6 +6617,7 @@ static int bgj_cuda_search_bucket_raw_impl(const int8_t *p_vecs,
     wait_t0 = bgj_cuda_wall_time();
     CUDA_TRY(cudaStreamSynchronize(stream));
     wait_sec = bgj_cuda_wall_time() - wait_t0;
+    bgj_cuda_get_submitted_counts(scratch, &h_result_count, &h_overflow);
 
     copy_t0 = bgj_cuda_wall_time();
     if (!bgj_cuda_finish_submitted_bucket(scratch,
@@ -6801,9 +6861,9 @@ extern "C" int bgj_cuda_search_bucket_raw_finish_async(bgj_cuda_result_t *result
     const double wait_t0 = bgj_cuda_wall_time();
     CUDA_TRY(cudaStreamSynchronize(stream));
     wait_sec = bgj_cuda_wall_time() - wait_t0;
-
-    h_result_count = submitted_result_count ? *submitted_result_count : 0;
-    h_overflow = submitted_overflow ? *submitted_overflow : 1;
+    bgj_cuda_get_submitted_counts(scratch, &h_result_count, &h_overflow);
+    if (submitted_result_count) *submitted_result_count = h_result_count;
+    if (submitted_overflow) *submitted_overflow = h_overflow;
 
     copy_t0 = bgj_cuda_wall_time();
     if (!bgj_cuda_finish_submitted_bucket(scratch,
@@ -7110,6 +7170,7 @@ extern "C" int bgj_cuda_search_bucket_pool_batch_raw(const int8_t *pool_vecs,
             set_cuda_error("cudaStreamSynchronize batch counts", err);
             goto fail_sync;
         }
+        bgj_cuda_get_submitted_counts(scratch, &result_count[i], &overflow[i]);
     }
     wait_sec = bgj_cuda_wall_time() - wait_t0;
 

@@ -583,6 +583,76 @@ extern "C" int bgj_cuda_search_bucket_pool_batch_raw(const int8_t *pool_vecs,
                                                       const uint32_t *result_capacity,
                                                       uint32_t *result_count,
                                                       int *overflow);
+extern "C" void *bgj_cuda_alloc_pinned_host_raw(size_t bytes);
+extern "C" void bgj_cuda_free_pinned_host_raw(void *ptr);
+
+static int bgj_cuda_pinned_results_requested()
+{
+    static const int requested = []() {
+        const char *env = getenv("BGJ_CUDA_PINNED_RESULTS");
+        if (env && env[0]) return env[0] != '0' ? 1 : 0;
+        return 0;
+    }();
+    return requested;
+}
+
+struct bgj_cuda_result_storage_t {
+    bgj_cuda_result_t *ptr;
+    size_t capacity;
+    int pinned;
+
+    bgj_cuda_result_storage_t()
+        : ptr(NULL),
+          capacity(0),
+          pinned(0)
+    {
+    }
+
+    ~bgj_cuda_result_storage_t()
+    {
+        release();
+    }
+
+    void release()
+    {
+        if (ptr) {
+            if (pinned) {
+                bgj_cuda_free_pinned_host_raw(ptr);
+            } else {
+                free(ptr);
+            }
+        }
+        ptr = NULL;
+        capacity = 0;
+        pinned = 0;
+    }
+
+    int reserve(size_t requested)
+    {
+        if (requested <= capacity) return 1;
+        if (requested > std::numeric_limits<size_t>::max() / sizeof(bgj_cuda_result_t)) {
+            return 0;
+        }
+        release();
+        if (requested == 0) return 1;
+
+        const size_t bytes = requested * sizeof(bgj_cuda_result_t);
+        if (bgj_cuda_pinned_results_requested()) {
+            ptr = (bgj_cuda_result_t *)bgj_cuda_alloc_pinned_host_raw(bytes);
+            if (ptr) pinned = 1;
+        }
+        if (!ptr) {
+            ptr = (bgj_cuda_result_t *)malloc(bytes);
+            pinned = 0;
+        }
+        if (!ptr) {
+            capacity = 0;
+            return 0;
+        }
+        capacity = requested;
+        return 1;
+    }
+};
 
 int bgj_cuda_device_count()
 {
@@ -1250,7 +1320,7 @@ int Pool_epi8_t<nb>::_search_bgj1_cuda(bucket_epi8_t<record_dp> *bkt,
 
     static thread_local std::vector<int8_t> p_vec_storage;
     static thread_local std::vector<int8_t> n_vec_storage;
-    static thread_local std::vector<bgj_cuda_result_t> result_storage;
+    static thread_local bgj_cuda_result_storage_t result_storage;
     const int use_pool_cache = bgj_cuda_pool_cache_requested();
     int8_t *p_vecs = NULL;
     int8_t *n_vecs = NULL;
@@ -1276,12 +1346,8 @@ int Pool_epi8_t<nb>::_search_bgj1_cuda(bucket_epi8_t<record_dp> *bkt,
     }
 
     const uint32_t result_capacity = bgj_cuda_max_results();
-    try {
-        result_storage.resize((size_t)result_capacity);
-    } catch (...) {
-        return 0;
-    }
-    bgj_cuda_result_t *results = result_storage.data();
+    if (!result_storage.reserve((size_t)result_capacity)) return 0;
+    bgj_cuda_result_t *results = result_storage.ptr;
 
     uint32_t result_count = 0;
     int overflow = 0;
@@ -1371,11 +1437,9 @@ int Pool_epi8_t<nb>::_search_bgj1_cuda_overlap(bucket_epi8_t<record_dp> *bkt,
     }
 
     const uint32_t result_capacity = bgj_cuda_max_results();
-    static thread_local std::vector<bgj_cuda_result_t> result_storage;
+    static thread_local bgj_cuda_result_storage_t result_storage;
 
-    try {
-        result_storage.resize((size_t)result_capacity);
-    } catch (...) {
+    if (!result_storage.reserve((size_t)result_capacity)) {
         _search_cred<record_dp, profiling>(bkt, sol, goal_norm, prof);
         return 0;
     }
@@ -1412,7 +1476,7 @@ int Pool_epi8_t<nb>::_search_bgj1_cuda_overlap(bucket_epi8_t<record_dp> *bkt,
 
     uint32_t result_count = 0;
     int overflow = 0;
-    bgj_cuda_result_t *results = result_storage.data();
+    bgj_cuda_result_t *results = result_storage.ptr;
     const int finished = bgj_cuda_search_bucket_raw_finish_async(results,
                                                                  result_capacity,
                                                                  &submitted_result_count,
@@ -1672,7 +1736,7 @@ int Pool_epi8_t<nb>::_search_bgj1_cuda_batch(bucket_epi8_t<record_dp> **buckets,
     static thread_local std::vector<uint32_t> result_capacities;
     static thread_local std::vector<uint32_t> result_counts;
     static thread_local std::vector<int> overflows;
-    static thread_local std::vector<std::vector<bgj_cuda_result_t> > result_storage;
+    static thread_local bgj_cuda_result_storage_t result_storage;
 
     try {
         p_ids.resize(batch_size);
@@ -1690,10 +1754,16 @@ int Pool_epi8_t<nb>::_search_bgj1_cuda_batch(bucket_epi8_t<record_dp> **buckets,
         result_capacities.resize(batch_size);
         result_counts.resize(batch_size);
         overflows.resize(batch_size);
-        result_storage.resize(batch_size);
     } catch (...) {
         return 0;
     }
+
+    if (batch_size != 0 &&
+        (size_t)batch_size > std::numeric_limits<size_t>::max() / (size_t)result_capacity) {
+        return 0;
+    }
+    const size_t result_slab_capacity = (size_t)batch_size * (size_t)result_capacity;
+    if (!result_storage.reserve(result_slab_capacity)) return 0;
 
     for (uint32_t i = 0; i < batch_size; i++) {
         bucket_epi8_t<record_dp> *bkt = buckets[i];
@@ -1713,12 +1783,7 @@ int Pool_epi8_t<nb>::_search_bgj1_cuda_batch(bucket_epi8_t<record_dp> **buckets,
         goal_norms[i] = goal_norm;
         center_norms[i] = bkt->center_norm;
         result_capacities[i] = result_capacity;
-        try {
-            result_storage[i].resize((size_t)result_capacity);
-        } catch (...) {
-            return 0;
-        }
-        result_ptrs[i] = result_storage[i].data();
+        result_ptrs[i] = result_storage.ptr + (size_t)i * (size_t)result_capacity;
         result_counts[i] = 0;
         overflows[i] = 0;
     }
