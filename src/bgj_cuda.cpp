@@ -321,6 +321,8 @@ struct bgj_cuda_consume_profile_state_t {
     uint64_t scalar_uid_buckets;
     uint64_t results;
     uint64_t sorted_results;
+    uint64_t linear_rank_buckets;
+    uint64_t table_rank_buckets;
     uint64_t uid_candidates;
     uint64_t uid_accepted;
     uint64_t uid_touched_locks;
@@ -350,6 +352,8 @@ struct bgj_cuda_consume_profile_state_t {
           scalar_uid_buckets(0),
           results(0),
           sorted_results(0),
+          linear_rank_buckets(0),
+          table_rank_buckets(0),
           uid_candidates(0),
           uid_accepted(0),
           uid_touched_locks(0),
@@ -475,7 +479,8 @@ static void bgj_cuda_consume_profile_dump()
     fprintf(stderr,
             "cuda_consume_profile: buckets=%lu sorted_buckets=%lu radix_buckets=%lu "
             "stdsort_buckets=%lu batched_uid_buckets=%lu scalar_uid_buckets=%lu "
-            "results=%lu sorted_results=%lu uid_candidates=%lu uid_accepted=%lu "
+            "results=%lu sorted_results=%lu linear_rank_buckets=%lu table_rank_buckets=%lu "
+            "uid_candidates=%lu uid_accepted=%lu "
             "uid_touched_locks=%lu max_results=%lu rank=%.6fs key=%.6fs "
             "radix=%.6fs stdsort=%.6fs write=%.6fs sort=%.6fs "
             "uid_build=%.6fs uid_group=%.6fs uid_insert=%.6fs uid_sol=%.6fs "
@@ -488,6 +493,8 @@ static void bgj_cuda_consume_profile_dump()
             (unsigned long)bgj_cuda_consume_profile.scalar_uid_buckets,
             (unsigned long)bgj_cuda_consume_profile.results,
             (unsigned long)bgj_cuda_consume_profile.sorted_results,
+            (unsigned long)bgj_cuda_consume_profile.linear_rank_buckets,
+            (unsigned long)bgj_cuda_consume_profile.table_rank_buckets,
             (unsigned long)bgj_cuda_consume_profile.uid_candidates,
             (unsigned long)bgj_cuda_consume_profile.uid_accepted,
             (unsigned long)bgj_cuda_consume_profile.uid_touched_locks,
@@ -631,6 +638,7 @@ static void bgj_cuda_uid_batch_profile_record(int used_batch,
 static void bgj_cuda_consume_profile_record(uint32_t result_count,
                                             int sorted,
                                             int used_radix,
+                                            int used_linear_rank,
                                             int used_uid_batch,
                                             uint64_t uid_candidates,
                                             uint64_t uid_accepted,
@@ -657,6 +665,11 @@ static void bgj_cuda_consume_profile_record(uint32_t result_count,
     if (sorted) {
         bgj_cuda_consume_profile.sorted_buckets++;
         bgj_cuda_consume_profile.sorted_results += result_count;
+        if (used_linear_rank) {
+            bgj_cuda_consume_profile.linear_rank_buckets++;
+        } else {
+            bgj_cuda_consume_profile.table_rank_buckets++;
+        }
         if (used_radix) {
             bgj_cuda_consume_profile.radix_buckets++;
         } else {
@@ -929,6 +942,22 @@ static uint32_t bgj_cuda_radix_sort_min_results()
     return min_results;
 }
 
+static uint32_t bgj_cuda_linear_rank_max_results()
+{
+    static const uint32_t max_results = []() {
+        const char *env = getenv("BGJ_CUDA_LINEAR_RANK_MAX_RESULTS");
+        if (env && env[0]) {
+            char *end = NULL;
+            const unsigned long parsed = strtoul(env, &end, 10);
+            if (end != env && parsed <= 0xfffffffful) {
+                return (uint32_t)parsed;
+            }
+        }
+        return (uint32_t)64;
+    }();
+    return max_results;
+}
+
 int bgj_cuda_materialize_requested()
 {
     const char *env = getenv("BGJ_CUDA_MATERIALIZE");
@@ -1055,6 +1084,65 @@ static int bgj_cuda_local_rank(const bgj_cuda_result_t &result,
     default:
         return -1;
     }
+}
+
+static inline void bgj_cuda_result_sort_keys_from_ranks(const bgj_cuda_result_t &result,
+                                                        int32_t px,
+                                                        int32_t py,
+                                                        int32_t nx,
+                                                        int32_t ny,
+                                                        int32_t &phase,
+                                                        int32_t &rank0,
+                                                        int32_t &rank1)
+{
+    switch (result.type) {
+    case BGJ_CUDA_SOL_A:
+        phase = 0;
+        rank0 = px;
+        rank1 = ny;
+        return;
+    case BGJ_CUDA_SOL_SA:
+        phase = 1;
+        rank0 = px;
+        rank1 = ny;
+        return;
+    case BGJ_CUDA_SOL_S:
+        if (px >= 0 && py >= 0) {
+            phase = 2;
+            rank0 = px;
+            rank1 = py;
+            return;
+        }
+        phase = (nx >= 0 && ny >= 0) ? 4 : 6;
+        rank0 = nx;
+        rank1 = ny;
+        return;
+    case BGJ_CUDA_SOL_SS:
+        phase = 3;
+        rank0 = px;
+        rank1 = py;
+        return;
+    case BGJ_CUDA_SOL_AA:
+        phase = 5;
+        rank0 = nx;
+        rank1 = ny;
+        return;
+    default:
+        phase = 7;
+        rank0 = -1;
+        rank1 = -1;
+        return;
+    }
+}
+
+static inline int32_t bgj_cuda_target_rank_of(const std::vector<uint32_t> &target_stamp,
+                                              const std::vector<uint32_t> &target_slot,
+                                              const std::vector<int32_t> &target_rank,
+                                              uint32_t epoch,
+                                              uint32_t id)
+{
+    if (id >= target_stamp.size() || target_stamp[id] != epoch) return -1;
+    return target_rank[target_slot[id]];
 }
 
 struct bgj_cuda_result_sort_item_t {
@@ -1197,6 +1285,7 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
     double consume_write_sec = 0.0;
     int consume_sorted = 0;
     int consume_used_radix = 0;
+    int consume_used_linear_rank = 0;
     const uint32_t num_p = (uint32_t)bkt->num_pvec;
     const uint32_t num_n = (uint32_t)bkt->num_nvec;
     const int sort_results = bgj_cuda_sort_results_requested();
@@ -1211,36 +1300,89 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
         static thread_local std::vector<uint32_t> n_rank_stamp;
         static thread_local std::vector<bgj_cuda_result_sort_item_t> sort_items;
         static thread_local std::vector<bgj_cuda_result_sort_item_t> sort_phase_items;
+        static thread_local std::vector<uint32_t> target_stamp;
+        static thread_local std::vector<uint32_t> target_slot;
+        static thread_local std::vector<int32_t> target_p_rank;
+        static thread_local std::vector<int32_t> target_n_rank;
         static thread_local uint32_t rank_epoch = 1;
+        static thread_local uint32_t target_epoch = 1;
 
-        rank_epoch++;
-        if (rank_epoch == 0) {
-            std::fill(p_rank_stamp.begin(), p_rank_stamp.end(), 0);
-            std::fill(n_rank_stamp.begin(), n_rank_stamp.end(), 0);
-            rank_epoch = 1;
-        }
-        try {
-            if (p_rank.size() < (size_t)pool->num_vec) {
-                p_rank.resize((size_t)pool->num_vec);
-                p_rank_stamp.resize((size_t)pool->num_vec, 0);
+        const uint32_t linear_rank_max_results = bgj_cuda_linear_rank_max_results();
+        const int use_linear_rank = linear_rank_max_results != 0 &&
+                                    result_count <= linear_rank_max_results;
+        consume_used_linear_rank = use_linear_rank;
+        if (use_linear_rank) {
+            target_epoch++;
+            if (target_epoch == 0) {
+                std::fill(target_stamp.begin(), target_stamp.end(), 0);
+                target_epoch = 1;
             }
-            if (n_rank.size() < (size_t)pool->num_vec) {
-                n_rank.resize((size_t)pool->num_vec);
-                n_rank_stamp.resize((size_t)pool->num_vec, 0);
+            try {
+                if (target_stamp.size() < (size_t)pool->num_vec) {
+                    target_stamp.resize((size_t)pool->num_vec, 0);
+                    target_slot.resize((size_t)pool->num_vec, 0);
+                }
+                target_p_rank.clear();
+                target_n_rank.clear();
+                target_p_rank.reserve((size_t)result_count * 2u);
+                target_n_rank.reserve((size_t)result_count * 2u);
+            } catch (...) {
+                return 0;
             }
-        } catch (...) {
-            return 0;
-        }
-        for (uint32_t i = 0; i < num_p; i++) {
-            if (bkt->pvec[i] < (uint32_t)p_rank.size()) {
-                p_rank[bkt->pvec[i]] = (int32_t)i;
-                p_rank_stamp[bkt->pvec[i]] = rank_epoch;
+            auto add_target = [&](uint32_t id) {
+                if (id >= (uint32_t)target_stamp.size()) return;
+                if (target_stamp[id] == target_epoch) return;
+                target_stamp[id] = target_epoch;
+                target_slot[id] = (uint32_t)target_p_rank.size();
+                target_p_rank.push_back(-1);
+                target_n_rank.push_back(-1);
+            };
+            for (uint32_t i = 0; i < result_count; i++) {
+                add_target(results[i].x);
+                add_target(results[i].y);
             }
-        }
-        for (uint32_t i = 0; i < num_n; i++) {
-            if (bkt->nvec[i] < (uint32_t)n_rank.size()) {
-                n_rank[bkt->nvec[i]] = (int32_t)i;
-                n_rank_stamp[bkt->nvec[i]] = rank_epoch;
+            for (uint32_t i = 0; i < num_p; i++) {
+                const uint32_t id = bkt->pvec[i];
+                if (id < (uint32_t)target_stamp.size() && target_stamp[id] == target_epoch) {
+                    target_p_rank[target_slot[id]] = (int32_t)i;
+                }
+            }
+            for (uint32_t i = 0; i < num_n; i++) {
+                const uint32_t id = bkt->nvec[i];
+                if (id < (uint32_t)target_stamp.size() && target_stamp[id] == target_epoch) {
+                    target_n_rank[target_slot[id]] = (int32_t)i;
+                }
+            }
+        } else {
+            rank_epoch++;
+            if (rank_epoch == 0) {
+                std::fill(p_rank_stamp.begin(), p_rank_stamp.end(), 0);
+                std::fill(n_rank_stamp.begin(), n_rank_stamp.end(), 0);
+                rank_epoch = 1;
+            }
+            try {
+                if (p_rank.size() < (size_t)pool->num_vec) {
+                    p_rank.resize((size_t)pool->num_vec);
+                    p_rank_stamp.resize((size_t)pool->num_vec, 0);
+                }
+                if (n_rank.size() < (size_t)pool->num_vec) {
+                    n_rank.resize((size_t)pool->num_vec);
+                    n_rank_stamp.resize((size_t)pool->num_vec, 0);
+                }
+            } catch (...) {
+                return 0;
+            }
+            for (uint32_t i = 0; i < num_p; i++) {
+                if (bkt->pvec[i] < (uint32_t)p_rank.size()) {
+                    p_rank[bkt->pvec[i]] = (int32_t)i;
+                    p_rank_stamp[bkt->pvec[i]] = rank_epoch;
+                }
+            }
+            for (uint32_t i = 0; i < num_n; i++) {
+                if (bkt->nvec[i] < (uint32_t)n_rank.size()) {
+                    n_rank[bkt->nvec[i]] = (int32_t)i;
+                    n_rank_stamp[bkt->nvec[i]] = rank_epoch;
+                }
             }
         }
         if (consume_profile) {
@@ -1263,26 +1405,57 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
         for (uint32_t i = 0; i < result_count; i++) {
             bgj_cuda_result_sort_item_t &item = sort_items[i];
             item.result = results[i];
-            item.phase = bgj_cuda_result_phase(item.result,
-                                               p_rank,
-                                               p_rank_stamp,
-                                               n_rank,
-                                               n_rank_stamp,
-                                               rank_epoch);
-            item.rank0 = bgj_cuda_local_rank(item.result,
-                                             p_rank,
-                                             p_rank_stamp,
-                                             n_rank,
-                                             n_rank_stamp,
-                                             rank_epoch,
-                                             1);
-            item.rank1 = bgj_cuda_local_rank(item.result,
-                                             p_rank,
-                                             p_rank_stamp,
-                                             n_rank,
-                                             n_rank_stamp,
-                                             rank_epoch,
-                                             0);
+            if (use_linear_rank) {
+                const int32_t px = bgj_cuda_target_rank_of(target_stamp,
+                                                           target_slot,
+                                                           target_p_rank,
+                                                           target_epoch,
+                                                           item.result.x);
+                const int32_t py = bgj_cuda_target_rank_of(target_stamp,
+                                                           target_slot,
+                                                           target_p_rank,
+                                                           target_epoch,
+                                                           item.result.y);
+                const int32_t nx = bgj_cuda_target_rank_of(target_stamp,
+                                                           target_slot,
+                                                           target_n_rank,
+                                                           target_epoch,
+                                                           item.result.x);
+                const int32_t ny = bgj_cuda_target_rank_of(target_stamp,
+                                                           target_slot,
+                                                           target_n_rank,
+                                                           target_epoch,
+                                                           item.result.y);
+                bgj_cuda_result_sort_keys_from_ranks(item.result,
+                                                     px,
+                                                     py,
+                                                     nx,
+                                                     ny,
+                                                     item.phase,
+                                                     item.rank0,
+                                                     item.rank1);
+            } else {
+                item.phase = bgj_cuda_result_phase(item.result,
+                                                   p_rank,
+                                                   p_rank_stamp,
+                                                   n_rank,
+                                                   n_rank_stamp,
+                                                   rank_epoch);
+                item.rank0 = bgj_cuda_local_rank(item.result,
+                                                 p_rank,
+                                                 p_rank_stamp,
+                                                 n_rank,
+                                                 n_rank_stamp,
+                                                 rank_epoch,
+                                                 1);
+                item.rank1 = bgj_cuda_local_rank(item.result,
+                                                 p_rank,
+                                                 p_rank_stamp,
+                                                 n_rank,
+                                                 n_rank_stamp,
+                                                 rank_epoch,
+                                                 0);
+            }
             phase_count[(uint32_t)item.phase]++;
             y_mask |= item.result.y;
             x_mask |= item.result.x;
@@ -1765,6 +1938,7 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
         bgj_cuda_consume_profile_record(result_count,
                                         consume_sorted,
                                         consume_used_radix,
+                                        consume_used_linear_rank,
                                         uid_profile_used_batch,
                                         uid_profile_candidates,
                                         uid_profile_accepted,
