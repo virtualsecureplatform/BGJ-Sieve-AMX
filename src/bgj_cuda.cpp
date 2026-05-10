@@ -718,6 +718,29 @@ static int bgj_cuda_sort_results_requested()
     return bgj_cuda_pinned_results_requested();
 }
 
+static int bgj_cuda_radix_sort_requested()
+{
+    const char *env = getenv("BGJ_CUDA_RADIX_SORT");
+    if (env && env[0]) return env[0] != '0';
+    return 1;
+}
+
+static uint32_t bgj_cuda_radix_sort_min_results()
+{
+    static const uint32_t min_results = []() {
+        const char *env = getenv("BGJ_CUDA_RADIX_SORT_MIN_RESULTS");
+        if (env && env[0]) {
+            char *end = NULL;
+            const unsigned long parsed = strtoul(env, &end, 10);
+            if (end != env && parsed > 0 && parsed <= 0xfffffffful) {
+                return (uint32_t)parsed;
+            }
+        }
+        return (uint32_t)1024;
+    }();
+    return min_results;
+}
+
 int bgj_cuda_materialize_requested()
 {
     const char *env = getenv("BGJ_CUDA_MATERIALIZE");
@@ -853,6 +876,66 @@ struct bgj_cuda_result_sort_item_t {
     bgj_cuda_result_t result;
 };
 
+static inline uint32_t bgj_cuda_sort_signed_key(int32_t value)
+{
+    return ((uint32_t)value) ^ 0x80000000u;
+}
+
+static inline uint32_t bgj_cuda_sort_key_byte(const bgj_cuda_result_sort_item_t &item,
+                                              uint32_t pass)
+{
+    if (pass < 4) return (item.result.y >> (pass * 8)) & 0xffu;
+    pass -= 4;
+    if (pass < 4) return (item.result.x >> (pass * 8)) & 0xffu;
+    pass -= 4;
+    if (pass < 4) return (item.result.type >> (pass * 8)) & 0xffu;
+    pass -= 4;
+    if (pass < 4) return (bgj_cuda_sort_signed_key(item.rank1) >> (pass * 8)) & 0xffu;
+    pass -= 4;
+    if (pass < 4) return (bgj_cuda_sort_signed_key(item.rank0) >> (pass * 8)) & 0xffu;
+    return ((uint32_t)item.phase) & 0xffu;
+}
+
+static void bgj_cuda_radix_sort_items(std::vector<bgj_cuda_result_sort_item_t> &items,
+                                      std::vector<bgj_cuda_result_sort_item_t> &scratch,
+                                      uint32_t count)
+{
+    static const uint32_t NUM_PASSES = 21;
+    bgj_cuda_result_sort_item_t *src = items.data();
+    bgj_cuda_result_sort_item_t *dst = scratch.data();
+    bool in_scratch = false;
+
+    for (uint32_t pass = 0; pass < NUM_PASSES; pass++) {
+        uint32_t counts[256];
+        uint32_t offsets[256];
+        memset(counts, 0, sizeof(counts));
+
+        for (uint32_t i = 0; i < count; i++) {
+            counts[bgj_cuda_sort_key_byte(src[i], pass)]++;
+        }
+
+        uint32_t offset = 0;
+        for (uint32_t i = 0; i < 256; i++) {
+            offsets[i] = offset;
+            offset += counts[i];
+        }
+
+        for (uint32_t i = 0; i < count; i++) {
+            const uint32_t key = bgj_cuda_sort_key_byte(src[i], pass);
+            dst[offsets[key]++] = src[i];
+        }
+
+        bgj_cuda_result_sort_item_t *tmp = src;
+        src = dst;
+        dst = tmp;
+        in_scratch = !in_scratch;
+    }
+
+    if (in_scratch) {
+        std::copy(scratch.begin(), scratch.begin() + count, items.begin());
+    }
+}
+
 template <uint32_t nb, bool record_dp, bool profiling>
 static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
                                          bucket_epi8_t<record_dp> *bkt,
@@ -941,35 +1024,43 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
                                              0);
             phase_count[(uint32_t)item.phase]++;
         }
-        uint32_t phase_begin[9];
-        phase_begin[0] = 0;
-        for (uint32_t phase = 0; phase < 8; phase++) {
-            phase_begin[phase + 1] = phase_begin[phase] + phase_count[phase];
-        }
-        uint32_t phase_cursor[8];
-        for (uint32_t phase = 0; phase < 8; phase++) {
-            phase_cursor[phase] = phase_begin[phase];
+
+        const int use_radix_sort = bgj_cuda_radix_sort_requested() &&
+                                   result_count >= bgj_cuda_radix_sort_min_results();
+        if (use_radix_sort) {
+            bgj_cuda_radix_sort_items(sort_items, sort_phase_items, result_count);
+        } else {
+            uint32_t phase_begin[9];
+            phase_begin[0] = 0;
+            for (uint32_t phase = 0; phase < 8; phase++) {
+                phase_begin[phase + 1] = phase_begin[phase] + phase_count[phase];
+            }
+            uint32_t phase_cursor[8];
+            for (uint32_t phase = 0; phase < 8; phase++) {
+                phase_cursor[phase] = phase_begin[phase];
+            }
+            for (uint32_t i = 0; i < result_count; i++) {
+                const uint32_t phase = (uint32_t)sort_items[i].phase;
+                sort_phase_items[phase_cursor[phase]++] = sort_items[i];
+            }
+            for (uint32_t phase = 0; phase < 8; phase++) {
+                bgj_cuda_result_sort_item_t *begin = sort_phase_items.data() + phase_begin[phase];
+                bgj_cuda_result_sort_item_t *end = sort_phase_items.data() + phase_begin[phase + 1];
+                if (end - begin <= 1) continue;
+                std::sort(begin, end,
+                          [](const bgj_cuda_result_sort_item_t &a,
+                             const bgj_cuda_result_sort_item_t &b) {
+                              if (a.rank0 != b.rank0) return a.rank0 < b.rank0;
+                              if (a.rank1 != b.rank1) return a.rank1 < b.rank1;
+                              if (a.result.type != b.result.type) return a.result.type < b.result.type;
+                              if (a.result.x != b.result.x) return a.result.x < b.result.x;
+                              return a.result.y < b.result.y;
+                          });
+            }
+            sort_items.swap(sort_phase_items);
         }
         for (uint32_t i = 0; i < result_count; i++) {
-            const uint32_t phase = (uint32_t)sort_items[i].phase;
-            sort_phase_items[phase_cursor[phase]++] = sort_items[i];
-        }
-        for (uint32_t phase = 0; phase < 8; phase++) {
-            bgj_cuda_result_sort_item_t *begin = sort_phase_items.data() + phase_begin[phase];
-            bgj_cuda_result_sort_item_t *end = sort_phase_items.data() + phase_begin[phase + 1];
-            if (end - begin <= 1) continue;
-            std::sort(begin, end,
-                      [](const bgj_cuda_result_sort_item_t &a,
-                         const bgj_cuda_result_sort_item_t &b) {
-                          if (a.rank0 != b.rank0) return a.rank0 < b.rank0;
-                          if (a.rank1 != b.rank1) return a.rank1 < b.rank1;
-                          if (a.result.type != b.result.type) return a.result.type < b.result.type;
-                          if (a.result.x != b.result.x) return a.result.x < b.result.x;
-                          return a.result.y < b.result.y;
-                      });
-        }
-        for (uint32_t i = 0; i < result_count; i++) {
-            results[i] = sort_phase_items[i].result;
+            results[i] = sort_items[i].result;
         }
         sort_sec = bgj_cuda_host_wall_time() - sort_t0;
     }
