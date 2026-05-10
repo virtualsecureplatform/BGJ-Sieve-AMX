@@ -132,6 +132,22 @@ static uint32_t bgj_cuda_uid_batch_min_results()
     return min_results;
 }
 
+static uint32_t bgj_cuda_sorted_uid_batch_min_results()
+{
+    static const uint32_t min_results = []() {
+        const char *env = getenv("BGJ_CUDA_SORTED_UID_BATCH_MIN_RESULTS");
+        if (env && env[0]) {
+            char *end = NULL;
+            const unsigned long parsed = strtoul(env, &end, 10);
+            if (end != env && parsed > 0 && parsed <= 0xfffffffful) {
+                return (uint32_t)parsed;
+            }
+        }
+        return (uint32_t)1024;
+    }();
+    return min_results;
+}
+
 static int bgj_cuda_uid_coalesce_requested()
 {
     static const int requested = []() {
@@ -851,8 +867,9 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
     double sort_sec = 0.0;
     const uint32_t num_p = (uint32_t)bkt->num_pvec;
     const uint32_t num_n = (uint32_t)bkt->num_nvec;
+    const int sort_results = bgj_cuda_sort_results_requested();
 
-    if (result_count > 1 && bgj_cuda_sort_results_requested()) {
+    if (result_count > 1 && sort_results) {
         const double sort_t0 = bgj_cuda_host_wall_time();
         static thread_local std::vector<int32_t> p_rank;
         static thread_local std::vector<int32_t> n_rank;
@@ -1090,8 +1107,10 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
         double uid_profile_sol_sec = 0.0;
         double uid_profile_scalar_sec = 0.0;
         const double uid_profile_total_t0 = uid_batch_profile ? bgj_cuda_host_wall_time() : 0.0;
+        const uint32_t uid_batch_min_results =
+            sort_results ? bgj_cuda_sorted_uid_batch_min_results() : bgj_cuda_uid_batch_min_results();
         int use_uid_batch = bgj_cuda_uid_batch_requested() &&
-                            result_count >= bgj_cuda_uid_batch_min_results();
+                            result_count >= uid_batch_min_results;
         if (use_uid_batch) {
             static thread_local std::vector<bgj_cuda_uid_candidate_t> candidates;
             static thread_local std::vector<uint32_t> order;
