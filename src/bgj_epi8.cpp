@@ -118,11 +118,24 @@ static uint32_t bgj2_epi8_cuda_batch_size(uint32_t search_threads)
         value = size_override > 32 ? 32 : (uint32_t)size_override;
     } else if (batch_env && batch_env[0]) {
         value = 8;
+    } else if (value == 1 && bgj_cuda_search_requested()) {
+        value = 8;
     }
 
     if (value < 1) value = 1;
     if (value > 32) value = 32;
     return value;
+}
+
+static uint64_t bgj2_epi8_cuda_batch_min_dots()
+{
+    const char *env = getenv("BGJ_CUDA_BGJ2_MIN_DOTS");
+    if (env && env[0]) return bgj_epi8_env_u64("BGJ_CUDA_BGJ2_MIN_DOTS", 64ULL * 1024ULL);
+
+    env = getenv("BGJ_CUDA_BATCH_MIN_DOTS");
+    if (env && env[0]) return bgj_epi8_env_u64("BGJ_CUDA_BATCH_MIN_DOTS", 64ULL * 1024ULL);
+
+    return 64ULL * 1024ULL;
 }
 
 static uint32_t bgj3_epi8_cuda_batch_size()
@@ -1540,7 +1553,7 @@ int Pool_epi8_t<nb>::bgj2_Sieve(long log_level, long lps_auto_adj){
             #if defined(HAVE_CUDA)
             const uint32_t cuda_batch_capacity = bgj2_epi8_cuda_batch_size((uint32_t)search_threads);
             const uint32_t cuda_min_batch = cuda_batch_capacity < 4 ? cuda_batch_capacity : 4;
-            const uint64_t cuda_batch_min_dots = bgj_epi8_env_u64("BGJ_CUDA_BGJ2_MIN_DOTS", bgj_cuda_batch_min_dots());
+            const uint64_t cuda_batch_min_dots = bgj2_epi8_cuda_batch_min_dots();
             const int cuda_bgj2_search = bgj_epi8_env_flag("BGJ_CUDA_BGJ2_SEARCH", 1);
             const int cuda_bgj2_search0 = cuda_bgj2_search ? bgj_epi8_env_flag("BGJ_CUDA_BGJ2_SEARCH0", 1) : 0;
             const int cuda_bgj2_search1 = cuda_bgj2_search ? bgj_epi8_env_flag("BGJ_CUDA_BGJ2_SEARCH1", 1) : 0;
