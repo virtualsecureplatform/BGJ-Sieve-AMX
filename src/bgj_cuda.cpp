@@ -310,6 +310,69 @@ struct bgj_cuda_uid_batch_profile_state_t {
 
 static bgj_cuda_uid_batch_profile_state_t bgj_cuda_uid_batch_profile;
 
+struct bgj_cuda_consume_profile_state_t {
+    pthread_mutex_t lock;
+    int registered;
+    uint64_t buckets;
+    uint64_t sorted_buckets;
+    uint64_t radix_buckets;
+    uint64_t stdsort_buckets;
+    uint64_t batched_uid_buckets;
+    uint64_t scalar_uid_buckets;
+    uint64_t results;
+    uint64_t sorted_results;
+    uint64_t uid_candidates;
+    uint64_t uid_accepted;
+    uint64_t uid_touched_locks;
+    uint64_t max_results;
+    double rank_sec;
+    double key_sec;
+    double radix_sec;
+    double stdsort_sec;
+    double write_sec;
+    double sort_sec;
+    double uid_build_sec;
+    double uid_group_sec;
+    double uid_insert_sec;
+    double uid_sol_sec;
+    double uid_scalar_sec;
+    double uid_total_sec;
+    double total_sec;
+
+    bgj_cuda_consume_profile_state_t()
+        : lock(PTHREAD_MUTEX_INITIALIZER),
+          registered(0),
+          buckets(0),
+          sorted_buckets(0),
+          radix_buckets(0),
+          stdsort_buckets(0),
+          batched_uid_buckets(0),
+          scalar_uid_buckets(0),
+          results(0),
+          sorted_results(0),
+          uid_candidates(0),
+          uid_accepted(0),
+          uid_touched_locks(0),
+          max_results(0),
+          rank_sec(0.0),
+          key_sec(0.0),
+          radix_sec(0.0),
+          stdsort_sec(0.0),
+          write_sec(0.0),
+          sort_sec(0.0),
+          uid_build_sec(0.0),
+          uid_group_sec(0.0),
+          uid_insert_sec(0.0),
+          uid_sol_sec(0.0),
+          uid_scalar_sec(0.0),
+          uid_total_sec(0.0),
+          total_sec(0.0)
+    {
+    }
+};
+
+static bgj_cuda_consume_profile_state_t bgj_cuda_consume_profile;
+
 static double bgj_cuda_host_wall_time()
 {
     struct timeval tv;
@@ -327,6 +390,15 @@ static int bgj_cuda_uid_batch_profile_requested()
 {
     static const int requested = []() {
         const char *env = getenv("BGJ_CUDA_UID_BATCH_PROFILE");
+        return env && env[0] && env[0] != '0';
+    }();
+    return requested;
+}
+
+static int bgj_cuda_consume_profile_requested()
+{
+    static const int requested = []() {
+        const char *env = getenv("BGJ_CUDA_CONSUME_PROFILE");
         return env && env[0] && env[0] != '0';
     }();
     return requested;
@@ -395,6 +467,47 @@ static void bgj_cuda_uid_batch_profile_dump()
     pthread_mutex_unlock(&bgj_cuda_uid_batch_profile.lock);
 }
 
+static void bgj_cuda_consume_profile_dump()
+{
+    if (!bgj_cuda_consume_profile_requested()) return;
+
+    pthread_mutex_lock(&bgj_cuda_consume_profile.lock);
+    fprintf(stderr,
+            "cuda_consume_profile: buckets=%lu sorted_buckets=%lu radix_buckets=%lu "
+            "stdsort_buckets=%lu batched_uid_buckets=%lu scalar_uid_buckets=%lu "
+            "results=%lu sorted_results=%lu uid_candidates=%lu uid_accepted=%lu "
+            "uid_touched_locks=%lu max_results=%lu rank=%.6fs key=%.6fs "
+            "radix=%.6fs stdsort=%.6fs write=%.6fs sort=%.6fs "
+            "uid_build=%.6fs uid_group=%.6fs uid_insert=%.6fs uid_sol=%.6fs "
+            "uid_scalar=%.6fs uid_total=%.6fs total=%.6fs\n",
+            (unsigned long)bgj_cuda_consume_profile.buckets,
+            (unsigned long)bgj_cuda_consume_profile.sorted_buckets,
+            (unsigned long)bgj_cuda_consume_profile.radix_buckets,
+            (unsigned long)bgj_cuda_consume_profile.stdsort_buckets,
+            (unsigned long)bgj_cuda_consume_profile.batched_uid_buckets,
+            (unsigned long)bgj_cuda_consume_profile.scalar_uid_buckets,
+            (unsigned long)bgj_cuda_consume_profile.results,
+            (unsigned long)bgj_cuda_consume_profile.sorted_results,
+            (unsigned long)bgj_cuda_consume_profile.uid_candidates,
+            (unsigned long)bgj_cuda_consume_profile.uid_accepted,
+            (unsigned long)bgj_cuda_consume_profile.uid_touched_locks,
+            (unsigned long)bgj_cuda_consume_profile.max_results,
+            bgj_cuda_consume_profile.rank_sec,
+            bgj_cuda_consume_profile.key_sec,
+            bgj_cuda_consume_profile.radix_sec,
+            bgj_cuda_consume_profile.stdsort_sec,
+            bgj_cuda_consume_profile.write_sec,
+            bgj_cuda_consume_profile.sort_sec,
+            bgj_cuda_consume_profile.uid_build_sec,
+            bgj_cuda_consume_profile.uid_group_sec,
+            bgj_cuda_consume_profile.uid_insert_sec,
+            bgj_cuda_consume_profile.uid_sol_sec,
+            bgj_cuda_consume_profile.uid_scalar_sec,
+            bgj_cuda_consume_profile.uid_total_sec,
+            bgj_cuda_consume_profile.total_sec);
+    pthread_mutex_unlock(&bgj_cuda_consume_profile.lock);
+}
+
 static void bgj_cuda_host_profile_register()
 {
     if (!bgj_cuda_host_profile_requested()) return;
@@ -417,6 +530,18 @@ static void bgj_cuda_uid_batch_profile_register()
         atexit(bgj_cuda_uid_batch_profile_dump);
     }
     pthread_mutex_unlock(&bgj_cuda_uid_batch_profile.lock);
+}
+
+static void bgj_cuda_consume_profile_register()
+{
+    if (!bgj_cuda_consume_profile_requested()) return;
+
+    pthread_mutex_lock(&bgj_cuda_consume_profile.lock);
+    if (!bgj_cuda_consume_profile.registered) {
+        bgj_cuda_consume_profile.registered = 1;
+        atexit(bgj_cuda_consume_profile_dump);
+    }
+    pthread_mutex_unlock(&bgj_cuda_consume_profile.lock);
 }
 
 static void bgj_cuda_host_profile_record(uint32_t result_count,
@@ -501,6 +626,69 @@ static void bgj_cuda_uid_batch_profile_record(int used_batch,
     bgj_cuda_uid_batch_profile.scalar_sec += scalar_sec;
     bgj_cuda_uid_batch_profile.total_sec += total_sec;
     pthread_mutex_unlock(&bgj_cuda_uid_batch_profile.lock);
+}
+
+static void bgj_cuda_consume_profile_record(uint32_t result_count,
+                                            int sorted,
+                                            int used_radix,
+                                            int used_uid_batch,
+                                            uint64_t uid_candidates,
+                                            uint64_t uid_accepted,
+                                            uint64_t uid_touched_locks,
+                                            double rank_sec,
+                                            double key_sec,
+                                            double radix_sec,
+                                            double stdsort_sec,
+                                            double write_sec,
+                                            double sort_sec,
+                                            double uid_build_sec,
+                                            double uid_group_sec,
+                                            double uid_insert_sec,
+                                            double uid_sol_sec,
+                                            double uid_scalar_sec,
+                                            double uid_total_sec,
+                                            double total_sec)
+{
+    if (!bgj_cuda_consume_profile_requested()) return;
+    bgj_cuda_consume_profile_register();
+
+    pthread_mutex_lock(&bgj_cuda_consume_profile.lock);
+    bgj_cuda_consume_profile.buckets++;
+    if (sorted) {
+        bgj_cuda_consume_profile.sorted_buckets++;
+        bgj_cuda_consume_profile.sorted_results += result_count;
+        if (used_radix) {
+            bgj_cuda_consume_profile.radix_buckets++;
+        } else {
+            bgj_cuda_consume_profile.stdsort_buckets++;
+        }
+    }
+    if (used_uid_batch) {
+        bgj_cuda_consume_profile.batched_uid_buckets++;
+    } else {
+        bgj_cuda_consume_profile.scalar_uid_buckets++;
+    }
+    bgj_cuda_consume_profile.results += result_count;
+    bgj_cuda_consume_profile.uid_candidates += uid_candidates;
+    bgj_cuda_consume_profile.uid_accepted += uid_accepted;
+    bgj_cuda_consume_profile.uid_touched_locks += uid_touched_locks;
+    if (result_count > bgj_cuda_consume_profile.max_results) {
+        bgj_cuda_consume_profile.max_results = result_count;
+    }
+    bgj_cuda_consume_profile.rank_sec += rank_sec;
+    bgj_cuda_consume_profile.key_sec += key_sec;
+    bgj_cuda_consume_profile.radix_sec += radix_sec;
+    bgj_cuda_consume_profile.stdsort_sec += stdsort_sec;
+    bgj_cuda_consume_profile.write_sec += write_sec;
+    bgj_cuda_consume_profile.sort_sec += sort_sec;
+    bgj_cuda_consume_profile.uid_build_sec += uid_build_sec;
+    bgj_cuda_consume_profile.uid_group_sec += uid_group_sec;
+    bgj_cuda_consume_profile.uid_insert_sec += uid_insert_sec;
+    bgj_cuda_consume_profile.uid_sol_sec += uid_sol_sec;
+    bgj_cuda_consume_profile.uid_scalar_sec += uid_scalar_sec;
+    bgj_cuda_consume_profile.uid_total_sec += uid_total_sec;
+    bgj_cuda_consume_profile.total_sec += total_sec;
+    pthread_mutex_unlock(&bgj_cuda_consume_profile.lock);
 }
 
 extern "C" int bgj_cuda_raw_device_count();
@@ -996,15 +1184,27 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
                                          uint32_t result_count)
 {
     const int host_profile = bgj_cuda_host_profile_requested();
+    const int consume_profile = !host_profile && bgj_cuda_consume_profile_requested();
     const int uid_batch_profile = !host_profile && bgj_cuda_uid_batch_profile_requested();
+    const int uid_timing_profile = uid_batch_profile || consume_profile;
     const double consume_t0 = host_profile ? bgj_cuda_host_wall_time() : 0.0;
+    const double consume_profile_t0 = consume_profile ? bgj_cuda_host_wall_time() : 0.0;
     double sort_sec = 0.0;
+    double consume_rank_sec = 0.0;
+    double consume_key_sec = 0.0;
+    double consume_radix_sec = 0.0;
+    double consume_stdsort_sec = 0.0;
+    double consume_write_sec = 0.0;
+    int consume_sorted = 0;
+    int consume_used_radix = 0;
     const uint32_t num_p = (uint32_t)bkt->num_pvec;
     const uint32_t num_n = (uint32_t)bkt->num_nvec;
     const int sort_results = bgj_cuda_sort_results_requested();
 
     if (result_count > 1 && sort_results) {
+        consume_sorted = 1;
         const double sort_t0 = bgj_cuda_host_wall_time();
+        const double rank_t0 = consume_profile ? bgj_cuda_host_wall_time() : 0.0;
         static thread_local std::vector<int32_t> p_rank;
         static thread_local std::vector<int32_t> n_rank;
         static thread_local std::vector<uint32_t> p_rank_stamp;
@@ -1043,6 +1243,9 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
                 n_rank_stamp[bkt->nvec[i]] = rank_epoch;
             }
         }
+        if (consume_profile) {
+            consume_rank_sec += bgj_cuda_host_wall_time() - rank_t0;
+        }
         try {
             sort_items.resize((size_t)result_count);
             sort_phase_items.resize((size_t)result_count);
@@ -1056,6 +1259,7 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
         uint32_t rank1_mask = 0;
         uint32_t rank0_mask = 0;
         uint32_t phase_mask = 0;
+        const double key_t0 = consume_profile ? bgj_cuda_host_wall_time() : 0.0;
         for (uint32_t i = 0; i < result_count; i++) {
             bgj_cuda_result_sort_item_t &item = sort_items[i];
             item.result = results[i];
@@ -1087,10 +1291,15 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
             rank0_mask |= bgj_cuda_sort_rank_key(item.rank0);
             phase_mask |= (uint32_t)item.phase;
         }
+        if (consume_profile) {
+            consume_key_sec += bgj_cuda_host_wall_time() - key_t0;
+        }
 
         const int use_radix_sort = bgj_cuda_radix_sort_requested() &&
                                    result_count >= bgj_cuda_radix_sort_min_results();
         if (use_radix_sort) {
+            consume_used_radix = 1;
+            const double radix_t0 = consume_profile ? bgj_cuda_host_wall_time() : 0.0;
             bgj_cuda_radix_sort_items(sort_items,
                                       sort_phase_items,
                                       result_count,
@@ -1100,7 +1309,11 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
                                       rank1_mask,
                                       rank0_mask,
                                       phase_mask);
+            if (consume_profile) {
+                consume_radix_sec += bgj_cuda_host_wall_time() - radix_t0;
+            }
         } else {
+            const double stdsort_t0 = consume_profile ? bgj_cuda_host_wall_time() : 0.0;
             uint32_t phase_begin[9];
             phase_begin[0] = 0;
             for (uint32_t phase = 0; phase < 8; phase++) {
@@ -1129,9 +1342,16 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
                           });
             }
             sort_items.swap(sort_phase_items);
+            if (consume_profile) {
+                consume_stdsort_sec += bgj_cuda_host_wall_time() - stdsort_t0;
+            }
         }
+        const double write_t0 = consume_profile ? bgj_cuda_host_wall_time() : 0.0;
         for (uint32_t i = 0; i < result_count; i++) {
             results[i] = sort_items[i].result;
+        }
+        if (consume_profile) {
+            consume_write_sec += bgj_cuda_host_wall_time() - write_t0;
         }
         sort_sec = bgj_cuda_host_wall_time() - sort_t0;
     }
@@ -1146,6 +1366,16 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
     double bucket_uid_sec = 0.0;
     double uid_sec = 0.0;
     double sol_sec = 0.0;
+    int uid_profile_used_batch = 0;
+    uint64_t uid_profile_candidates = 0;
+    uint64_t uid_profile_accepted = 0;
+    uint64_t uid_profile_touched_locks = 0;
+    double uid_profile_build_sec = 0.0;
+    double uid_profile_group_sec = 0.0;
+    double uid_profile_insert_sec = 0.0;
+    double uid_profile_sol_sec = 0.0;
+    double uid_profile_scalar_sec = 0.0;
+    double uid_profile_total_sec = 0.0;
 
     if (host_profile) {
         static thread_local std::unordered_set<uint64_t> bucket_uid_seen;
@@ -1259,16 +1489,7 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
             }
         }
     } else {
-        int uid_profile_used_batch = 0;
-        uint64_t uid_profile_candidates = 0;
-        uint64_t uid_profile_accepted = 0;
-        uint64_t uid_profile_touched_locks = 0;
-        double uid_profile_build_sec = 0.0;
-        double uid_profile_group_sec = 0.0;
-        double uid_profile_insert_sec = 0.0;
-        double uid_profile_sol_sec = 0.0;
-        double uid_profile_scalar_sec = 0.0;
-        const double uid_profile_total_t0 = uid_batch_profile ? bgj_cuda_host_wall_time() : 0.0;
+        const double uid_profile_total_t0 = uid_timing_profile ? bgj_cuda_host_wall_time() : 0.0;
         const uint32_t uid_batch_min_results =
             sort_results ? bgj_cuda_sorted_uid_batch_min_results() : bgj_cuda_uid_batch_min_results();
         int use_uid_batch = bgj_cuda_uid_batch_requested() &&
@@ -1298,7 +1519,7 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
 
             if (use_uid_batch) {
                 uid_profile_used_batch = 1;
-                double uid_profile_phase_t0 = uid_batch_profile ? bgj_cuda_host_wall_time() : 0.0;
+                double uid_profile_phase_t0 = uid_timing_profile ? bgj_cuda_host_wall_time() : 0.0;
                 for (uint32_t i = 0; i < result_count; i++) {
                     const uint32_t x = results[i].x;
                     const uint32_t y = results[i].y;
@@ -1362,13 +1583,13 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
                         break;
                     }
                 }
-                if (uid_batch_profile) {
+                if (uid_timing_profile) {
                     uid_profile_build_sec += bgj_cuda_host_wall_time() - uid_profile_phase_t0;
                 }
                 uid_profile_candidates = candidates.size();
                 uid_profile_touched_locks = touched_slots.size();
 
-                uid_profile_phase_t0 = uid_batch_profile ? bgj_cuda_host_wall_time() : 0.0;
+                uid_profile_phase_t0 = uid_timing_profile ? bgj_cuda_host_wall_time() : 0.0;
                 uint32_t offset = 0;
                 for (uint32_t i = 0; i < touched_slots.size(); i++) {
                     const uint32_t slot = touched_slots[i];
@@ -1380,11 +1601,11 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
                     const uint32_t slot = candidates[i].slot;
                     order[slot_cursor[slot]++] = i;
                 }
-                if (uid_batch_profile) {
+                if (uid_timing_profile) {
                     uid_profile_group_sec += bgj_cuda_host_wall_time() - uid_profile_phase_t0;
                 }
 
-                uid_profile_phase_t0 = uid_batch_profile ? bgj_cuda_host_wall_time() : 0.0;
+                uid_profile_phase_t0 = uid_timing_profile ? bgj_cuda_host_wall_time() : 0.0;
                 for (uint32_t i = 0; i < touched_slots.size(); i++) {
                     const uint32_t slot = touched_slots[i];
                     const uint32_t begin = slot_offsets[slot];
@@ -1397,11 +1618,11 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
                     }
                     pthread_spin_unlock(&pool->uid->uid_lock[slot].a);
                 }
-                if (uid_batch_profile) {
+                if (uid_timing_profile) {
                     uid_profile_insert_sec += bgj_cuda_host_wall_time() - uid_profile_phase_t0;
                 }
 
-                uid_profile_phase_t0 = uid_batch_profile ? bgj_cuda_host_wall_time() : 0.0;
+                uid_profile_phase_t0 = uid_timing_profile ? bgj_cuda_host_wall_time() : 0.0;
                 uint64_t uid_profile_batch_accepted = 0;
                 for (uint32_t i = 0; i < candidates.size(); i++) {
                     if (!candidates[i].accepted) continue;
@@ -1415,7 +1636,7 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
                     bgj_cuda_add_accepted_solution(sol, candidates[i]);
                 }
                 uid_profile_accepted = uid_profile_batch_accepted;
-                if (uid_batch_profile) {
+                if (uid_timing_profile) {
                     uid_profile_sol_sec += bgj_cuda_host_wall_time() - uid_profile_phase_t0;
                 }
 
@@ -1429,7 +1650,7 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
         }
 
         if (!use_uid_batch) {
-            const double uid_profile_scalar_t0 = uid_batch_profile ? bgj_cuda_host_wall_time() : 0.0;
+            const double uid_profile_scalar_t0 = uid_timing_profile ? bgj_cuda_host_wall_time() : 0.0;
             for (uint32_t i = 0; i < result_count; i++) {
                 const uint32_t x = results[i].x;
                 const uint32_t y = results[i].y;
@@ -1493,9 +1714,12 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
                     break;
                 }
             }
-            if (uid_batch_profile) {
+            if (uid_timing_profile) {
                 uid_profile_scalar_sec += bgj_cuda_host_wall_time() - uid_profile_scalar_t0;
             }
+        }
+        if (uid_timing_profile) {
+            uid_profile_total_sec = bgj_cuda_host_wall_time() - uid_profile_total_t0;
         }
         if (uid_batch_profile) {
             bgj_cuda_uid_batch_profile_record(uid_profile_used_batch,
@@ -1509,7 +1733,7 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
                                               uid_profile_insert_sec,
                                               uid_profile_sol_sec,
                                               uid_profile_scalar_sec,
-                                              bgj_cuda_host_wall_time() - uid_profile_total_t0);
+                                              uid_profile_total_sec);
         }
     }
 
@@ -1536,6 +1760,28 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
                                      uid_sec,
                                      sol_sec,
                                      bgj_cuda_host_wall_time() - consume_t0);
+    }
+    if (consume_profile) {
+        bgj_cuda_consume_profile_record(result_count,
+                                        consume_sorted,
+                                        consume_used_radix,
+                                        uid_profile_used_batch,
+                                        uid_profile_candidates,
+                                        uid_profile_accepted,
+                                        uid_profile_touched_locks,
+                                        consume_rank_sec,
+                                        consume_key_sec,
+                                        consume_radix_sec,
+                                        consume_stdsort_sec,
+                                        consume_write_sec,
+                                        sort_sec,
+                                        uid_profile_build_sec,
+                                        uid_profile_group_sec,
+                                        uid_profile_insert_sec,
+                                        uid_profile_sol_sec,
+                                        uid_profile_scalar_sec,
+                                        uid_profile_total_sec,
+                                        bgj_cuda_host_wall_time() - consume_profile_t0);
     }
     return 1;
 }
