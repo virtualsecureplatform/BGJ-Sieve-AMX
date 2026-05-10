@@ -876,42 +876,93 @@ struct bgj_cuda_result_sort_item_t {
     bgj_cuda_result_t result;
 };
 
-static inline uint32_t bgj_cuda_sort_signed_key(int32_t value)
+enum bgj_cuda_radix_sort_field_t {
+    BGJ_CUDA_SORT_FIELD_Y = 0,
+    BGJ_CUDA_SORT_FIELD_X = 1,
+    BGJ_CUDA_SORT_FIELD_TYPE = 2,
+    BGJ_CUDA_SORT_FIELD_RANK1 = 3,
+    BGJ_CUDA_SORT_FIELD_RANK0 = 4,
+    BGJ_CUDA_SORT_FIELD_PHASE = 5
+};
+
+struct bgj_cuda_radix_sort_pass_t {
+    uint8_t field;
+    uint8_t shift;
+};
+
+static inline uint32_t bgj_cuda_sort_rank_key(int32_t rank)
 {
-    return ((uint32_t)value) ^ 0x80000000u;
+    // Ranks are either -1 or local nonnegative indices; +1 preserves that order.
+    return (uint32_t)((int64_t)rank + 1);
+}
+
+static inline uint32_t bgj_cuda_sort_field_key(const bgj_cuda_result_sort_item_t &item,
+                                               uint8_t field)
+{
+    switch (field) {
+    case BGJ_CUDA_SORT_FIELD_Y:
+        return item.result.y;
+    case BGJ_CUDA_SORT_FIELD_X:
+        return item.result.x;
+    case BGJ_CUDA_SORT_FIELD_TYPE:
+        return item.result.type;
+    case BGJ_CUDA_SORT_FIELD_RANK1:
+        return bgj_cuda_sort_rank_key(item.rank1);
+    case BGJ_CUDA_SORT_FIELD_RANK0:
+        return bgj_cuda_sort_rank_key(item.rank0);
+    case BGJ_CUDA_SORT_FIELD_PHASE:
+        return (uint32_t)item.phase;
+    default:
+        return 0;
+    }
 }
 
 static inline uint32_t bgj_cuda_sort_key_byte(const bgj_cuda_result_sort_item_t &item,
-                                              uint32_t pass)
+                                              const bgj_cuda_radix_sort_pass_t &pass)
 {
-    if (pass < 4) return (item.result.y >> (pass * 8)) & 0xffu;
-    pass -= 4;
-    if (pass < 4) return (item.result.x >> (pass * 8)) & 0xffu;
-    pass -= 4;
-    if (pass < 4) return (item.result.type >> (pass * 8)) & 0xffu;
-    pass -= 4;
-    if (pass < 4) return (bgj_cuda_sort_signed_key(item.rank1) >> (pass * 8)) & 0xffu;
-    pass -= 4;
-    if (pass < 4) return (bgj_cuda_sort_signed_key(item.rank0) >> (pass * 8)) & 0xffu;
-    return ((uint32_t)item.phase) & 0xffu;
+    return (bgj_cuda_sort_field_key(item, pass.field) >> pass.shift) & 0xffu;
+}
+
+static inline void bgj_cuda_radix_add_field_passes(bgj_cuda_radix_sort_pass_t *passes,
+                                                   uint32_t *num_passes,
+                                                   uint8_t field,
+                                                   uint32_t mask)
+{
+    for (uint8_t shift = 0; mask; shift += 8, mask >>= 8) {
+        passes[(*num_passes)++] = {field, shift};
+    }
 }
 
 static void bgj_cuda_radix_sort_items(std::vector<bgj_cuda_result_sort_item_t> &items,
                                       std::vector<bgj_cuda_result_sort_item_t> &scratch,
-                                      uint32_t count)
+                                      uint32_t count,
+                                      uint32_t y_mask,
+                                      uint32_t x_mask,
+                                      uint32_t type_mask,
+                                      uint32_t rank1_mask,
+                                      uint32_t rank0_mask,
+                                      uint32_t phase_mask)
 {
-    static const uint32_t NUM_PASSES = 21;
+    bgj_cuda_radix_sort_pass_t passes[21];
+    uint32_t num_passes = 0;
+    bgj_cuda_radix_add_field_passes(passes, &num_passes, BGJ_CUDA_SORT_FIELD_Y, y_mask);
+    bgj_cuda_radix_add_field_passes(passes, &num_passes, BGJ_CUDA_SORT_FIELD_X, x_mask);
+    bgj_cuda_radix_add_field_passes(passes, &num_passes, BGJ_CUDA_SORT_FIELD_TYPE, type_mask);
+    bgj_cuda_radix_add_field_passes(passes, &num_passes, BGJ_CUDA_SORT_FIELD_RANK1, rank1_mask);
+    bgj_cuda_radix_add_field_passes(passes, &num_passes, BGJ_CUDA_SORT_FIELD_RANK0, rank0_mask);
+    bgj_cuda_radix_add_field_passes(passes, &num_passes, BGJ_CUDA_SORT_FIELD_PHASE, phase_mask);
+
     bgj_cuda_result_sort_item_t *src = items.data();
     bgj_cuda_result_sort_item_t *dst = scratch.data();
     bool in_scratch = false;
 
-    for (uint32_t pass = 0; pass < NUM_PASSES; pass++) {
+    for (uint32_t pass = 0; pass < num_passes; pass++) {
         uint32_t counts[256];
         uint32_t offsets[256];
         memset(counts, 0, sizeof(counts));
 
         for (uint32_t i = 0; i < count; i++) {
-            counts[bgj_cuda_sort_key_byte(src[i], pass)]++;
+            counts[bgj_cuda_sort_key_byte(src[i], passes[pass])]++;
         }
 
         uint32_t offset = 0;
@@ -921,7 +972,7 @@ static void bgj_cuda_radix_sort_items(std::vector<bgj_cuda_result_sort_item_t> &
         }
 
         for (uint32_t i = 0; i < count; i++) {
-            const uint32_t key = bgj_cuda_sort_key_byte(src[i], pass);
+            const uint32_t key = bgj_cuda_sort_key_byte(src[i], passes[pass]);
             dst[offsets[key]++] = src[i];
         }
 
@@ -999,6 +1050,12 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
             return 0;
         }
         uint32_t phase_count[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        uint32_t y_mask = 0;
+        uint32_t x_mask = 0;
+        uint32_t type_mask = 0;
+        uint32_t rank1_mask = 0;
+        uint32_t rank0_mask = 0;
+        uint32_t phase_mask = 0;
         for (uint32_t i = 0; i < result_count; i++) {
             bgj_cuda_result_sort_item_t &item = sort_items[i];
             item.result = results[i];
@@ -1023,12 +1080,26 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
                                              rank_epoch,
                                              0);
             phase_count[(uint32_t)item.phase]++;
+            y_mask |= item.result.y;
+            x_mask |= item.result.x;
+            type_mask |= item.result.type;
+            rank1_mask |= bgj_cuda_sort_rank_key(item.rank1);
+            rank0_mask |= bgj_cuda_sort_rank_key(item.rank0);
+            phase_mask |= (uint32_t)item.phase;
         }
 
         const int use_radix_sort = bgj_cuda_radix_sort_requested() &&
                                    result_count >= bgj_cuda_radix_sort_min_results();
         if (use_radix_sort) {
-            bgj_cuda_radix_sort_items(sort_items, sort_phase_items, result_count);
+            bgj_cuda_radix_sort_items(sort_items,
+                                      sort_phase_items,
+                                      result_count,
+                                      y_mask,
+                                      x_mask,
+                                      type_mask,
+                                      rank1_mask,
+                                      rank0_mask,
+                                      phase_mask);
         } else {
             uint32_t phase_begin[9];
             phase_begin[0] = 0;
