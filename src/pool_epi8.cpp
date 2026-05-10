@@ -1288,7 +1288,6 @@ int Pool_epi8_t<nb>::tail_LLL(double delta, long n) {
     int32_t _dshift_old = 0;
     const int tail_use_fplll = bgj_tail_lll_use_fplll();
     const int tail_use_custom_deep = bgj_tail_deep_lll_use_custom();
-    const double tail_max_abs = 1.0e18;
     const double tail_min_row_abs = 1.0e-30;
 
     auto lattice_entries_are_sane = [&](Lattice_QP *L, const char **reason) -> int {
@@ -1307,10 +1306,6 @@ int Pool_epi8_t<nb>::tail_LLL(double delta, long n) {
                     return 0;
                 }
                 const double abs_hi = fabs(hi);
-                if (abs_hi > tail_max_abs) {
-                    if (reason) *reason = "oversized local basis entry";
-                    return 0;
-                }
                 if (abs_hi > row_max) row_max = abs_hi;
             }
             if (row_max <= tail_min_row_abs) {
