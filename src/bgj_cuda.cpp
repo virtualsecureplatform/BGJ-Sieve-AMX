@@ -591,7 +591,7 @@ static int bgj_cuda_pinned_results_requested()
     static const int requested = []() {
         const char *env = getenv("BGJ_CUDA_PINNED_RESULTS");
         if (env && env[0]) return env[0] != '0' ? 1 : 0;
-        return 0;
+        return 1;
     }();
     return requested;
 }
@@ -698,7 +698,8 @@ static int bgj_cuda_overflow_fallback_requested()
 static int bgj_cuda_sort_results_requested()
 {
     const char *env = getenv("BGJ_CUDA_SORT_RESULTS");
-    return env && env[0] && env[0] != '0';
+    if (env && env[0]) return env[0] != '0';
+    return bgj_cuda_pinned_results_requested();
 }
 
 int bgj_cuda_materialize_requested()
