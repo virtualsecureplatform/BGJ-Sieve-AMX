@@ -830,6 +830,13 @@ static int bgj_cuda_local_rank(const bgj_cuda_result_t &result,
     }
 }
 
+struct bgj_cuda_result_sort_item_t {
+    int32_t phase;
+    int32_t rank0;
+    int32_t rank1;
+    bgj_cuda_result_t result;
+};
+
 template <uint32_t nb, bool record_dp, bool profiling>
 static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
                                          bucket_epi8_t<record_dp> *bkt,
@@ -851,6 +858,7 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
         static thread_local std::vector<int32_t> n_rank;
         static thread_local std::vector<uint32_t> p_rank_stamp;
         static thread_local std::vector<uint32_t> n_rank_stamp;
+        static thread_local std::vector<bgj_cuda_result_sort_item_t> sort_items;
         static thread_local uint32_t rank_epoch = 1;
 
         rank_epoch++;
@@ -883,21 +891,48 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
                 n_rank_stamp[bkt->nvec[i]] = rank_epoch;
             }
         }
-        std::sort(results, results + result_count,
-                  [](const bgj_cuda_result_t &a, const bgj_cuda_result_t &b) {
-                      const int phase_a = bgj_cuda_result_phase(a, p_rank, p_rank_stamp, n_rank, n_rank_stamp, rank_epoch);
-                      const int phase_b = bgj_cuda_result_phase(b, p_rank, p_rank_stamp, n_rank, n_rank_stamp, rank_epoch);
-                      if (phase_a != phase_b) return phase_a < phase_b;
-                      const int a0 = bgj_cuda_local_rank(a, p_rank, p_rank_stamp, n_rank, n_rank_stamp, rank_epoch, 1);
-                      const int b0 = bgj_cuda_local_rank(b, p_rank, p_rank_stamp, n_rank, n_rank_stamp, rank_epoch, 1);
-                      if (a0 != b0) return a0 < b0;
-                      const int a1 = bgj_cuda_local_rank(a, p_rank, p_rank_stamp, n_rank, n_rank_stamp, rank_epoch, 0);
-                      const int b1 = bgj_cuda_local_rank(b, p_rank, p_rank_stamp, n_rank, n_rank_stamp, rank_epoch, 0);
-                      if (a1 != b1) return a1 < b1;
-                      if (a.type != b.type) return a.type < b.type;
-                      if (a.x != b.x) return a.x < b.x;
-                      return a.y < b.y;
+        try {
+            sort_items.resize((size_t)result_count);
+        } catch (...) {
+            return 0;
+        }
+        for (uint32_t i = 0; i < result_count; i++) {
+            bgj_cuda_result_sort_item_t &item = sort_items[i];
+            item.result = results[i];
+            item.phase = bgj_cuda_result_phase(item.result,
+                                               p_rank,
+                                               p_rank_stamp,
+                                               n_rank,
+                                               n_rank_stamp,
+                                               rank_epoch);
+            item.rank0 = bgj_cuda_local_rank(item.result,
+                                             p_rank,
+                                             p_rank_stamp,
+                                             n_rank,
+                                             n_rank_stamp,
+                                             rank_epoch,
+                                             1);
+            item.rank1 = bgj_cuda_local_rank(item.result,
+                                             p_rank,
+                                             p_rank_stamp,
+                                             n_rank,
+                                             n_rank_stamp,
+                                             rank_epoch,
+                                             0);
+        }
+        std::sort(sort_items.begin(), sort_items.begin() + result_count,
+                  [](const bgj_cuda_result_sort_item_t &a,
+                     const bgj_cuda_result_sort_item_t &b) {
+                      if (a.phase != b.phase) return a.phase < b.phase;
+                      if (a.rank0 != b.rank0) return a.rank0 < b.rank0;
+                      if (a.rank1 != b.rank1) return a.rank1 < b.rank1;
+                      if (a.result.type != b.result.type) return a.result.type < b.result.type;
+                      if (a.result.x != b.result.x) return a.result.x < b.result.x;
+                      return a.result.y < b.result.y;
                   });
+        for (uint32_t i = 0; i < result_count; i++) {
+            results[i] = sort_items[i].result;
+        }
         sort_sec = bgj_cuda_host_wall_time() - sort_t0;
     }
 
