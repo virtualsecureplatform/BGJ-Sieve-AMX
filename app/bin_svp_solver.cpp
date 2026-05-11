@@ -225,6 +225,13 @@ static int solver_svp120_should_run_final_lsh(Lattice_QP *L, double *target_out)
     return run;
 }
 
+static int solver_svp120_quality_satisfied(Lattice_QP *L, double target, solver_best_candidate_t *candidate_out)
+{
+    const solver_best_candidate_t candidate = solver_find_best_candidate(L);
+    if (candidate_out) *candidate_out = candidate;
+    return target > 0.0 && candidate.length > 0.0 && candidate.length <= target;
+}
+
 #define SOLVER_PROFILE_DO(label, stmt) do {               \
         double __solver_profile_t0 = solver_now();        \
         stmt;                                             \
@@ -373,10 +380,71 @@ int _svp_solver_red(Lattice_QP* L, long algo) {
         SOLVER_PROFILE_DO("120t95 local_lsh_75_20_120_b", __local_lsh_pump(L, 75, 25, 20, 120));
         SOLVER_PROFILE_DO("120t95 lsh_pump_90_30_q035", __lsh_pump_red_epi8(L, num_threads, 1.1, 0.35, 90, 30, 24, 0, 24, 0, 0, 45));
         SOLVER_PROFILE_DO("120t95 local_pump_85_15_120", __local_pump(L, 85, 20, 15, 120));
-        SOLVER_PROFILE_DO("120t95 lsh_pump_92_28_q035", __lsh_pump_red_epi8(L, num_threads, 1.1, 0.35, 92, 28, 24, 0, 24, 0, 0, 45));
-        SOLVER_PROFILE_DO("120t95 local_pump_85_15_120_b", __local_pump(L, 85, 20, 15, 120));
-        double final_lsh_target = 0.0;
-        if (solver_svp120_should_run_final_lsh(L, &final_lsh_target)) {
+        double final_lsh_target = solver_svp120_final_lsh_target(L);
+        const int final_lsh_mode = solver_svp120_final_lsh_mode();
+        const double lsh_pump_stop_length = (final_lsh_mode == 2) ?
+            solver_env_double("BGJ_120T95_LSH_PUMP_STOP_LENGTH", final_lsh_target) : 0.0;
+        SOLVER_PROFILE_DO("120t95 lsh_pump_92_28_q035",
+                          __lsh_pump_red_epi8(L, num_threads, 1.1, 0.35, 92, 28, 24, 0, 24, 0, 0, 45,
+                                              lsh_pump_stop_length));
+        solver_best_candidate_t quality_candidate;
+        long retry_count = 0;
+        int final_lsh_decided = 0;
+        int run_final_lsh = 0;
+        if (final_lsh_mode == 2 && solver_svp120_quality_satisfied(L, final_lsh_target, &quality_candidate)) {
+            if (profile) {
+                printf("quality_stop: algo=120t95 after=lsh_pump_92 current_best=%.9g source=%s target=%.9g skip_local_pump_b=1\n",
+                       quality_candidate.length, quality_candidate.source, final_lsh_target);
+                fflush(stdout);
+            }
+        } else {
+            retry_count = (final_lsh_mode == 2) ? solver_env_long("BGJ_120T95_LSH_RETRY", 0) : 0;
+            const long retry_msd = solver_env_long("BGJ_120T95_LSH_RETRY_MSD", 92);
+            const long retry_f = solver_env_long("BGJ_120T95_LSH_RETRY_F", 28);
+            const long retry_ni = solver_env_long("BGJ_120T95_LSH_RETRY_NI", 1);
+            const long retry_ne = solver_env_long("BGJ_120T95_LSH_RETRY_NE", 0);
+            const long retry_ns = solver_env_long("BGJ_120T95_LSH_RETRY_NS", 0);
+            const long retry_minsd = solver_env_long("BGJ_120T95_LSH_RETRY_MINSD", 45);
+            const double retry_qratio = solver_env_double("BGJ_120T95_LSH_RETRY_QRATIO", 0.35);
+            for (long retry = 0; retry < retry_count; ++retry) {
+                char retry_label[128];
+                snprintf(retry_label, sizeof(retry_label),
+                         "120t95 lsh_pump_92_retry_%ld", retry + 1);
+                SOLVER_PROFILE_DO(retry_label,
+                                  __lsh_pump_red_epi8(L, num_threads, 1.1, retry_qratio,
+                                                      retry_msd, retry_f, retry_ni, retry_ne,
+                                                      retry_ns, 0, 0, retry_minsd,
+                                                      lsh_pump_stop_length));
+                if (solver_svp120_quality_satisfied(L, final_lsh_target, &quality_candidate)) {
+                    if (profile) {
+                        printf("quality_stop: algo=120t95 after=lsh_pump_92_retry_%ld current_best=%.9g source=%s target=%.9g skip_local_pump_b=1\n",
+                               retry + 1, quality_candidate.length,
+                               quality_candidate.source, final_lsh_target);
+                        fflush(stdout);
+                    }
+                    break;
+                }
+            }
+            if (!solver_svp120_quality_satisfied(L, final_lsh_target, &quality_candidate)) {
+                const int keep_local_b = solver_env_long("BGJ_120T95_LOCAL_PUMP_B_BEFORE_RESCUE", 1) != 0;
+                if (final_lsh_mode == 2 && !keep_local_b) {
+                    run_final_lsh = solver_svp120_should_run_final_lsh(L, &final_lsh_target);
+                    final_lsh_decided = 1;
+                    if (run_final_lsh && profile) {
+                        printf("local_pump_skip: algo=120t95 after=lsh_pump_92 current_best=%.9g source=%s target=%.9g skip_local_pump_b=1 reason=final_lsh_rescue\n",
+                               quality_candidate.length, quality_candidate.source, final_lsh_target);
+                        fflush(stdout);
+                    }
+                }
+                if (!run_final_lsh) {
+                    SOLVER_PROFILE_DO("120t95 local_pump_85_15_120_b", __local_pump(L, 85, 20, 15, 120));
+                }
+            }
+        }
+        if (!final_lsh_decided) {
+            run_final_lsh = solver_svp120_should_run_final_lsh(L, &final_lsh_target);
+        }
+        if (run_final_lsh) {
             const double final_qratio = solver_env_double("BGJ_120T95_FINAL_LSH_QRATIO", 0.6);
             const double final_ext_qratio = solver_env_double("BGJ_120T95_FINAL_LSH_EXT_QRATIO", final_qratio);
             const long final_msd = solver_env_long("BGJ_120T95_FINAL_LSH_MSD", 102);
@@ -384,6 +452,10 @@ int _svp_solver_red(Lattice_QP* L, long algo) {
             const long final_log = solver_env_long("BGJ_120T95_FINAL_LSH_LOG", 3);
             const long final_shuffle = solver_env_long("BGJ_120T95_FINAL_LSH_SHUFFLE_FIRST", 0);
             const long final_minsd = solver_env_long("BGJ_120T95_FINAL_LSH_MINSD", 40);
+            const long final_lift_margin = solver_env_long("BGJ_120T95_FINAL_LSH_LIFT_MARGIN", 12);
+            const long final_lift_start_default = final_msd - final_lift_margin;
+            const long final_lift_start = solver_env_long("BGJ_120T95_FINAL_LSH_LIFT_START_CSD",
+                                                          final_lift_start_default);
             const double final_stop_length = solver_env_double("BGJ_120T95_FINAL_LSH_STOP_LENGTH",
                                                                final_lsh_target);
             double final_lsh_length = 0.0;
@@ -400,7 +472,8 @@ int _svp_solver_red(Lattice_QP* L, long algo) {
                                                                        final_log,
                                                                        final_shuffle,
                                                                        final_minsd,
-                                                                       final_stop_length));
+                                                                       final_stop_length,
+                                                                       final_lift_start));
             if (final_lsh_length > 0.0) {
                 printf("final_lsh_best: algo=120t95 length=%.9g\n", final_lsh_length);
             }

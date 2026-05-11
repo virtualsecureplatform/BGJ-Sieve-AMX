@@ -64,6 +64,18 @@ static double svp_profile_now()
     return tv.tv_sec + (double)tv.tv_usec / 1000000.0;
 }
 
+static int svp_lsh_best_at_or_below(long dimension, double stop_length, double *best_length)
+{
+    if (best_length) *best_length = 0.0;
+    if (stop_length <= 0.0 || dimension <= 0) return 0;
+    double length = 0.0;
+    long record_dimension = 0;
+    if (!bgj_lsh_best_solution_get(&length, NULL, dimension, &record_dimension)) return 0;
+    if (record_dimension != dimension || length <= 0.0) return 0;
+    if (best_length) *best_length = length;
+    return length <= stop_length;
+}
+
 #define SVP_PROFILE_DO(acc, stmt) do {                             \
         if (pump_profile) {                                        \
             double __svp_profile_t0 = svp_profile_now();           \
@@ -462,7 +474,7 @@ void __pump_red_epi8(Lattice_QP *L, long num_threads, double eta, long msd, long
              total_time, num_threads, (total_time * num_threads), dPot);
 }
 
-void __lsh_pump_red_epi8(Lattice_QP *L, long num_threads, double eta, double qratio, long msd, long f, long ni, long ne, long ns, long log_level, long shuffle_first, long minsd) {
+void __lsh_pump_red_epi8(Lattice_QP *L, long num_threads, double eta, double qratio, long msd, long f, long ni, long ne, long ns, long log_level, long shuffle_first, long minsd, double stop_length) {
     if (min(msd, L->NumRows()) < minsd){
         fprintf(stderr, "[Warning] sieving dimension too small, may get stuck, nothing done.\nYou can use Enum based algorithms instead.\n");
         return;
@@ -508,6 +520,8 @@ void __lsh_pump_red_epi8(Lattice_QP *L, long num_threads, double eta, double qra
     long profile_bgj3_count = 0;
     long profile_insert_count = 0;
     long profile_tail_lll_count = 0;
+    int profile_stop_hit = 0;
+    double profile_stop_best_length = 0.0;
 
 
     bool GET_STUCKED = shuffle_first;
@@ -586,6 +600,10 @@ void __lsh_pump_red_epi8(Lattice_QP *L, long num_threads, double eta, double qra
                         SVP_PROFILE_DO(profile_insert, p.insert(ind, eta));                                     \
                     }                                                                                           \
                     profile_insert_count++;                                                                     \
+                    if (svp_lsh_best_at_or_below(L->NumCols(), stop_length, &profile_stop_best_length)) {        \
+                        profile_stop_hit = 1;                                                                   \
+                        break;                                                                                  \
+                    }                                                                                           \
                     int tlll_dim = 32;                                                                          \
                     for (long i = 32; i < p.CSD; i++) {                                                         \
                         if (L->get_B().hi[p.CSD-i+p.index_l] <  0.49 * L->get_B().hi[p.CSD-i-1+p.index_l]) {    \
@@ -653,8 +671,9 @@ void __lsh_pump_red_epi8(Lattice_QP *L, long num_threads, double eta, double qra
     SVP_PROFILE_DO(profile_final_lll, L->LLL_QP(0.99));
     if (pump_profile) {
         fprintf(stderr,
-                "lsh_pump_profile: seq=%ld n=%ld msd=%ld f=%ld minsd=%ld cuda_bgj1=%d total=%.6fs shuffle_gso=%.6fs setup=%.6fs sampling=%.6fs extend=%.6fs bgj1=%.6fs/%ld bgj2=%.6fs/%ld bgj3=%.6fs/%ld insert=%.6fs/%ld tail_lll=%.6fs/%ld shrink=%.6fs final_lll=%.6fs\n",
-                profile_seq, n, msd, f, minsd, profile_cuda_bgj1, svp_profile_now() - profile_total_start,
+                "lsh_pump_profile: seq=%ld n=%ld msd=%ld f=%ld minsd=%ld cuda_bgj1=%d stop_length=%.9g early_stop=%d stop_best=%.9g total=%.6fs shuffle_gso=%.6fs setup=%.6fs sampling=%.6fs extend=%.6fs bgj1=%.6fs/%ld bgj2=%.6fs/%ld bgj3=%.6fs/%ld insert=%.6fs/%ld tail_lll=%.6fs/%ld shrink=%.6fs final_lll=%.6fs\n",
+                profile_seq, n, msd, f, minsd, profile_cuda_bgj1, stop_length, profile_stop_hit,
+                profile_stop_best_length, svp_profile_now() - profile_total_start,
                 profile_shuffle_gso, profile_pool_setup, profile_sampling, profile_extend,
                 profile_sieve_bgj1, profile_bgj1_count, profile_sieve_bgj2, profile_bgj2_count,
                 profile_sieve_bgj3, profile_bgj3_count, profile_insert, profile_insert_count,
@@ -671,7 +690,7 @@ void __lsh_pump_red_epi8(Lattice_QP *L, long num_threads, double eta, double qra
              total_time, num_threads, (total_time * num_threads), dPot);
 }
 
-double __last_lsh_pump_epi8(Lattice_QP *L, long num_threads, double qratio, double ext_qratio, long msd, long ext_d, long log_level, long shuffle_first, long minsd, double stop_length) {
+double __last_lsh_pump_epi8(Lattice_QP *L, long num_threads, double qratio, double ext_qratio, long msd, long ext_d, long log_level, long shuffle_first, long minsd, double stop_length, long lift_start_csd) {
     if (min(msd, L->NumRows()) < minsd){
         fprintf(stderr, "[Warning] sieving dimension too small, may get stuck, nothing done.\nYou can use Enum based algorithms instead.\n");
         return 0.0;
@@ -689,6 +708,9 @@ double __last_lsh_pump_epi8(Lattice_QP *L, long num_threads, double qratio, doub
     const long n = L->NumRows();
     if (msd > n) msd = n;
     if (msd + ext_d > n) ext_d = n - msd;
+    if (lift_start_csd <= 0) lift_start_csd = msd - 12;
+    if (lift_start_csd < minsd) lift_start_csd = minsd;
+    if (lift_start_csd > msd + ext_d) lift_start_csd = msd + ext_d;
     double best_lift_length = 0.0;
 
     const int pump_profile = svp_pump_profile_enabled();
@@ -762,7 +784,7 @@ double __last_lsh_pump_epi8(Lattice_QP *L, long num_threads, double qratio, doub
                     SVP_PROFILE_ASSIGN(profile_sieve_bgj1, ret, svp_bgj1_sieve(p, log_level-3, 1));         \
                     profile_bgj1_count++;                                                                   \
                 }                                                                                           \
-                if (p.CSD >= msd - 12) {                                                                    \
+                if (p.CSD >= lift_start_csd) {                                                               \
                     double __svp_lift_profile_t0 = pump_profile ? svp_profile_now() : 0.0;                  \
                     if (p.CSD < n - 24 && (((p.CSD >= msd) && ext_qratio != 0.0) || ((p.CSD < msd) && qratio != 0.0))) { \
                         p.show_lsfsh_insert(0, 10.0, log_level-3, 0, 0, (p.CSD>=msd)?ext_qratio:qratio);    \
@@ -809,8 +831,9 @@ double __last_lsh_pump_epi8(Lattice_QP *L, long num_threads, double qratio, doub
     SVP_PROFILE_DO(profile_final_lll, L->LLL_QP(0.99));
     if (pump_profile) {
         fprintf(stderr,
-                "last_lsh_profile: n=%ld msd=%ld ext_d=%ld minsd=%ld stop_length=%.9g early_stop=%d total=%.6fs setup=%.6fs sampling=%.6fs extend=%.6fs bgj1=%.6fs/%ld bgj2=%.6fs/%ld bgj3=%.6fs/%ld show_lift=%.6fs/%ld final_lll=%.6fs\n",
-                n, msd, ext_d, minsd, stop_length, profile_stop_hit, svp_profile_now() - profile_total_start,
+                "last_lsh_profile: n=%ld msd=%ld ext_d=%ld minsd=%ld lift_start_csd=%ld stop_length=%.9g early_stop=%d total=%.6fs setup=%.6fs sampling=%.6fs extend=%.6fs bgj1=%.6fs/%ld bgj2=%.6fs/%ld bgj3=%.6fs/%ld show_lift=%.6fs/%ld final_lll=%.6fs\n",
+                n, msd, ext_d, minsd, lift_start_csd, stop_length, profile_stop_hit,
+                svp_profile_now() - profile_total_start,
                 profile_pool_setup, profile_sampling, profile_extend,
                 profile_sieve_bgj1, profile_bgj1_count, profile_sieve_bgj2, profile_bgj2_count,
                 profile_sieve_bgj3, profile_bgj3_count, profile_show_lift, profile_show_lift_count,

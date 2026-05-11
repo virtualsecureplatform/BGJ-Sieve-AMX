@@ -22,9 +22,9 @@ void __pump_red(Lattice_QP *L, long num_threads, double eta, long msd, long f, l
  */
 void __pump_red_epi8(Lattice_QP *L, long num_threads, double eta, long msd, long f, long ni, long ne, long ns, long log_level, long shuffle_first = 1, long minsd = 40);
 
-void __lsh_pump_red_epi8(Lattice_QP *L, long num_threads, double eta, double qratio, long msd, long f, long ni, long ne, long ns, long log_level, long shuffle_first = 1, long minsd = 40);
+void __lsh_pump_red_epi8(Lattice_QP *L, long num_threads, double eta, double qratio, long msd, long f, long ni, long ne, long ns, long log_level, long shuffle_first = 1, long minsd = 40, double stop_length = 0.0);
 
-double __last_lsh_pump_epi8(Lattice_QP *L, long num_threads, double qratio, double ext_qratio, long msd, long ext_d, long log_level, long shuffle_first, long minsd, double stop_length = 0.0);
+double __last_lsh_pump_epi8(Lattice_QP *L, long num_threads, double qratio, double ext_qratio, long msd, long ext_d, long log_level, long shuffle_first, long minsd, double stop_length = 0.0, long lift_start_csd = 0);
 
 #if defined(__AMX_INT8__)
 void __pump_red_amx(Lattice_QP *L, long num_threads, double eta, long msd, long f, long ni, long ne, long ns, long log_level, long shuffle_first = 1, long minsd = 40);

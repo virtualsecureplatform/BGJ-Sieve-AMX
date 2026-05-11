@@ -92,8 +92,24 @@ compares the best basis row and the best recorded LSH candidate against
 standalone final LSH pass only if that candidate is still worse. Set
 `BGJ_SVP_FINAL_LSH=0` to disable the rescue or `BGJ_SVP_FINAL_LSH=force` to run
 it unconditionally. `BGJ_120T95_FINAL_LSH_TARGET=<length>` sets an absolute
-target, and `BGJ_120T95_FINAL_LSH_STOP_LENGTH=<length>` overrides the rescue
-early-stop threshold.
+target. The final full-dimensional `lsh_pump_92` also stops early in auto mode
+once it records a candidate at the same target, skipping the trailing local pump
+and rescue; override that with `BGJ_120T95_LSH_PUMP_STOP_LENGTH=<length>`.
+If that pump misses, `BGJ_120T95_LSH_RETRY=<n>` can run one or more
+single-insert late-LSH probes before final rescue; it defaults to `0` because
+the probe is only useful when it avoids the rescue. Tune
+`BGJ_120T95_LSH_RETRY_NI`, `BGJ_120T95_LSH_RETRY_MSD`,
+`BGJ_120T95_LSH_RETRY_F`, and `BGJ_120T95_LSH_RETRY_QRATIO`.
+When auto mode decides the final rescue is needed, the trailing
+`local_pump_85_15_120_b` remains enabled by default to preserve the validated
+rescue trajectory; set `BGJ_120T95_LOCAL_PUMP_B_BEFORE_RESCUE=0` to skip it
+for experiments.
+The final rescue delays lift probes until `BGJ_120T95_FINAL_LSH_LIFT_MARGIN`
+below the final MSD, default `12`; use
+`BGJ_120T95_FINAL_LSH_LIFT_START_CSD=<dim>` for an absolute start point.
+Smaller margins reduce rescue lift probes but can miss the best lifted vector.
+`BGJ_120T95_FINAL_LSH_STOP_LENGTH=<length>` overrides the rescue early-stop
+threshold.
 For BGJ2, CUDA search is enabled for first-level reuse buckets by default.
 Second-level subbucket search is available but off by default for SVP quality.
 `BGJ_CUDA_BGJ2_SEARCH=0` disables BGJ2 search offload,
