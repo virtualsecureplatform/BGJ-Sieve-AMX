@@ -1266,6 +1266,9 @@ int Pool_epi8_t<nb>::show_min_lift(long index) {
     last_lift_lift_norm = lift_norm;
     last_lift_gh = gh;
     last_lift_approx_factor = approx;
+    if (index == 0) {
+        bgj_lsh_best_solution_record(euclidean_norm, v_QP.hi, basis->NumCols());
+    }
     printf("\nlength = %.9g(%.9g), gh = %.9g, approx = %.9g, vec = ",
            euclidean_norm, lift_norm, gh, approx);
     PRINT_VEC(v_QP.hi, basis->NumCols());

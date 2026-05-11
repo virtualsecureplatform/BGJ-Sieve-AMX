@@ -84,12 +84,22 @@ unless `BGJ_CUDA_MATERIALIZE=1` is set. This avoids the small-bucket launch and
 materialization overheads that make low-dimensional pump stages slower than the
 CPU path.
 `app/svp_solver` also accepts `--cuda`; it enables the same
-`BGJ_SVP_CUDA=1` hook used by the solver internals.
-For BGJ2, CUDA search is enabled for both first-level reuse buckets and
-second-level subbuckets by default. `BGJ_CUDA_BGJ2_SEARCH=0` disables BGJ2
-search offload, `BGJ_CUDA_BGJ2_SEARCH0=0` disables only the first-level reuse
-buckets, `BGJ_CUDA_BGJ2_SEARCH1=0` disables only the second-level subbucket
-search, and `BGJ_CUDA_BGJ2_MIN_DOTS` sets the BGJ2-only search threshold.
+`BGJ_SVP_CUDA=1` hook used by the solver internals and enables CUDA LSH search
+unless `BGJ_CUDA_LSH_SEARCH=0` is set. For the `120t95` schedule, the default
+final LSH policy is an automatic quality rescue: after the normal schedule it
+compares the best basis row and the best recorded LSH candidate against
+`BGJ_120T95_FINAL_LSH_TARGET_FACTOR` times GH, default `0.97`, and runs the
+standalone final LSH pass only if that candidate is still worse. Set
+`BGJ_SVP_FINAL_LSH=0` to disable the rescue or `BGJ_SVP_FINAL_LSH=force` to run
+it unconditionally. `BGJ_120T95_FINAL_LSH_TARGET=<length>` sets an absolute
+target, and `BGJ_120T95_FINAL_LSH_STOP_LENGTH=<length>` overrides the rescue
+early-stop threshold.
+For BGJ2, CUDA search is enabled for first-level reuse buckets by default.
+Second-level subbucket search is available but off by default for SVP quality.
+`BGJ_CUDA_BGJ2_SEARCH=0` disables BGJ2 search offload,
+`BGJ_CUDA_BGJ2_SEARCH0=0` disables only the first-level reuse buckets,
+`BGJ_CUDA_BGJ2_SEARCH1=1` enables the second-level subbucket search, and
+`BGJ_CUDA_BGJ2_MIN_DOTS` sets the BGJ2-only search threshold.
 BGJ2-only search batching can be tested with `BGJ_CUDA_BGJ2_BATCH=1` or
 `BGJ_CUDA_BGJ2_BATCH_SIZE=<n>` without changing the BGJ1 batch setting. In a
 May 2026 A100/GPU1 dim-96 direct BGJ2 run, enabling second-level CUDA search

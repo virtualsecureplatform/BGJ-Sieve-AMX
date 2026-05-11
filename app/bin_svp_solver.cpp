@@ -110,6 +110,15 @@ struct solver_best_row_t {
     double length;
 };
 
+struct solver_best_candidate_t {
+    double length;
+    const char *source;
+    long basis_index;
+    double basis_length;
+    double lsh_length;
+    int has_lsh;
+};
+
 static solver_best_row_t solver_find_best_basis_row(Lattice_QP *L)
 {
     solver_best_row_t best;
@@ -123,6 +132,97 @@ static solver_best_row_t solver_find_best_basis_row(Lattice_QP *L)
         }
     }
     return best;
+}
+
+static solver_best_candidate_t solver_find_best_candidate(Lattice_QP *L)
+{
+    const solver_best_row_t basis = solver_find_best_basis_row(L);
+    solver_best_candidate_t best;
+    best.length = basis.length;
+    best.source = "basis";
+    best.basis_index = basis.index;
+    best.basis_length = basis.length;
+    best.lsh_length = 0.0;
+    best.has_lsh = 0;
+
+    long lsh_dim = 0;
+    double lsh_length = 0.0;
+    if (bgj_lsh_best_solution_get(&lsh_length, NULL, L->NumCols(), &lsh_dim) &&
+        lsh_dim == L->NumCols() && lsh_length > 0.0) {
+        best.has_lsh = 1;
+        best.lsh_length = lsh_length;
+        if (lsh_length < best.length) {
+            best.length = lsh_length;
+            best.source = "lsh_best";
+        }
+    }
+    return best;
+}
+
+static int solver_env_flag_value(const char *env, int default_value)
+{
+    if (env == NULL || env[0] == '\0') return default_value;
+    if (!strcasecmp(env, "0") || !strcasecmp(env, "false") ||
+        !strcasecmp(env, "no") || !strcasecmp(env, "off")) return 0;
+    return 1;
+}
+
+static int solver_svp120_final_lsh_mode()
+{
+    const char *env = getenv("BGJ_SVP_FINAL_LSH");
+    if (env == NULL || env[0] == '\0') return 2;
+    if (!strcasecmp(env, "auto")) return 2;
+    if (!strcasecmp(env, "default")) return 2;
+    if (!strcasecmp(env, "force")) return 1;
+    if (!strcasecmp(env, "always")) return 1;
+    return solver_env_flag_value(env, 0);
+}
+
+static double solver_svp120_final_lsh_target(Lattice_QP *L)
+{
+    double target = solver_env_double("BGJ_120T95_FINAL_LSH_TARGET", 0.0);
+    if (target <= 0.0) {
+        const double target_factor = solver_env_double("BGJ_120T95_FINAL_LSH_TARGET_FACTOR", 0.97);
+        target = L->gh() * target_factor;
+    }
+    return target;
+}
+
+static int solver_svp120_should_run_final_lsh(Lattice_QP *L, double *target_out)
+{
+    const int mode = solver_svp120_final_lsh_mode();
+    const double target = solver_svp120_final_lsh_target(L);
+    if (target_out) *target_out = target;
+    if (mode == 0) {
+        if (profile) {
+            printf("final_lsh_policy: algo=120t95 mode=off final_lsh=skip\n");
+            fflush(stdout);
+        }
+        return 0;
+    }
+    if (mode == 1) {
+        if (profile) {
+            printf("final_lsh_policy: algo=120t95 mode=force target=%.9g final_lsh=run\n", target);
+            fflush(stdout);
+        }
+        return 1;
+    }
+
+    const solver_best_candidate_t best = solver_find_best_candidate(L);
+    const int run = best.length > target;
+    if (profile) {
+        if (best.has_lsh) {
+            printf("final_lsh_policy: algo=120t95 mode=auto basis_best=%.9g lsh_best=%.9g current_best=%.9g source=%s target=%.9g final_lsh=%s\n",
+                   best.basis_length, best.lsh_length, best.length, best.source,
+                   target, run ? "run" : "skip");
+        } else {
+            printf("final_lsh_policy: algo=120t95 mode=auto basis_best=%.9g lsh_best=none current_best=%.9g source=%s target=%.9g final_lsh=%s\n",
+                   best.basis_length, best.length, best.source,
+                   target, run ? "run" : "skip");
+        }
+        fflush(stdout);
+    }
+    return run;
 }
 
 #define SOLVER_PROFILE_DO(label, stmt) do {               \
@@ -275,8 +375,8 @@ int _svp_solver_red(Lattice_QP* L, long algo) {
         SOLVER_PROFILE_DO("120t95 local_pump_85_15_120", __local_pump(L, 85, 20, 15, 120));
         SOLVER_PROFILE_DO("120t95 lsh_pump_92_28_q035", __lsh_pump_red_epi8(L, num_threads, 1.1, 0.35, 92, 28, 24, 0, 24, 0, 0, 45));
         SOLVER_PROFILE_DO("120t95 local_pump_85_15_120_b", __local_pump(L, 85, 20, 15, 120));
-        // the final sieve do not insert to the basis, it only print the short vectors
-        if (solver_env_flag("BGJ_SVP_FINAL_LSH", 0)) {
+        double final_lsh_target = 0.0;
+        if (solver_svp120_should_run_final_lsh(L, &final_lsh_target)) {
             const double final_qratio = solver_env_double("BGJ_120T95_FINAL_LSH_QRATIO", 0.6);
             const double final_ext_qratio = solver_env_double("BGJ_120T95_FINAL_LSH_EXT_QRATIO", final_qratio);
             const long final_msd = solver_env_long("BGJ_120T95_FINAL_LSH_MSD", 102);
@@ -284,6 +384,8 @@ int _svp_solver_red(Lattice_QP* L, long algo) {
             const long final_log = solver_env_long("BGJ_120T95_FINAL_LSH_LOG", 3);
             const long final_shuffle = solver_env_long("BGJ_120T95_FINAL_LSH_SHUFFLE_FIRST", 0);
             const long final_minsd = solver_env_long("BGJ_120T95_FINAL_LSH_MINSD", 40);
+            const double final_stop_length = solver_env_double("BGJ_120T95_FINAL_LSH_STOP_LENGTH",
+                                                               final_lsh_target);
             double final_lsh_length = 0.0;
             char final_lsh_label[128];
             snprintf(final_lsh_label, sizeof(final_lsh_label),
@@ -297,7 +399,8 @@ int _svp_solver_red(Lattice_QP* L, long algo) {
                                                                        final_ext_d,
                                                                        final_log,
                                                                        final_shuffle,
-                                                                       final_minsd));
+                                                                       final_minsd,
+                                                                       final_stop_length));
             if (final_lsh_length > 0.0) {
                 printf("final_lsh_best: algo=120t95 length=%.9g\n", final_lsh_length);
             }
@@ -532,6 +635,9 @@ int main(int argc, char** argv) {
         return 2;
         #else
         setenv("BGJ_SVP_CUDA", "1", 1);
+        if (!solver_env_is_set("BGJ_CUDA_LSH_SEARCH")) {
+            setenv("BGJ_CUDA_LSH_SEARCH", "1", 0);
+        }
         #endif
     }
     if (profile) {
@@ -602,7 +708,7 @@ int main(int argc, char** argv) {
     if (goal_length == 0.0) goal_length = L.gh() * 1.00;
     if (min_len < goal_length) {
         if (use_lsh_best) {
-            printf("possible sol: %s, source = lsh_insert, length = %.2f, time = %.2fs, vec = ",
+            printf("possible sol: %s, source = lsh_best, length = %.2f, time = %.2fs, vec = ",
                    argv[filename_place], min_len, CURRENT_TIME);
             PRINT_VEC(lsh_best_vec.data(), lsh_best_dim);
         } else {

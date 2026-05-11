@@ -671,7 +671,7 @@ void __lsh_pump_red_epi8(Lattice_QP *L, long num_threads, double eta, double qra
              total_time, num_threads, (total_time * num_threads), dPot);
 }
 
-double __last_lsh_pump_epi8(Lattice_QP *L, long num_threads, double qratio, double ext_qratio, long msd, long ext_d, long log_level, long shuffle_first, long minsd) {
+double __last_lsh_pump_epi8(Lattice_QP *L, long num_threads, double qratio, double ext_qratio, long msd, long ext_d, long log_level, long shuffle_first, long minsd, double stop_length) {
     if (min(msd, L->NumRows()) < minsd){
         fprintf(stderr, "[Warning] sieving dimension too small, may get stuck, nothing done.\nYou can use Enum based algorithms instead.\n");
         return 0.0;
@@ -690,6 +690,22 @@ double __last_lsh_pump_epi8(Lattice_QP *L, long num_threads, double qratio, doub
     if (msd > n) msd = n;
     if (msd + ext_d > n) ext_d = n - msd;
     double best_lift_length = 0.0;
+
+    const int pump_profile = svp_pump_profile_enabled();
+    const double profile_total_start = pump_profile ? svp_profile_now() : 0.0;
+    double profile_pool_setup = 0.0;
+    double profile_sampling = 0.0;
+    double profile_extend = 0.0;
+    double profile_sieve_bgj1 = 0.0;
+    double profile_sieve_bgj2 = 0.0;
+    double profile_sieve_bgj3 = 0.0;
+    double profile_show_lift = 0.0;
+    double profile_final_lll = 0.0;
+    long profile_bgj1_count = 0;
+    long profile_bgj2_count = 0;
+    long profile_bgj3_count = 0;
+    long profile_show_lift_count = 0;
+    int profile_stop_hit = 0;
 
     constexpr double pool_size_ratio = 3.2;
 
@@ -716,36 +732,52 @@ double __last_lsh_pump_epi8(Lattice_QP *L, long num_threads, double qratio, doub
         const long max_pool_size = (long)(pow(4./3., msd * 0.5) * pool_size_ratio);
 
         #define __LAST_LSH_PUMP_EPI8_ONE_TRY do {                                                           \
+            double __svp_profile_t0 = pump_profile ? svp_profile_now() : 0.0;                                \
             p.set_num_threads(num_threads);                                                                 \
             long minps = (long)(pow(4./3., minsd * 0.5) * pool_size_ratio);                                 \
             minps *= 3;                                                                                     \
             p.set_max_pool_size((max_pool_size > minps) ? max_pool_size : minps);                           \
             p.set_sieving_context(n-minsd, n);                                                              \
-            p.sampling(minps);                                                                              \
-                                                                                                            \
-            int ret = svp_bgj1_sieve(p, log_level - 3, 1); \
+            if (pump_profile) profile_pool_setup += svp_profile_now() - __svp_profile_t0;                    \
+            int __svp_sampling_ret = 0;                                                                      \
+            SVP_PROFILE_ASSIGN(profile_sampling, __svp_sampling_ret, p.sampling(minps));                     \
+            if (__svp_sampling_ret == -1) return best_lift_length;                                           \
+	                                                                                                            \
+            int ret = 0;                                                                                    \
+            SVP_PROFILE_ASSIGN(profile_sieve_bgj1, ret, svp_bgj1_sieve(p, log_level - 3, 1));               \
+            profile_bgj1_count++;                                                                           \
             num_stuck = ret;                                                                                \
             while (p.CSD < msd + ext_d) {                                                                   \
-                p.extend_left();                                                                            \
+                SVP_PROFILE_DO(profile_extend, p.extend_left());                                             \
                 long target_num_vec = (long) (pow(4./3., min(p.CSD, msd) * 0.5) * pool_size_ratio);         \
                 if (target_num_vec > p.num_vec + p.num_empty) p.num_empty = target_num_vec - p.num_vec;     \
-                                                                                                            \
+	                                                                                                            \
                 if (p.CSD > 92) {                                                                           \
-                    ret = svp_bgj3_sieve(p, log_level-3, 1);                                                \
+                    SVP_PROFILE_ASSIGN(profile_sieve_bgj3, ret, svp_bgj3_sieve(p, log_level-3, 1));         \
+                    profile_bgj3_count++;                                                                   \
                 } else if (p.CSD > 80) {                                                                    \
-                    ret = svp_bgj2_sieve(p, log_level-3, 1);                                                \
+                    SVP_PROFILE_ASSIGN(profile_sieve_bgj2, ret, svp_bgj2_sieve(p, log_level-3, 1));         \
+                    profile_bgj2_count++;                                                                   \
                 } else {                                                                                    \
-                    ret = svp_bgj1_sieve(p, log_level-3, 1); \
+                    SVP_PROFILE_ASSIGN(profile_sieve_bgj1, ret, svp_bgj1_sieve(p, log_level-3, 1));         \
+                    profile_bgj1_count++;                                                                   \
                 }                                                                                           \
                 if (p.CSD >= msd - 12) {                                                                    \
-                    if (p.CSD < n - 24 && (((p.CSD >= msd) && ext_qratio != 0.0) || ((p.CSD < msd) && qratio != 0.0))) {     \
+                    double __svp_lift_profile_t0 = pump_profile ? svp_profile_now() : 0.0;                  \
+                    if (p.CSD < n - 24 && (((p.CSD >= msd) && ext_qratio != 0.0) || ((p.CSD < msd) && qratio != 0.0))) { \
                         p.show_lsfsh_insert(0, 10.0, log_level-3, 0, 0, (p.CSD>=msd)?ext_qratio:qratio);    \
                     } else {                                                                                \
                         p.show_min_lift(0);                                                                 \
                     }                                                                                       \
+                    if (pump_profile) profile_show_lift += svp_profile_now() - __svp_lift_profile_t0;       \
+                    profile_show_lift_count++;                                                              \
                     if (p.last_lift_valid &&                                                                \
                         (best_lift_length == 0.0 || p.last_lift_euclidean_norm < best_lift_length)) {       \
                         best_lift_length = p.last_lift_euclidean_norm;                                      \
+                    }                                                                                       \
+                    if (stop_length > 0.0 && best_lift_length > 0.0 && best_lift_length <= stop_length) {    \
+                        profile_stop_hit = 1;                                                               \
+                        break;                                                                              \
                     }                                                                                       \
                 }                                                                                           \
                 if (ret) {                                                                                  \
@@ -774,7 +806,16 @@ double __last_lsh_pump_epi8(Lattice_QP *L, long num_threads, double qratio, doub
 
 
 
-    L->LLL_QP(0.99);
+    SVP_PROFILE_DO(profile_final_lll, L->LLL_QP(0.99));
+    if (pump_profile) {
+        fprintf(stderr,
+                "last_lsh_profile: n=%ld msd=%ld ext_d=%ld minsd=%ld stop_length=%.9g early_stop=%d total=%.6fs setup=%.6fs sampling=%.6fs extend=%.6fs bgj1=%.6fs/%ld bgj2=%.6fs/%ld bgj3=%.6fs/%ld show_lift=%.6fs/%ld final_lll=%.6fs\n",
+                n, msd, ext_d, minsd, stop_length, profile_stop_hit, svp_profile_now() - profile_total_start,
+                profile_pool_setup, profile_sampling, profile_extend,
+                profile_sieve_bgj1, profile_bgj1_count, profile_sieve_bgj2, profile_bgj2_count,
+                profile_sieve_bgj3, profile_bgj3_count, profile_show_lift, profile_show_lift_count,
+                profile_final_lll);
+    }
     if (best_lift_length > 0.0) {
         fprintf(stdout, "__last_lsh_pump_epi8 best_lift_length = %.9g\n", best_lift_length);
     }

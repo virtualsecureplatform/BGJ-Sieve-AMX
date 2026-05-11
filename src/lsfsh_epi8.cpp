@@ -115,6 +115,11 @@ static int lsh_record_best_solution(double length, const double *vec, long dimen
     return updated;
 }
 
+int bgj_lsh_best_solution_record(double length, const double *vec, long dimension)
+{
+    return lsh_record_best_solution(length, vec, dimension);
+}
+
 static inline int lsh_env_profile_enabled()
 {
     const char *env = getenv("BGJ_LSH_PROFILE");
@@ -2014,7 +2019,7 @@ int Pool_epi8_t<nb>::_show_lsfsh_insert(long target_index, double eta, long log_
         last_lift_lift_norm = lift_norm;
         last_lift_gh = gh;
         last_lift_approx_factor = approx;
-        if (target_index == 0 && min_place == 0) {
+        if (target_index == 0) {
             lsh_record_best_solution(euclidean_norm, v_QP.hi, basis->NumCols());
         }
         if (target_index != 0 || (target_index == 0 && min_place == 0)) {
