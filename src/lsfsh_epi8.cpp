@@ -1,5 +1,8 @@
 #include "../include/pool_epi8.h"
 #include "../include/bgj_epi8.h"
+#if defined(HAVE_CUDA)
+#include "../include/bgj_cuda.h"
+#endif
 
 #include "../include/lsfsh_tables.hpp"
 
@@ -10,6 +13,14 @@
 #define LSH_DEFAULT_DHDIM 24
 #define LSH_DEFAULT_SHSIZE 64
 #define LSH_HALF_SHSIZE 32
+
+static inline uint32_t lsh_select_dh_dim(long index_l)
+{
+    if (index_l >= LSH_DEFAULT_DHDIM) return LSH_DEFAULT_DHDIM;
+    if (index_l >= 16) return 16;
+    if (index_l >= 8) return 8;
+    return 0;
+}
 
 #define LSH_L1_BLOCK 256
 #define LSH_L2_BLOCK 8192
@@ -154,6 +165,26 @@ static inline uint32_t lsh_cuda_max_results()
         if (value > 0 && value <= 0xffffffffUL) return (uint32_t)value;
     }
     return 8u << 20;
+}
+
+static inline int lsh_cuda_deterministic_threads_enabled()
+{
+    const char *env = getenv("BGJ_CUDA_DETERMINISTIC_THREADS");
+    if (env && env[0]) return env[0] != '0';
+    return bgj_cuda_execution_device_count() > 1;
+}
+
+static inline void lsh_cuda_bind_worker_slot(long thread, long num_threads)
+{
+    if (!lsh_cuda_search_enabled()) return;
+    if (!lsh_cuda_deterministic_threads_enabled()) return;
+    const int device_count = bgj_cuda_execution_device_count();
+    if (device_count <= 1) return;
+    if (thread < 0) thread = 0;
+    if (num_threads <= 0) num_threads = 1;
+    int slot = (int)((thread * (long)device_count) / num_threads);
+    if (slot >= device_count) slot = device_count - 1;
+    bgj_cuda_set_thread_execution_device_slot(slot);
 }
 
 static inline int lsh_cuda_chunked_enabled()
@@ -1572,6 +1603,9 @@ int Pool_epi8_t<nb>::_lsfsh_insert(long target_index, double eta, long log_level
         double search_time = 0.0;
         #pragma omp parallel for
         for (long thread = 0; thread < num_threads; thread++) {
+#if defined(HAVE_CUDA)
+            lsh_cuda_bind_worker_slot(thread, num_threads);
+#endif
             const long begin_ind = thread * num_mb / num_threads;
             const long end_ind = (thread + 1) * num_mb / num_threads;
             double _lift_time = 0.0;
@@ -1617,6 +1651,9 @@ int Pool_epi8_t<nb>::_lsfsh_insert(long target_index, double eta, long log_level
             if (_lift_time > lift_time) lift_time = _lift_time;
             if (_search_time > search_time) search_time = _search_time;
             pthread_spin_unlock(&min_lock);
+#if defined(HAVE_CUDA)
+            bgj_cuda_clear_thread_execution_device_slot();
+#endif
         }
         profile_data.lift_time += lift_time;
         profile_data.dp_time += search_time;
@@ -1716,8 +1753,17 @@ int Pool_epi8_t<nb>::_lsfsh_insert(long target_index, double eta, long log_level
 template <uint32_t nb>
 int Pool_epi8_t<nb>::lsfsh_insert(long target_index, double eta, long log_level, double target_length, double stop_ratio, double qratio) {
     /////// basic information of the lifting ///////
+    const uint32_t lsh_dh_dim = lsh_select_dh_dim(index_l - target_index);
+    if (lsh_dh_dim == 0 || target_index + (long)lsh_dh_dim > index_l) {
+        if (lsh_env_profile_enabled()) {
+            fprintf(stderr,
+                    "lsh_insert_skip: target=%ld csd=%ld index_l=%ld dh_dim=%u reason=insufficient_dual_window\n",
+                    target_index, CSD, index_l, lsh_dh_dim);
+        }
+        return 0;
+    }
     const double tail_gh = sqrt(gh2);
-    const double dual_gh = basis->gh(index_l - LSH_DEFAULT_DHDIM, index_l);
+    const double dual_gh = basis->gh(index_l - lsh_dh_dim, index_l);
     const double lift_gh = basis->gh(target_index, index_l);
     const double tail_exp_ratio = sqrt(cvec[3*(num_vec/2)+2] * 4.0) / _ratio / tail_gh;
 
@@ -1801,9 +1847,9 @@ int Pool_epi8_t<nb>::lsfsh_insert(long target_index, double eta, long log_level,
     } while (0);
 
     // a conservative estimation for normal case
-    const double dual_exp_length = unique_target ? 
-                        target_length * sqrt(LSH_DEFAULT_DHDIM) / sqrt(index_r - target_index) :
-                        lift_exp_length * sqrt(LSH_DEFAULT_DHDIM) / sqrt(index_l - target_index);
+    const double dual_exp_length = unique_target ?
+                        target_length * sqrt((double)lsh_dh_dim) / sqrt(index_r - target_index) :
+                        lift_exp_length * sqrt((double)lsh_dh_dim) / sqrt(index_l - target_index);
 
     if (log_level >= 1) {
         printf("input: tail_gh = %.2f, dual_gh = %.2f, lift_gh = %.2f\n", tail_gh, dual_gh, lift_gh);
@@ -1823,11 +1869,11 @@ int Pool_epi8_t<nb>::lsfsh_insert(long target_index, double eta, long log_level,
 
     /////// choosing param ///////
     // output values
-    float *dual_vec = (float *) NEW_VEC(LSH_DEFAULT_SHSIZE * 8 * _CEIL8(LSH_DEFAULT_DHDIM), sizeof(float));
+    float *dual_vec = (float *) NEW_VEC(LSH_DEFAULT_SHSIZE * 8 * _CEIL8(lsh_dh_dim), sizeof(float));
     uint32_t *compress_pos = (uint32_t *) NEW_VEC(LSH_DEFAULT_SHSIZE * 8 * 6, sizeof(uint32_t));
     int32_t num_hbits, num_tbits, threshold;
     // input values
-    Lattice_QP *b_mid = basis->b_loc_QP(index_l - LSH_DEFAULT_DHDIM, index_l);
+    Lattice_QP *b_mid = basis->b_loc_QP(index_l - lsh_dh_dim, index_l);
     TIMER_START;
     if (log_level >= 2) printf("param: ");
     _opt_nsh_threshold(dual_vec, compress_pos, num_hbits, num_tbits, threshold,
@@ -1846,8 +1892,17 @@ int Pool_epi8_t<nb>::lsfsh_insert(long target_index, double eta, long log_level,
     }
 
     /////// call the lifting kernel ///////
-    int ret = _lsfsh_insert<LSH_DEFAULT_SHSIZE, LSH_DEFAULT_DHDIM>
+    int ret = 0;
+    if (lsh_dh_dim == LSH_DEFAULT_DHDIM) {
+        ret = _lsfsh_insert<LSH_DEFAULT_SHSIZE, LSH_DEFAULT_DHDIM>
                 (target_index, eta, log_level, dual_vec, compress_pos, num_hbits, threshold, dual_exp_length/dual_gh, unique_target ? target_length : 0.0, qratio);
+    } else if (lsh_dh_dim == 16) {
+        ret = _lsfsh_insert<LSH_DEFAULT_SHSIZE, 16>
+                (target_index, eta, log_level, dual_vec, compress_pos, num_hbits, threshold, dual_exp_length/dual_gh, unique_target ? target_length : 0.0, qratio);
+    } else if (lsh_dh_dim == 8) {
+        ret = _lsfsh_insert<LSH_DEFAULT_SHSIZE, 8>
+                (target_index, eta, log_level, dual_vec, compress_pos, num_hbits, threshold, dual_exp_length/dual_gh, unique_target ? target_length : 0.0, qratio);
+    }
 
     FREE_VEC(dual_vec);
     FREE_VEC((void *)compress_pos);
@@ -1933,6 +1988,9 @@ int Pool_epi8_t<nb>::_show_lsfsh_insert(long target_index, double eta, long log_
         double search_time = 0.0;
         #pragma omp parallel for
         for (long thread = 0; thread < num_threads; thread++) {
+#if defined(HAVE_CUDA)
+            lsh_cuda_bind_worker_slot(thread, num_threads);
+#endif
             const long begin_ind = thread * num_mb / num_threads;
             const long end_ind = (thread + 1) * num_mb / num_threads;
             double _lift_time = 0.0;
@@ -1955,6 +2013,9 @@ int Pool_epi8_t<nb>::_show_lsfsh_insert(long target_index, double eta, long log_
             if (_lift_time > lift_time) lift_time = _lift_time;
             if (_search_time > search_time) search_time = _search_time;
             pthread_spin_unlock(&min_lock);
+#if defined(HAVE_CUDA)
+            bgj_cuda_clear_thread_execution_device_slot();
+#endif
         }
         profile_data.lift_time += lift_time;
         profile_data.dp_time += search_time;
@@ -2047,8 +2108,17 @@ int Pool_epi8_t<nb>::_show_lsfsh_insert(long target_index, double eta, long log_
 template <uint32_t nb>
 int Pool_epi8_t<nb>::show_lsfsh_insert(long target_index, double eta, long log_level, double target_length, double stop_ratio, double qratio) {
     /////// basic information of the lifting ///////
+    const uint32_t lsh_dh_dim = lsh_select_dh_dim(index_l - target_index);
+    if (lsh_dh_dim == 0 || target_index + (long)lsh_dh_dim > index_l) {
+        if (lsh_env_profile_enabled()) {
+            fprintf(stderr,
+                    "lsh_insert_skip: target=%ld csd=%ld index_l=%ld dh_dim=%u reason=insufficient_dual_window\n",
+                    target_index, CSD, index_l, lsh_dh_dim);
+        }
+        return 0;
+    }
     const double tail_gh = sqrt(gh2);
-    const double dual_gh = basis->gh(index_l - LSH_DEFAULT_DHDIM, index_l);
+    const double dual_gh = basis->gh(index_l - lsh_dh_dim, index_l);
     const double lift_gh = basis->gh(target_index, index_l);
     const double tail_exp_ratio = sqrt(cvec[3LL*(num_vec/2LL)+2LL] * 4.0) / _ratio / tail_gh;
 
@@ -2132,9 +2202,9 @@ int Pool_epi8_t<nb>::show_lsfsh_insert(long target_index, double eta, long log_l
     } while (0);
 
     // a conservative estimation for normal case
-    const double dual_exp_length = unique_target ? 
-                        target_length * sqrt(LSH_DEFAULT_DHDIM) / sqrt(index_r - target_index) :
-                        lift_exp_length * sqrt(LSH_DEFAULT_DHDIM) / sqrt(index_l - target_index);
+    const double dual_exp_length = unique_target ?
+                        target_length * sqrt((double)lsh_dh_dim) / sqrt(index_r - target_index) :
+                        lift_exp_length * sqrt((double)lsh_dh_dim) / sqrt(index_l - target_index);
 
     if (log_level >= 1) {
         printf("input: tail_gh = %.2f, dual_gh = %.2f, lift_gh = %.2f\n", tail_gh, dual_gh, lift_gh);
@@ -2154,11 +2224,11 @@ int Pool_epi8_t<nb>::show_lsfsh_insert(long target_index, double eta, long log_l
 
     /////// choosing param ///////
     // output values
-    float *dual_vec = (float *) NEW_VEC(LSH_DEFAULT_SHSIZE * 8 * _CEIL8(LSH_DEFAULT_DHDIM), sizeof(float));
+    float *dual_vec = (float *) NEW_VEC(LSH_DEFAULT_SHSIZE * 8 * _CEIL8(lsh_dh_dim), sizeof(float));
     uint32_t *compress_pos = (uint32_t *) NEW_VEC(LSH_DEFAULT_SHSIZE * 8 * 6, sizeof(uint32_t));
     int32_t num_hbits, num_tbits, threshold;
     // input values
-    Lattice_QP *b_mid = basis->b_loc_QP(index_l - LSH_DEFAULT_DHDIM, index_l);
+    Lattice_QP *b_mid = basis->b_loc_QP(index_l - lsh_dh_dim, index_l);
     TIMER_START;
     if (log_level >= 2) printf("param: ");
     _opt_nsh_threshold(dual_vec, compress_pos, num_hbits, num_tbits, threshold, 
@@ -2172,8 +2242,17 @@ int Pool_epi8_t<nb>::show_lsfsh_insert(long target_index, double eta, long log_l
     }
 
     /////// call the lifting kernel ///////
-    int ret = _show_lsfsh_insert<LSH_DEFAULT_SHSIZE, LSH_DEFAULT_DHDIM>
+    int ret = 0;
+    if (lsh_dh_dim == LSH_DEFAULT_DHDIM) {
+        ret = _show_lsfsh_insert<LSH_DEFAULT_SHSIZE, LSH_DEFAULT_DHDIM>
                 (target_index, eta, log_level, dual_vec, compress_pos, num_hbits, threshold, dual_exp_length/dual_gh, unique_target ? target_length : 0.0, qratio);
+    } else if (lsh_dh_dim == 16) {
+        ret = _show_lsfsh_insert<LSH_DEFAULT_SHSIZE, 16>
+                (target_index, eta, log_level, dual_vec, compress_pos, num_hbits, threshold, dual_exp_length/dual_gh, unique_target ? target_length : 0.0, qratio);
+    } else if (lsh_dh_dim == 8) {
+        ret = _show_lsfsh_insert<LSH_DEFAULT_SHSIZE, 8>
+                (target_index, eta, log_level, dual_vec, compress_pos, num_hbits, threshold, dual_exp_length/dual_gh, unique_target ? target_length : 0.0, qratio);
+    }
 
     FREE_VEC(dual_vec);
     FREE_VEC((void *)compress_pos);
@@ -2182,19 +2261,43 @@ int Pool_epi8_t<nb>::show_lsfsh_insert(long target_index, double eta, long log_l
 
 
 #if COMPILE_POOL_EPI8_96
-template int Pool_epi8_t<3>::_lsfsh_insert<LSH_DEFAULT_SHSIZE, LSH_DEFAULT_DHDIM>(long target_index, double eta, long log_level, 
+template int Pool_epi8_t<3>::_lsfsh_insert<LSH_DEFAULT_SHSIZE, LSH_DEFAULT_DHDIM>(long target_index, double eta, long log_level,
+                float *dual_vec, uint32_t *compress_pos, int32_t num_hbits, int32_t threshold, double target_ratio, double target_length, double qratio);
+template int Pool_epi8_t<3>::_lsfsh_insert<LSH_DEFAULT_SHSIZE, 16>(long target_index, double eta, long log_level,
+                float *dual_vec, uint32_t *compress_pos, int32_t num_hbits, int32_t threshold, double target_ratio, double target_length, double qratio);
+template int Pool_epi8_t<3>::_lsfsh_insert<LSH_DEFAULT_SHSIZE, 8>(long target_index, double eta, long log_level,
+                float *dual_vec, uint32_t *compress_pos, int32_t num_hbits, int32_t threshold, double target_ratio, double target_length, double qratio);
+template int Pool_epi8_t<3>::_show_lsfsh_insert<LSH_DEFAULT_SHSIZE, 16>(long target_index, double eta, long log_level,
+                float *dual_vec, uint32_t *compress_pos, int32_t num_hbits, int32_t threshold, double target_ratio, double target_length, double qratio);
+template int Pool_epi8_t<3>::_show_lsfsh_insert<LSH_DEFAULT_SHSIZE, 8>(long target_index, double eta, long log_level,
                 float *dual_vec, uint32_t *compress_pos, int32_t num_hbits, int32_t threshold, double target_ratio, double target_length, double qratio);
 template class Pool_epi8_t<3>;
 #endif
 
 #if COMPILE_POOL_EPI8_128
-template int Pool_epi8_t<4>::_lsfsh_insert<LSH_DEFAULT_SHSIZE, LSH_DEFAULT_DHDIM>(long target_index, double eta, long log_level, 
+template int Pool_epi8_t<4>::_lsfsh_insert<LSH_DEFAULT_SHSIZE, LSH_DEFAULT_DHDIM>(long target_index, double eta, long log_level,
+                float *dual_vec, uint32_t *compress_pos, int32_t num_hbits, int32_t threshold, double target_ratio, double target_length, double qratio);
+template int Pool_epi8_t<4>::_lsfsh_insert<LSH_DEFAULT_SHSIZE, 16>(long target_index, double eta, long log_level,
+                float *dual_vec, uint32_t *compress_pos, int32_t num_hbits, int32_t threshold, double target_ratio, double target_length, double qratio);
+template int Pool_epi8_t<4>::_lsfsh_insert<LSH_DEFAULT_SHSIZE, 8>(long target_index, double eta, long log_level,
+                float *dual_vec, uint32_t *compress_pos, int32_t num_hbits, int32_t threshold, double target_ratio, double target_length, double qratio);
+template int Pool_epi8_t<4>::_show_lsfsh_insert<LSH_DEFAULT_SHSIZE, 16>(long target_index, double eta, long log_level,
+                float *dual_vec, uint32_t *compress_pos, int32_t num_hbits, int32_t threshold, double target_ratio, double target_length, double qratio);
+template int Pool_epi8_t<4>::_show_lsfsh_insert<LSH_DEFAULT_SHSIZE, 8>(long target_index, double eta, long log_level,
                 float *dual_vec, uint32_t *compress_pos, int32_t num_hbits, int32_t threshold, double target_ratio, double target_length, double qratio);
 template class Pool_epi8_t<4>;
 #endif
 
 #if COMPILE_POOL_EPI8_160
-template int Pool_epi8_t<5>::_lsfsh_insert<LSH_DEFAULT_SHSIZE, LSH_DEFAULT_DHDIM>(long target_index, double eta, long log_level, 
+template int Pool_epi8_t<5>::_lsfsh_insert<LSH_DEFAULT_SHSIZE, LSH_DEFAULT_DHDIM>(long target_index, double eta, long log_level,
+                float *dual_vec, uint32_t *compress_pos, int32_t num_hbits, int32_t threshold, double target_ratio, double target_length, double qratio);
+template int Pool_epi8_t<5>::_lsfsh_insert<LSH_DEFAULT_SHSIZE, 16>(long target_index, double eta, long log_level,
+                float *dual_vec, uint32_t *compress_pos, int32_t num_hbits, int32_t threshold, double target_ratio, double target_length, double qratio);
+template int Pool_epi8_t<5>::_lsfsh_insert<LSH_DEFAULT_SHSIZE, 8>(long target_index, double eta, long log_level,
+                float *dual_vec, uint32_t *compress_pos, int32_t num_hbits, int32_t threshold, double target_ratio, double target_length, double qratio);
+template int Pool_epi8_t<5>::_show_lsfsh_insert<LSH_DEFAULT_SHSIZE, 16>(long target_index, double eta, long log_level,
+                float *dual_vec, uint32_t *compress_pos, int32_t num_hbits, int32_t threshold, double target_ratio, double target_length, double qratio);
+template int Pool_epi8_t<5>::_show_lsfsh_insert<LSH_DEFAULT_SHSIZE, 8>(long target_index, double eta, long log_level,
                 float *dual_vec, uint32_t *compress_pos, int32_t num_hbits, int32_t threshold, double target_ratio, double target_length, double qratio);
 template class Pool_epi8_t<5>;
 #endif

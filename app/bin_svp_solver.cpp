@@ -16,6 +16,9 @@
 #include "../include/pool_epi8.h"
 #include "../include/sampler.h"
 #include "../include/fplll_bridge.h"
+#if defined(HAVE_CUDA)
+#include "../include/bgj_cuda.h"
+#endif
 
 #if 1
 struct timeval _solver_timer_start, _solver_timer_end;
@@ -104,6 +107,119 @@ static int solver_env_flag(const char *name, int default_value)
         !strcasecmp(env, "no") || !strcasecmp(env, "off")) return 0;
     return 1;
 }
+
+class solver_scoped_env_var {
+    std::string name;
+    std::string old_value;
+    int active;
+    int had_old;
+
+public:
+    solver_scoped_env_var(const char *trigger_env,
+                          const char *target_env,
+                          const char *value)
+        : name(target_env ? target_env : ""),
+          active(0),
+          had_old(0)
+    {
+        if (!trigger_env || !target_env || !value) return;
+        if (!solver_env_flag(trigger_env, 0)) return;
+
+        const char *old = getenv(target_env);
+        if (old) {
+            old_value = old;
+            had_old = 1;
+        }
+        if (setenv(target_env, value, 1) == 0) {
+            active = 1;
+            if (profile) {
+                printf("env_scope: trigger=%s set=%s=%s\n",
+                       trigger_env, target_env, value);
+                fflush(stdout);
+            }
+        }
+    }
+
+    ~solver_scoped_env_var()
+    {
+        if (!active) return;
+        if (had_old) {
+            setenv(name.c_str(), old_value.c_str(), 1);
+        } else {
+            unsetenv(name.c_str());
+        }
+    }
+};
+
+#if defined(HAVE_CUDA)
+static int solver_parse_cuda_device_list(const char *env, int *devices, int max_devices)
+{
+    int count = 0;
+    const char *p = env;
+    while (p && *p && count < max_devices) {
+        char *end = NULL;
+        long device = strtol(p, &end, 10);
+        if (end != p) {
+            int duplicate = 0;
+            for (int i = 0; i < count; i++) {
+                if (devices[i] == (int)device) duplicate = 1;
+            }
+            if (!duplicate) devices[count++] = (int)device;
+            p = end;
+        } else {
+            p++;
+        }
+        while (*p == ',' || *p == ';' || *p == ':' || *p == ' ' || *p == '\t') p++;
+    }
+    return count;
+}
+
+class solver_scoped_cuda_devices {
+    int active;
+
+public:
+    explicit solver_scoped_cuda_devices(const char *env_name)
+        : active(0)
+    {
+        if (env_name == NULL || env_name[0] == '\0') return;
+        const char *env = getenv(env_name);
+        if (env == NULL || env[0] == '\0') return;
+
+        int devices[16];
+        const int count = solver_parse_cuda_device_list(env, devices, 16);
+        if (count <= 0) {
+            fprintf(stderr, "Warning: %s did not contain a valid CUDA device list.\n", env_name);
+            return;
+        }
+        active = bgj_cuda_set_execution_devices_override(devices, count);
+        if (!active) {
+            fprintf(stderr, "Warning: failed to set %s=%s: %s\n",
+                    env_name, env, bgj_cuda_last_error());
+            return;
+        }
+        if (profile) {
+            printf("cuda_device_scope: env=%s devices=%s count=%d\n", env_name, env, count);
+            fflush(stdout);
+        }
+    }
+
+    ~solver_scoped_cuda_devices()
+    {
+        if (active) bgj_cuda_clear_execution_devices_override();
+    }
+
+    int is_active() const
+    {
+        return active;
+    }
+};
+#else
+class solver_scoped_cuda_devices {
+public:
+    explicit solver_scoped_cuda_devices(const char *) {}
+    int is_active() const { return 0; }
+};
+#endif
 
 struct solver_best_row_t {
     long index;
@@ -378,15 +494,78 @@ int _svp_solver_red(Lattice_QP* L, long algo) {
         SOLVER_PROFILE_DO("120t95 lsh_pump_88_32_q04", __lsh_pump_red_epi8(L, num_threads, 1.1, 0.4, 88, 32, 24, 0, 24, 0, 0, 45));
         SOLVER_PROFILE_DO("120t95 local_lsh_82_13_120", __local_lsh_pump(L, 82, 25, 13, 120));
         SOLVER_PROFILE_DO("120t95 local_lsh_75_20_120_b", __local_lsh_pump(L, 75, 25, 20, 120));
-        SOLVER_PROFILE_DO("120t95 lsh_pump_90_30_q035", __lsh_pump_red_epi8(L, num_threads, 1.1, 0.35, 90, 30, 24, 0, 24, 0, 0, 45));
-        SOLVER_PROFILE_DO("120t95 local_pump_85_15_120", __local_pump(L, 85, 20, 15, 120));
-        double final_lsh_target = solver_svp120_final_lsh_target(L);
-        const int final_lsh_mode = solver_svp120_final_lsh_mode();
-        const double lsh_pump_stop_length = (final_lsh_mode == 2) ?
-            solver_env_double("BGJ_120T95_LSH_PUMP_STOP_LENGTH", final_lsh_target) : 0.0;
-        SOLVER_PROFILE_DO("120t95 lsh_pump_92_28_q035",
-                          __lsh_pump_red_epi8(L, num_threads, 1.1, 0.35, 92, 28, 24, 0, 24, 0, 0, 45,
-                                              lsh_pump_stop_length));
+        double final_lsh_target = 0.0;
+        int final_lsh_mode = 0;
+        double lsh_pump_stop_length = 0.0;
+        {
+            solver_scoped_cuda_devices tail_cuda_devices("BGJ_120T95_TAIL_CUDA_DEVICES");
+            solver_scoped_env_var tail_static_chunks("BGJ_120T95_TAIL_STATIC_CHUNKS",
+                                                     "BGJ_CUDA_STATIC_CHUNKS",
+                                                     "1");
+            solver_scoped_env_var tail_ordered_consume("BGJ_120T95_TAIL_ORDERED_CONSUME",
+                                                       "BGJ_CUDA_ORDERED_CONSUME",
+                                                       "1");
+            solver_scoped_env_var tail_ordered_cred("BGJ_120T95_TAIL_ORDERED_CONSUME",
+                                                    "BGJ_CUDA_ORDERED_DEVICE_CRED",
+                                                    "1");
+            solver_scoped_env_var tail_serial_consume("BGJ_120T95_TAIL_SERIAL_CONSUME",
+                                                      "BGJ_CUDA_SERIAL_CONSUME",
+                                                      "1");
+            solver_scoped_env_var tail_uid_stable("BGJ_120T95_TAIL_UID_STABLE_LOCKS",
+                                                  "BGJ_CUDA_UID_STABLE_LOCKS",
+                                                  "1");
+            solver_scoped_env_var tail_global_insert("BGJ_120T95_TAIL_GLOBAL_INSERT",
+                                                     "BGJ_INSERT_GLOBAL_BEST",
+                                                     "1");
+            solver_scoped_env_var tail_deterministic_threads("BGJ_120T95_TAIL_DETERMINISTIC_CUDA_THREADS",
+                                                             "BGJ_CUDA_DETERMINISTIC_THREADS",
+                                                             "1");
+            SOLVER_PROFILE_DO("120t95 lsh_pump_90_30_q035", __lsh_pump_red_epi8(L, num_threads, 1.1, 0.35, 90, 30, 24, 0, 24, 0, 0, 45));
+            SOLVER_PROFILE_DO("120t95 local_pump_85_15_120", __local_pump(L, 85, 20, 15, 120));
+            final_lsh_target = solver_svp120_final_lsh_target(L);
+            final_lsh_mode = solver_svp120_final_lsh_mode();
+            lsh_pump_stop_length = (final_lsh_mode == 2) ?
+                solver_env_double("BGJ_120T95_LSH_PUMP_STOP_LENGTH", final_lsh_target) : 0.0;
+            const double lsh_pump_qratio =
+                solver_env_double("BGJ_120T95_LSH_PUMP_QRATIO", 0.35);
+            const long lsh_pump_msd =
+                solver_env_long("BGJ_120T95_LSH_PUMP_MSD", 92);
+            const long lsh_pump_f =
+                solver_env_long("BGJ_120T95_LSH_PUMP_F", 120 - lsh_pump_msd);
+            const long lsh_pump_minsd =
+                solver_env_long("BGJ_120T95_LSH_PUMP_MINSD", 45);
+            solver_scoped_cuda_devices late_cuda_devices(
+                tail_cuda_devices.is_active() ? NULL : "BGJ_120T95_LATE_CUDA_DEVICES");
+            solver_scoped_env_var late_static_chunks("BGJ_120T95_LATE_STATIC_CHUNKS",
+                                                     "BGJ_CUDA_STATIC_CHUNKS",
+                                                     "1");
+            solver_scoped_env_var late_ordered_consume("BGJ_120T95_LATE_ORDERED_CONSUME",
+                                                       "BGJ_CUDA_ORDERED_CONSUME",
+                                                       "1");
+            solver_scoped_env_var late_ordered_cred("BGJ_120T95_LATE_ORDERED_CONSUME",
+                                                    "BGJ_CUDA_ORDERED_DEVICE_CRED",
+                                                    "1");
+            solver_scoped_env_var late_serial_consume("BGJ_120T95_LATE_SERIAL_CONSUME",
+                                                      "BGJ_CUDA_SERIAL_CONSUME",
+                                                      "1");
+            solver_scoped_env_var late_uid_stable("BGJ_120T95_LATE_UID_STABLE_LOCKS",
+                                                  "BGJ_CUDA_UID_STABLE_LOCKS",
+                                                  "1");
+            solver_scoped_env_var late_global_insert("BGJ_120T95_LATE_GLOBAL_INSERT",
+                                                     "BGJ_INSERT_GLOBAL_BEST",
+                                                     "1");
+            solver_scoped_env_var late_deterministic_threads("BGJ_120T95_LATE_DETERMINISTIC_CUDA_THREADS",
+                                                             "BGJ_CUDA_DETERMINISTIC_THREADS",
+                                                             "1");
+            char lsh_pump_label[128];
+            snprintf(lsh_pump_label, sizeof(lsh_pump_label),
+                     "120t95 lsh_pump_%ld_%ld_q%.3f",
+                     lsh_pump_msd, lsh_pump_f, lsh_pump_qratio);
+            SOLVER_PROFILE_DO(lsh_pump_label,
+                              __lsh_pump_red_epi8(L, num_threads, 1.1, lsh_pump_qratio,
+                                                  lsh_pump_msd, lsh_pump_f, 24, 0, 24, 0, 0, lsh_pump_minsd,
+                                                  lsh_pump_stop_length));
+        }
         solver_best_candidate_t quality_candidate;
         long retry_count = 0;
         int final_lsh_decided = 0;

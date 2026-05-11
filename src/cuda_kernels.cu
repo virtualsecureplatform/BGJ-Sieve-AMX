@@ -290,6 +290,13 @@ struct bgj_cuda_raw_batch_scratch_t {
         free(items);
     }
 
+    void release_all()
+    {
+        for (size_t i = 0; i < size; i++) {
+            if (items[i]) items[i]->release();
+        }
+    }
+
     bgj_cuda_raw_scratch_t *get(uint32_t index)
     {
         if ((size_t)index >= capacity) {
@@ -490,13 +497,21 @@ struct bgj_cuda_execution_device_state_t {
     int initialized;
     int count;
     int devices[BGJ_CUDA_MAX_EXEC_DEVICES];
+    int override_active;
+    int override_count;
+    int override_devices[BGJ_CUDA_MAX_EXEC_DEVICES];
     unsigned next_slot;
+    unsigned generation;
 
     bgj_cuda_execution_device_state_t()
         : initialized(0),
           count(0),
           devices(),
-          next_slot(0)
+          override_active(0),
+          override_count(0),
+          override_devices(),
+          next_slot(0),
+          generation(1)
     {
         pthread_mutex_init(&lock, NULL);
     }
@@ -509,6 +524,12 @@ struct bgj_cuda_execution_device_state_t {
 
 static bgj_cuda_execution_device_state_t bgj_cuda_execution_devices;
 static thread_local int bgj_cuda_thread_device = -1;
+static thread_local unsigned bgj_cuda_thread_device_generation = 0;
+static thread_local int bgj_cuda_thread_device_slot_override = -1;
+static thread_local int bgj_cuda_thread_device_slot_bound = -1;
+
+static void bgj_cuda_release_shared_pool_caches();
+static void bgj_cuda_release_materialize_resources();
 
 struct bgj_cuda_device_profile_entry_t {
     uint64_t calls;
@@ -1100,12 +1121,10 @@ static void bgj_cuda_init_execution_devices_locked()
         }
     }
 
-    int current_device = 0;
-    err = cudaGetDevice(&current_device);
-    if (err == cudaSuccess && current_device >= 0 && current_device < runtime_count) {
-        state->devices[state->count++] = current_device;
-    } else {
-        state->devices[state->count++] = 0;
+    const int default_count =
+        runtime_count < BGJ_CUDA_MAX_EXEC_DEVICES ? runtime_count : BGJ_CUDA_MAX_EXEC_DEVICES;
+    for (int i = 0; i < default_count; i++) {
+        state->devices[state->count++] = i;
     }
 }
 
@@ -1114,9 +1133,79 @@ extern "C" int bgj_cuda_raw_execution_device_count()
     bgj_cuda_execution_device_state_t *state = &bgj_cuda_execution_devices;
     pthread_mutex_lock(&state->lock);
     bgj_cuda_init_execution_devices_locked();
-    const int count = state->count;
+    const int count = state->override_active ? state->override_count : state->count;
     pthread_mutex_unlock(&state->lock);
     return count;
+}
+
+extern "C" int bgj_cuda_raw_set_execution_devices_override(const int *devices, int count)
+{
+    bgj_cuda_execution_device_state_t *state = &bgj_cuda_execution_devices;
+    pthread_mutex_lock(&state->lock);
+    bgj_cuda_init_execution_devices_locked();
+
+    if (devices == NULL || count <= 0) {
+        state->override_active = 0;
+        state->override_count = 0;
+        state->next_slot = 0;
+        state->generation++;
+        if (state->generation == 0) state->generation = 1;
+        pthread_mutex_unlock(&state->lock);
+        bgj_cuda_release_shared_pool_caches();
+        bgj_cuda_release_materialize_resources();
+        return 1;
+    }
+
+    int runtime_count = 0;
+    cudaError_t err = cudaGetDeviceCount(&runtime_count);
+    if (err != cudaSuccess || runtime_count <= 0) {
+        if (err != cudaSuccess) set_cuda_error("cudaGetDeviceCount", err);
+        pthread_mutex_unlock(&state->lock);
+        return 0;
+    }
+
+    int parsed_count = 0;
+    int parsed_devices[BGJ_CUDA_MAX_EXEC_DEVICES] = {};
+    for (int i = 0; i < count; i++) {
+        bgj_cuda_add_execution_device(parsed_devices, &parsed_count, runtime_count, devices[i]);
+    }
+    if (parsed_count <= 0) {
+        set_plain_error("CUDA execution device override selected no valid devices");
+        pthread_mutex_unlock(&state->lock);
+        return 0;
+    }
+
+    for (int i = 0; i < parsed_count; i++) {
+        state->override_devices[i] = parsed_devices[i];
+    }
+    state->override_count = parsed_count;
+    state->override_active = 1;
+    state->next_slot = 0;
+    state->generation++;
+    if (state->generation == 0) state->generation = 1;
+    pthread_mutex_unlock(&state->lock);
+    bgj_cuda_release_shared_pool_caches();
+    bgj_cuda_release_materialize_resources();
+    return 1;
+}
+
+extern "C" int bgj_cuda_raw_clear_thread_execution_device_slot()
+{
+    if (bgj_cuda_thread_device_slot_override >= 0) {
+        bgj_cuda_thread_device_slot_override = -1;
+        bgj_cuda_thread_device_generation = 0;
+    }
+    return 1;
+}
+
+extern "C" int bgj_cuda_raw_set_thread_execution_device_slot(int slot)
+{
+    if (slot < 0) return bgj_cuda_raw_clear_thread_execution_device_slot();
+    if (bgj_cuda_thread_device_slot_override != slot) {
+        bgj_cuda_thread_device_slot_override = slot;
+        bgj_cuda_thread_device_generation = 0;
+    }
+    return 1;
 }
 
 static int bgj_cuda_current_device(int *device)
@@ -1139,21 +1228,55 @@ static int bgj_cuda_set_current_device(int device)
     return 1;
 }
 
+static void bgj_cuda_release_thread_device_resources()
+{
+    if (bgj_cuda_raw_async_state.active && bgj_cuda_raw_scratch.device >= 0) {
+        cudaSetDevice(bgj_cuda_raw_scratch.device);
+        if (bgj_cuda_raw_scratch.stream_ready) {
+            cudaStreamSynchronize(bgj_cuda_raw_scratch.stream);
+        }
+    }
+    bgj_cuda_raw_async_state.active = 0;
+    bgj_cuda_raw_scratch.release();
+    bgj_cuda_raw_batch_scratch.release_all();
+    bgj_cuda_bucket_scratch.release();
+    cudaGetLastError();
+}
+
 static int bgj_cuda_select_thread_device()
 {
-    if (bgj_cuda_thread_device < 0) {
-        bgj_cuda_execution_device_state_t *state = &bgj_cuda_execution_devices;
-        pthread_mutex_lock(&state->lock);
-        bgj_cuda_init_execution_devices_locked();
-        if (state->count <= 0) {
+    bgj_cuda_execution_device_state_t *state = &bgj_cuda_execution_devices;
+    int next_device = bgj_cuda_thread_device;
+    unsigned next_generation = bgj_cuda_thread_device_generation;
+    int next_slot_bound = bgj_cuda_thread_device_slot_bound;
+    const int requested_slot = bgj_cuda_thread_device_slot_override;
+    int release_thread_resources = 0;
+
+    pthread_mutex_lock(&state->lock);
+    bgj_cuda_init_execution_devices_locked();
+    if (bgj_cuda_thread_device < 0 ||
+        bgj_cuda_thread_device_generation != state->generation ||
+        bgj_cuda_thread_device_slot_bound != requested_slot) {
+        const int count = state->override_active ? state->override_count : state->count;
+        const int *devices = state->override_active ? state->override_devices : state->devices;
+        if (count <= 0) {
             pthread_mutex_unlock(&state->lock);
             set_plain_error("no CUDA execution devices are configured");
             return 0;
         }
-        const unsigned slot = state->next_slot++;
-        bgj_cuda_thread_device = state->devices[slot % (unsigned)state->count];
-        pthread_mutex_unlock(&state->lock);
+        const unsigned slot = requested_slot >= 0 ?
+            (unsigned)requested_slot : state->next_slot++;
+        next_device = devices[slot % (unsigned)count];
+        next_generation = state->generation;
+        next_slot_bound = requested_slot;
+        release_thread_resources = (bgj_cuda_thread_device >= 0);
     }
+    pthread_mutex_unlock(&state->lock);
+
+    if (release_thread_resources) bgj_cuda_release_thread_device_resources();
+    bgj_cuda_thread_device = next_device;
+    bgj_cuda_thread_device_generation = next_generation;
+    bgj_cuda_thread_device_slot_bound = next_slot_bound;
     return bgj_cuda_set_current_device(bgj_cuda_thread_device);
 }
 
@@ -3254,6 +3377,24 @@ struct bgj_cuda_shared_pool_cache_t {
 
 static bgj_cuda_shared_pool_cache_t bgj_cuda_shared_pool_cache[BGJ_CUDA_MAX_EXEC_DEVICES];
 
+static void bgj_cuda_release_shared_pool_caches()
+{
+    for (int i = 0; i < BGJ_CUDA_MAX_EXEC_DEVICES; i++) {
+        bgj_cuda_shared_pool_cache_t *cache = &bgj_cuda_shared_pool_cache[i];
+        pthread_mutex_lock(&cache->lock);
+        if (cache->device >= 0) cudaSetDevice(cache->device);
+        cudaFree(cache->vecs);
+        cache->vecs = NULL;
+        cache->capacity = 0;
+        cache->host_key = NULL;
+        cache->epoch = 0;
+        cache->pool_size = 0;
+        cache->vec_length = 0;
+        pthread_mutex_unlock(&cache->lock);
+    }
+    cudaGetLastError();
+}
+
 static bgj_cuda_shared_pool_cache_t *bgj_cuda_current_shared_pool_cache()
 {
     int device = 0;
@@ -3793,6 +3934,14 @@ struct bgj_cuda_materialize_scratch_t {
 };
 
 static bgj_cuda_materialize_scratch_t bgj_cuda_materialize_scratch;
+
+static void bgj_cuda_release_materialize_resources()
+{
+    pthread_mutex_lock(&bgj_cuda_materialize_scratch.lock);
+    bgj_cuda_materialize_scratch.release();
+    pthread_mutex_unlock(&bgj_cuda_materialize_scratch.lock);
+    cudaGetLastError();
+}
 
 static int bgj_cuda_prepare_materialize_stream(bgj_cuda_materialize_scratch_t *scratch)
 {
