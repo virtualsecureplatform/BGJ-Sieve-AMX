@@ -452,7 +452,7 @@ int _svp_solver_red(Lattice_QP* L, long algo) {
             const long final_log = solver_env_long("BGJ_120T95_FINAL_LSH_LOG", 3);
             const long final_shuffle = solver_env_long("BGJ_120T95_FINAL_LSH_SHUFFLE_FIRST", 0);
             const long final_minsd = solver_env_long("BGJ_120T95_FINAL_LSH_MINSD", 40);
-            const long final_lift_margin = solver_env_long("BGJ_120T95_FINAL_LSH_LIFT_MARGIN", 6);
+            const long final_lift_margin = solver_env_long("BGJ_120T95_FINAL_LSH_LIFT_MARGIN", 12);
             const long final_lift_start_default = final_msd - final_lift_margin;
             const long final_lift_start = solver_env_long("BGJ_120T95_FINAL_LSH_LIFT_START_CSD",
                                                           final_lift_start_default);

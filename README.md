@@ -105,9 +105,10 @@ When auto mode decides the final rescue is needed, the trailing
 rescue trajectory; set `BGJ_120T95_LOCAL_PUMP_B_BEFORE_RESCUE=0` to skip it
 for experiments.
 The final rescue delays lift probes until `BGJ_120T95_FINAL_LSH_LIFT_MARGIN`
-below the final MSD, default `6`; use
-`BGJ_120T95_FINAL_LSH_LIFT_START_CSD=<dim>` for an absolute start point.
-Smaller margins reduce rescue lift probes but can miss the best lifted vector.
+below the final MSD, default `12` for the validated SVP-120 rescue trajectory;
+use `BGJ_120T95_FINAL_LSH_LIFT_START_CSD=<dim>` for an absolute start point.
+Smaller margins reduce rescue lift probes but can miss the best lifted vector;
+larger margins probe earlier and may shorten later BGJ3 rescue work.
 `BGJ_120T95_FINAL_LSH_STOP_LENGTH=<length>` overrides the rescue early-stop
 threshold.
 Plain `--cuda` uses one CUDA execution device unless `BGJ_CUDA_DEVICES` or
