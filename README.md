@@ -105,11 +105,15 @@ When auto mode decides the final rescue is needed, the trailing
 rescue trajectory; set `BGJ_120T95_LOCAL_PUMP_B_BEFORE_RESCUE=0` to skip it
 for experiments.
 The final rescue delays lift probes until `BGJ_120T95_FINAL_LSH_LIFT_MARGIN`
-below the final MSD, default `12`; use
+below the final MSD, default `6`; use
 `BGJ_120T95_FINAL_LSH_LIFT_START_CSD=<dim>` for an absolute start point.
 Smaller margins reduce rescue lift probes but can miss the best lifted vector.
 `BGJ_120T95_FINAL_LSH_STOP_LENGTH=<length>` overrides the rescue early-stop
 threshold.
+Plain `--cuda` uses one CUDA execution device unless `BGJ_CUDA_DEVICES` or
+`BGJ_CUDA_NUM_DEVICES` is set. The SVP-120 quality-rescue default is validated
+on that single-device trajectory; explicit multi-GPU trajectories should be
+revalidated because they can expose different lifted candidates.
 For BGJ2, CUDA search is enabled for first-level reuse buckets by default.
 Second-level subbucket search is available but off by default for SVP quality.
 `BGJ_CUDA_BGJ2_SEARCH=0` disables BGJ2 search offload,
