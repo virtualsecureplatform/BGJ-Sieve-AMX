@@ -1083,10 +1083,6 @@ struct Pool_epi8_t {
         int _search_bgj1_cuda_overlap(bucket_epi8_t<record_dp> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<nb> *prof = NULL);
         template <bool record_dp, bool profiling>
         int _search_bgj1_cuda_batch(bucket_epi8_t<record_dp> **buckets, long num_bucket, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<nb> *prof = NULL);
-        template <bool record_dp, bool profiling>
-        int _search_bgj1_cuda_batch_ordered(bucket_epi8_t<record_dp> **buckets, long num_bucket, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<nb> *prof, uint32_t chunk_size, uint64_t stop_limit, int report_bgj);
-        template <bool record_dp, uint32_t max_bucket>
-        int _search0_cuda_static_chunks(bucket_epi8_t<record_dp> **bucket_list, long num_bucket, sol_list_epi8_t **sol_list, long search_threads, int32_t goal_norm, bgj_profile_data_t<nb> *prof, uint64_t stop_limit, int report_bgj, uint32_t cuda_batch_capacity, uint32_t cuda_min_batch, uint64_t cuda_batch_min_dots, int single_threshold_uses_profile_ndp);
         long _sol_list_to_desc(sol_list_epi8_t **sol_list, long num_sol_list, bgj_cuda_materialize_desc_t *desc, uint64_t *dst_vu);
         int _desc_to_vec_cpu(const bgj_cuda_materialize_desc_t *desc, long num_desc, long cpu_threads, int8_t *dst_vec, int32_t *dst_vnorm, int32_t *dst_vsum);
         int _sol_list_to_vec_cpu_parallel(sol_list_epi8_t **sol_list, long num_sol_list, int8_t *dst_vec, uint64_t *dst_vu, int32_t *dst_vnorm, int32_t *dst_vsum);

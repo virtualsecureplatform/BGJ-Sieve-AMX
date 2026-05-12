@@ -29,20 +29,6 @@ static int bgj_insert_batch_uid_erase_enabled()
     return 0;
 }
 
-static int bgj_insert_best_first_enabled()
-{
-    const char *env = getenv("BGJ_INSERT_BEST_FIRST");
-    if (env && env[0]) return env[0] != '0';
-    return 0;
-}
-
-static int bgj_insert_global_best_enabled()
-{
-    const char *env = getenv("BGJ_INSERT_GLOBAL_BEST");
-    if (env && env[0]) return env[0] != '0';
-    return 0;
-}
-
 static int bgj_insert_phase_profile_enabled()
 {
     const char *env = getenv("BGJ_INSERT_PHASE_PROFILE");
@@ -3703,7 +3689,6 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
     int32_t *vsum_to_insert = (int32_t *) NEW_VEC(num_total_sol, sizeof(int32_t));
     uint32_t *staged_selected_indices = NULL;
     uint32_t *staged_selected_pos = NULL;
-    uint32_t *insert_order = NULL;
     int8_t *staged_selected_vec = NULL;
     long staged_selected_count = 0;
     int staged_materialized = 0;
@@ -3728,9 +3713,7 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
     uint64_t materialize_cuda_failed_call = 0;
     uint64_t materialize_cuda_phase_chunk = 0;
     const int insert_phase_profile = bgj_insert_phase_profile_enabled();
-    const int global_best_insert = bgj_insert_global_best_enabled();
     int batch_uid_erase = bgj_insert_batch_uid_erase_enabled();
-    if (global_best_insert) batch_uid_erase = 0;
     const int collect_insert_phase = insert_phase_profile;
     uint64_t *deferred_uid_erase = NULL;
     uint64_t *deferred_shard_counts = NULL;
@@ -3773,8 +3756,7 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
         const int try_cuda_materialize = bgj_cuda_materialize_requested();
         if (try_cuda_materialize &&
             bgj_cuda_materialize_staged_for_dim(vec_length) &&
-            !bgj_cuda_materialize_hybrid_requested() &&
-            !global_best_insert) {
+            !bgj_cuda_materialize_hybrid_requested()) {
             const long staged_capacity = num_total_empty + num_total_nonempty;
             int staged_arrays_ok = 1;
             if (staged_capacity > 0) {
@@ -3868,27 +3850,6 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
     }
     materialize_total_time = bgj_bucket_wall_time() - materialize_start;
 
-    if ((bgj_insert_best_first_enabled() || global_best_insert) && num_total_sol > 1) {
-        insert_order = (uint32_t *)NEW_VEC(num_total_sol, sizeof(uint32_t));
-        if (insert_order) {
-            for (long i = 0; i < num_total_sol; i++) insert_order[i] = (uint32_t)i;
-            std::sort(insert_order, insert_order + num_total_sol,
-                      [&](uint32_t a, uint32_t b) {
-                          if (vnorm_to_insert[a] != vnorm_to_insert[b]) {
-                              return vnorm_to_insert[a] < vnorm_to_insert[b];
-                          }
-                          if (vu_to_insert[a] != vu_to_insert[b]) {
-                              return vu_to_insert[a] < vu_to_insert[b];
-                          }
-                          return a < b;
-                      });
-        }
-    }
-
-    auto insert_source_index = [&](long order_ind) -> long {
-        return insert_order ? (long)insert_order[order_ind] : order_ind;
-    };
-
     long empty_final_ind[MAX_NTHREADS];
     long nonempty_final_ind[MAX_NTHREADS];
     #if defined(HAVE_CUDA)
@@ -3901,53 +3862,51 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
         for (long thread = 0; thread < num_threads; thread++) {
             const long begin_ind = (num_total_sol * thread) / num_threads;
             const long end_ind = (num_total_sol * (thread+1)) / num_threads;
-            long order_ind = begin_ind;
+            long ind = begin_ind;
             long empty_ind = empty_begin[thread];
             long nonempty_ind = nonempty_end[thread] - 1;
 
-            while (order_ind < end_ind && nonempty_ind >= nonempty_begin[thread]) {
-                const long src_ind = insert_source_index(order_ind);
-                if (vnorm_to_insert[src_ind] > linfty_fail_bound) {
-                    order_ind++;
+            while (ind < end_ind && nonempty_ind >= nonempty_begin[thread]) {
+                if (vnorm_to_insert[ind] > linfty_fail_bound) {
+                    ind++;
                     continue;
                 }
 
                 uint32_t dst = *((uint32_t *)(cvec + 3LL * nonempty_ind));
-                if (vnorm_to_insert[src_ind] < vnorm[dst]) {
+                if (vnorm_to_insert[ind] < vnorm[dst]) {
                     long pos = __sync_fetch_and_add(&staged_selected_count, 1);
                     if (pos < staged_capacity) {
-                        staged_selected_indices[pos] = (uint32_t)src_ind;
-                        staged_selected_pos[src_ind] = (uint32_t)pos;
+                        staged_selected_indices[pos] = (uint32_t)ind;
+                        staged_selected_pos[ind] = (uint32_t)pos;
                     }
                     nonempty_ind--;
-                    order_ind++;
+                    ind++;
                     continue;
                 } else if (empty_ind < empty_end[thread]) {
                     long pos = __sync_fetch_and_add(&staged_selected_count, 1);
                     if (pos < staged_capacity) {
-                        staged_selected_indices[pos] = (uint32_t)src_ind;
-                        staged_selected_pos[src_ind] = (uint32_t)pos;
+                        staged_selected_indices[pos] = (uint32_t)ind;
+                        staged_selected_pos[ind] = (uint32_t)pos;
                     }
-                    order_ind++;
+                    ind++;
                     empty_ind++;
                     continue;
                 } else {
-                    order_ind++;
+                    ind++;
                 }
             }
 
-            while (order_ind < end_ind && empty_ind < empty_end[thread]) {
-                const long src_ind = insert_source_index(order_ind);
-                if (vnorm_to_insert[src_ind] > linfty_fail_bound) {
-                    order_ind++;
+            while (ind < end_ind && empty_ind < empty_end[thread]) {
+                if (vnorm_to_insert[ind] > linfty_fail_bound) {
+                    ind++;
                     continue;
                 }
                 long pos = __sync_fetch_and_add(&staged_selected_count, 1);
                 if (pos < staged_capacity) {
-                    staged_selected_indices[pos] = (uint32_t)src_ind;
-                    staged_selected_pos[src_ind] = (uint32_t)pos;
+                    staged_selected_indices[pos] = (uint32_t)ind;
+                    staged_selected_pos[ind] = (uint32_t)pos;
                 }
-                order_ind++;
+                ind++;
                 empty_ind++;
             }
         }
@@ -4030,123 +3989,11 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
     };
 
     const double insert_scan_start = bgj_bucket_wall_time();
-    if (global_best_insert) {
-        const int32_t linfty_fail_bound = 1.2 * goal_norm;
-        const long empty_capacity = num_total_empty;
-        const long replace_capacity = num_total_nonempty;
-        long empty_used = 0;
-        long replace_used = 0;
-
-        auto erase_uid_direct = [&](uint64_t erase_uid) {
-            if (collect_insert_phase) insert_uid_erase_count++;
-            double t0 = 0.0;
-            if (insert_phase_profile) t0 = bgj_bucket_wall_time();
-            const int ok = uid->erase_uid(erase_uid);
-            if (insert_phase_profile) insert_uid_erase_time += bgj_bucket_wall_time() - t0;
-            if (!ok) {
-                if (collect_insert_phase) {
-                    insert_uid_erase_fail++;
-                } else {
-                    fprintf(stderr,
-                            "[Error] Pool_epi8_t<%u>::_pool_insert: erase uid failed, ignored.\n",
-                            nb);
-                }
-            }
-        };
-        auto copy_insert_vec_global = [&](int8_t *dst, long src_ind) {
-            if (collect_insert_phase) insert_copy_count++;
-            if (insert_phase_profile) {
-                const double t0 = bgj_bucket_wall_time();
-                copy_avx2(dst, vec_to_insert_ptr(src_ind), vec_length);
-                insert_copy_time += bgj_bucket_wall_time() - t0;
-            } else {
-                copy_avx2(dst, vec_to_insert_ptr(src_ind), vec_length);
-            }
-        };
-        auto erase_remaining_as_not_try = [&](long order_ind) {
-            if (profiling) num_not_try += (uint64_t)(num_total_sol - order_ind);
-            for (long rest = order_ind; rest < num_total_sol; rest++) {
-                const long src_ind = insert_source_index(rest);
-                erase_uid_direct(vu_to_insert[src_ind]);
-            }
-        };
-
-        for (long order_ind = 0; order_ind < num_total_sol; order_ind++) {
-            if (replace_used >= replace_capacity && empty_used >= empty_capacity) {
-                erase_remaining_as_not_try(order_ind);
-                break;
-            }
-
-            const long src_ind = insert_source_index(order_ind);
-            if (vnorm_to_insert[src_ind] > linfty_fail_bound) {
-                if (profiling) num_linfty_failed++;
-                erase_uid_direct(vu_to_insert[src_ind]);
-                continue;
-            }
-
-            if (profiling) {
-                int r = round(sqrt((10000.0 * vnorm_to_insert[src_ind]) / goal_norm));
-                if (r > 255) r = 255;
-                if (r < 0) r = 0;
-                length_stat[r]++;
-            }
-
-            if (replace_used < replace_capacity) {
-                const long cvec_ind = sorted_index - 1 - replace_used;
-                uint32_t dst = *((uint32_t *)(cvec + 3LL * cvec_ind));
-                if (vnorm_to_insert[src_ind] < vnorm[dst]) {
-                    erase_uid_direct(vu[dst]);
-                    copy_insert_vec_global(vec + dst * vec_length, src_ind);
-                    vnorm[dst] = vnorm_to_insert[src_ind];
-                    vu[dst] = vu_to_insert[src_ind];
-                    vsum[dst] = vsum_to_insert[src_ind];
-                    int32_t cnorm = ((vnorm[dst] >> 1) > 65535) ? 65535 : (vnorm[dst] >> 1);
-                    cvec[cvec_ind * 3LL + 2LL] = cnorm;
-                    replace_used++;
-                    num_total_insert++;
-                    continue;
-                }
-            }
-
-            if (empty_used < empty_capacity) {
-                const uint32_t dst = (uint32_t)(num_vec + empty_used);
-                copy_insert_vec_global(vec + (uint64_t)dst * vec_length, src_ind);
-                vnorm[dst] = vnorm_to_insert[src_ind];
-                vsum[dst] = vsum_to_insert[src_ind];
-                vu[dst] = vu_to_insert[src_ind];
-                int32_t cnorm = ((vnorm[dst] >> 1) > 65535) ? 65535 : (vnorm[dst] >> 1);
-                cvec[(uint64_t)dst * 3LL + 2LL] = cnorm;
-                *((uint32_t *) (cvec + (uint64_t)dst * 3LL)) = dst;
-                empty_used++;
-                num_total_insert++;
-                continue;
-            }
-
-            if (profiling) num_l2_failed++;
-            erase_uid_direct(vu_to_insert[src_ind]);
-            if (order_ind + 1 < num_total_sol) {
-                erase_remaining_as_not_try(order_ind + 1);
-                break;
-            }
-        }
-
-        long remaining_empty = empty_used;
-        for (long thread = 0; thread < num_threads; thread++) {
-            long take_empty = 0;
-            if (remaining_empty > 0) {
-                take_empty = (remaining_empty < num_emptyy[thread]) ? remaining_empty : num_emptyy[thread];
-                remaining_empty -= take_empty;
-            }
-            empty_final_ind[thread] = empty_begin[thread] + take_empty;
-            nonempty_final_ind[thread] = sorted_index;
-        }
-        if (num_threads > 0) nonempty_final_ind[num_threads - 1] = sorted_index - replace_used;
-    } else {
     #pragma omp parallel for
     for (long thread = 0; thread < num_threads; thread++) {
         const long begin_ind = (num_total_sol * thread) / num_threads;
         const long end_ind = (num_total_sol * (thread+1)) / num_threads;
-        long order_ind = begin_ind;
+        long ind = begin_ind;
         long empty_ind = empty_begin[thread];
         long nonempty_ind = nonempty_end[thread] - 1;
         
@@ -4200,89 +4047,82 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
             }
         };
 
-        while (order_ind < end_ind && nonempty_ind >= nonempty_begin[thread]) {
-            const long src_ind = insert_source_index(order_ind);
-            if (vnorm_to_insert[src_ind] > linfty_fail_bound) {
+        while (ind < end_ind && nonempty_ind >= nonempty_begin[thread]) {
+            if (vnorm_to_insert[ind] > linfty_fail_bound) {
                 if (profiling) _num_linfty_failed++;
-                erase_or_defer_uid(vu_to_insert[src_ind]);
-                order_ind++;
+                erase_or_defer_uid(vu_to_insert[ind]);
+                ind++;
                 continue;
             }
-
+            
             uint32_t dst = *((uint32_t *)(cvec + 3LL * nonempty_ind));
             if (profiling) {
-                int r = round(sqrt((10000.0 * vnorm_to_insert[src_ind]) / goal_norm));
+                int r = round(sqrt((10000.0 * vnorm_to_insert[ind]) / goal_norm));
                 if (r > 255) r = 255;
                 if (r < 0) r = 0;
                 _length_stat[r]++;
             }
-            if (vnorm_to_insert[src_ind] < vnorm[dst]) {
+            if (vnorm_to_insert[ind] < vnorm[dst]) {
                 erase_or_defer_uid(vu[dst]);
-                copy_insert_vec(vec + dst * vec_length, src_ind);
-                vnorm[dst] = vnorm_to_insert[src_ind];
-                vu[dst] = vu_to_insert[src_ind];
-                vsum[dst] = vsum_to_insert[src_ind];
+                copy_insert_vec(vec + dst * vec_length, ind);
+                vnorm[dst] = vnorm_to_insert[ind];
+                vu[dst] = vu_to_insert[ind];
+                vsum[dst] = vsum_to_insert[ind];
                 int32_t cnorm = ((vnorm[dst] >> 1) > 65535) ? 65535 : (vnorm[dst] >> 1);
-                cvec[nonempty_ind*3LL+2LL] = cnorm;
+                cvec[nonempty_ind*3LL+2LL] = cnorm; 
                 nonempty_ind--;
-                order_ind++;
+                ind++;
                 continue;
             } else if (empty_ind < empty_end[thread]) {
-                copy_insert_vec(vec + empty_ind * vec_length, src_ind);
-                vnorm[empty_ind] = vnorm_to_insert[src_ind];
-                vsum[empty_ind] = vsum_to_insert[src_ind];
-                vu[empty_ind] = vu_to_insert[src_ind];
+                copy_insert_vec(vec + empty_ind * vec_length, ind);
+                vnorm[empty_ind] = vnorm_to_insert[ind];
+                vsum[empty_ind] = vsum_to_insert[ind];
+                vu[empty_ind] = vu_to_insert[ind];
                 int32_t cnorm = ((vnorm[empty_ind] >> 1) > 65535) ? 65535 : (vnorm[empty_ind] >> 1);
                 cvec[empty_ind * 3LL + 2LL] = cnorm;
                 *((uint32_t *) (cvec + empty_ind * 3LL)) = empty_ind;
-                order_ind++;
+                ind++;
                 empty_ind++;
                 continue;
             } else {
                 if (profiling) _num_l2_failed++;
-                erase_or_defer_uid(vu_to_insert[src_ind]);
-                order_ind++;
+                erase_or_defer_uid(vu_to_insert[ind]);
+                ind++;
             }
         }
 
-        while (order_ind < end_ind && empty_ind < empty_end[thread]) {
-            const long src_ind = insert_source_index(order_ind);
-            if (vnorm_to_insert[src_ind] > linfty_fail_bound) {
+        while (ind < end_ind && empty_ind < empty_end[thread]) {
+            if (vnorm_to_insert[ind] > linfty_fail_bound) {
                 if (profiling) _num_linfty_failed++;
-                erase_or_defer_uid(vu_to_insert[src_ind]);
-                order_ind++;
+                erase_or_defer_uid(vu_to_insert[ind]);
+                ind++;
                 continue;
             }
             if (profiling) {
-                int r = round(sqrt((10000.0 * vnorm_to_insert[src_ind]) / goal_norm));
+                int r = round(sqrt((10000.0 * vnorm_to_insert[ind]) / goal_norm));
                 if (r > 255) r = 255;
                 if (r < 0) r = 0;
                 _length_stat[r]++;
             }
-            copy_insert_vec(vec + empty_ind * vec_length, src_ind);
-            vnorm[empty_ind] = vnorm_to_insert[src_ind];
-            vsum[empty_ind] = vsum_to_insert[src_ind];
-            vu[empty_ind] = vu_to_insert[src_ind];
+            copy_insert_vec(vec + empty_ind * vec_length, ind);
+            vnorm[empty_ind] = vnorm_to_insert[ind];
+            vsum[empty_ind] = vsum_to_insert[ind];
+            vu[empty_ind] = vu_to_insert[ind];
             int32_t cnorm = ((vnorm[empty_ind] >> 1) > 65535) ? 65535 : (vnorm[empty_ind] >> 1);
             cvec[empty_ind * 3LL + 2LL] = cnorm;
             *((uint32_t *) (cvec + empty_ind * 3LL)) = empty_ind;
-            order_ind++;
+            ind++;
             empty_ind++;
         }
 
-        while (order_ind < end_ind) {
-            const long src_ind = insert_source_index(order_ind);
-            erase_or_defer_uid(vu_to_insert[src_ind]);
-            order_ind++;
+        while (ind < end_ind) {
+            erase_or_defer_uid(vu_to_insert[ind]);
+            ind++;
         }
  
         if (prof) {
             uint64_t _num_total_insert = (empty_ind - empty_begin[thread]) + (nonempty_end[thread] - 1 - nonempty_ind);
-            int64_t _num_not_try_signed =
-                (int64_t)(end_ind - begin_ind) - (int64_t)_num_total_insert -
-                (int64_t)_num_linfty_failed - (int64_t)_num_l2_failed;
-            uint64_t _num_not_try =
-                _num_not_try_signed > 0 ? (uint64_t)_num_not_try_signed : 0;
+            uint64_t _num_not_try = num_sol[thread] - _num_total_insert - _num_linfty_failed - _num_l2_failed;
             pthread_spin_lock(&prof->profile_lock);
             if (profiling) {
                 for (long i = 0; i < 256; i++) length_stat[i] += _length_stat[i];
@@ -4311,7 +4151,6 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
         if (batch_uid_erase) deferred_uid_count[thread] = _deferred_uid_count;
         empty_final_ind[thread] = empty_ind;
         nonempty_final_ind[thread] = nonempty_ind;
-    }
     }
     insert_scan_time = bgj_bucket_wall_time() - insert_scan_start;
 
@@ -4438,7 +4277,6 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
     if (vec_to_insert) FREE_VEC((void *)vec_to_insert);
     if (staged_selected_indices) FREE_VEC((void *)staged_selected_indices);
     if (staged_selected_pos) FREE_VEC((void *)staged_selected_pos);
-    if (insert_order) FREE_VEC((void *)insert_order);
     if (staged_selected_vec) FREE_VEC((void *)staged_selected_vec);
     if (deferred_uid_erase) FREE_VEC((void *)deferred_uid_erase);
     if (deferred_shard_counts) FREE_VEC((void *)deferred_shard_counts);

@@ -1647,7 +1647,7 @@ int Pool_epi8_t<nb>::naivedh_insert(long target_index, double eta, long log_leve
     const double lift_gh = basis->gh(target_index, index_l);
     const double tail_exp_ratio = sqrt(cvec[3*(num_vec/2)+2] * 4.0) / _ratio / tail_gh;
 
-    double tail_exp_alpha;
+    double tail_exp_alpha = 0.0;
     do {
         double min_exp_length = lift_gh;
         for (double _alpha = 0.0; _alpha < 0.5; _alpha += 0.01) {

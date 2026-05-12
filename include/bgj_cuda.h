@@ -46,10 +46,6 @@ struct alignas(16) bgj_cuda_bucket_entry_t {
 
 int bgj_cuda_device_count();
 int bgj_cuda_execution_device_count();
-int bgj_cuda_set_execution_devices_override(const int *devices, int count);
-int bgj_cuda_clear_execution_devices_override();
-int bgj_cuda_set_thread_execution_device_slot(int slot);
-int bgj_cuda_clear_thread_execution_device_slot();
 const char *bgj_cuda_last_error();
 int bgj_cuda_search_requested();
 void bgj_cuda_set_search_requested(int enabled);
