@@ -505,6 +505,9 @@ int _svp_solver_red(Lattice_QP* L, long algo) {
             solver_scoped_env_var tail_ordered_consume("BGJ_120T95_TAIL_ORDERED_CONSUME",
                                                        "BGJ_CUDA_ORDERED_CONSUME",
                                                        "1");
+            solver_scoped_env_var tail_ordered_strict("BGJ_120T95_TAIL_ORDERED_STRICT",
+                                                      "BGJ_CUDA_ORDERED_STRICT",
+                                                      "1");
             solver_scoped_env_var tail_ordered_cred("BGJ_120T95_TAIL_ORDERED_CONSUME",
                                                     "BGJ_CUDA_ORDERED_DEVICE_CRED",
                                                     "1");
@@ -542,6 +545,9 @@ int _svp_solver_red(Lattice_QP* L, long algo) {
             solver_scoped_env_var late_ordered_consume("BGJ_120T95_LATE_ORDERED_CONSUME",
                                                        "BGJ_CUDA_ORDERED_CONSUME",
                                                        "1");
+            solver_scoped_env_var late_ordered_strict("BGJ_120T95_LATE_ORDERED_STRICT",
+                                                      "BGJ_CUDA_ORDERED_STRICT",
+                                                      "1");
             solver_scoped_env_var late_ordered_cred("BGJ_120T95_LATE_ORDERED_CONSUME",
                                                     "BGJ_CUDA_ORDERED_DEVICE_CRED",
                                                     "1");

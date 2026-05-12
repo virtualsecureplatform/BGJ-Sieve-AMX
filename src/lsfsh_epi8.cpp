@@ -6,6 +6,7 @@
 
 #include "../include/lsfsh_tables.hpp"
 
+#include <cstdio>
 #include <cstdlib>
 #include <sys/time.h>
 #include <vector>
@@ -61,6 +62,23 @@ struct lsh_best_solution_record_t {
 };
 
 static std::vector<lsh_best_solution_record_t> lsh_best_solution_records;
+
+static void lsh_checkpoint_best_solution(double length, const double *vec, long dimension)
+{
+    const char *path = getenv("BGJ_LSH_BEST_SOLUTION_FILE");
+    if (!path || !path[0] || !vec || dimension <= 0) return;
+
+    FILE *out = fopen(path, "w");
+    if (!out) return;
+    fprintf(out, "length %.17g\n", length);
+    fprintf(out, "dimension %ld\n", dimension);
+    fprintf(out, "vec");
+    for (long i = 0; i < dimension; i++) {
+        fprintf(out, " %.17g", vec[i]);
+    }
+    fprintf(out, "\n");
+    fclose(out);
+}
 
 void bgj_lsh_best_solution_reset()
 {
@@ -123,6 +141,7 @@ static int lsh_record_best_solution(double length, const double *vec, long dimen
         updated = 1;
     }
     pthread_mutex_unlock(&lsh_best_solution_lock);
+    if (updated) lsh_checkpoint_best_solution(length, vec, dimension);
     return updated;
 }
 

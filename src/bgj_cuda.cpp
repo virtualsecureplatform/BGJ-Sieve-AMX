@@ -1183,6 +1183,13 @@ static int bgj_cuda_ordered_device_cred_requested()
     return 1;
 }
 
+static int bgj_cuda_ordered_strict_requested()
+{
+    const char *env = getenv("BGJ_CUDA_ORDERED_STRICT");
+    if (env && env[0]) return env[0] != '0';
+    return 0;
+}
+
 static long bgj_cuda_env_long(const char *name, long fallback, long min_value, long max_value)
 {
     const char *env = getenv(name);
@@ -2756,6 +2763,7 @@ int Pool_epi8_t<nb>::_search_bgj1_cuda_batch_ordered(bucket_epi8_t<record_dp> **
         std::vector<uint32_t> result_capacities;
         std::vector<uint32_t> result_counts;
         std::vector<int> overflows;
+        std::vector<unsigned char> cred_done;
         bgj_cuda_result_storage_t result_storage;
         long batch_ndp_long = 0;
         uint64_t batch_ndp = 0;
@@ -2807,22 +2815,26 @@ int Pool_epi8_t<nb>::_search_bgj1_cuda_batch_ordered(bucket_epi8_t<record_dp> **
             chunk->result_capacities.resize(batch_size);
             chunk->result_counts.resize(batch_size);
             chunk->overflows.resize(batch_size);
+            chunk->cred_done.assign(batch_size, 0);
         }
     } catch (...) {
         for (size_t i = 0; i < chunks.size(); i++) delete chunks[i];
         return 0;
     }
 
+    const int ordered_strict = bgj_cuda_ordered_strict_requested();
     const int cuda_cred_on_device =
-        record_dp && (bgj_cuda_cred_transform_requested() ||
+        record_dp && !ordered_strict &&
+        (bgj_cuda_cred_transform_requested() ||
                       bgj_cuda_ordered_device_cred_requested());
     double cuda_cred_time = 0.0;
-    if (record_dp && !cuda_cred_on_device) {
+    if (record_dp && !cuda_cred_on_device && !ordered_strict) {
         const double t0 = bgj_cuda_host_wall_time();
         for (long chunk_index = 0; chunk_index < num_chunks; chunk_index++) {
             ordered_chunk_t *chunk = chunks[(size_t)chunk_index];
             for (size_t i = 0; i < chunk->bucket.size(); i++) {
                 _search_cred<record_dp, profiling>(chunk->bucket[i], sol, goal_norm, prof);
+                chunk->cred_done[i] = 1;
             }
         }
         cuda_cred_time += bgj_cuda_host_wall_time() - t0;
@@ -2957,6 +2969,12 @@ int Pool_epi8_t<nb>::_search_bgj1_cuda_batch_ordered(bucket_epi8_t<record_dp> **
                     report_ordered_stop(chunk_index, i);
                     break;
                 }
+                if (ordered_strict && record_dp && !chunk->cred_done[i]) {
+                    const double cred_t0 = bgj_cuda_host_wall_time();
+                    _search_cred<record_dp, profiling>(chunk->bucket[i], sol, goal_norm, prof);
+                    cuda_cred_time += bgj_cuda_host_wall_time() - cred_t0;
+                    chunk->cred_done[i] = 1;
+                }
                 if (!bgj_cuda_consume_bgj1_results<nb, record_dp, profiling>(this,
                                                                               chunk->bucket[i],
                                                                               sol,
@@ -2977,30 +2995,29 @@ int Pool_epi8_t<nb>::_search_bgj1_cuda_batch_ordered(bucket_epi8_t<record_dp> **
             }
         }
 
-        const double fallback_t0 = bgj_cuda_host_wall_time();
-        if (record_dp && cuda_cred_on_device) {
-            for (uint32_t i = 0; i < batch_size; i++) {
-                if (ordered_stop_hit()) {
-                    report_ordered_stop(chunk_index, i);
-                    break;
-                }
-                _search_cred<record_dp, profiling>(chunk->bucket[i], sol, goal_norm, prof);
-            }
-        }
+        double fallback_search_sec = 0.0;
         for (uint32_t i = 0; i < batch_size; i++) {
             if (ordered_stop_hit()) {
                 report_ordered_stop(chunk_index, i);
                 break;
             }
+            if (record_dp && !chunk->cred_done[i]) {
+                const double cred_t0 = bgj_cuda_host_wall_time();
+                _search_cred<record_dp, profiling>(chunk->bucket[i], sol, goal_norm, prof);
+                cuda_cred_time += bgj_cuda_host_wall_time() - cred_t0;
+                chunk->cred_done[i] = 1;
+            }
+            const double search_t0 = bgj_cuda_host_wall_time();
             _search_np<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, record_dp, profiling>(chunk->bucket[i], sol, goal_norm, prof);
             _search_pp<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, record_dp, profiling>(chunk->bucket[i], sol, goal_norm, prof);
             _search_nn<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, record_dp, profiling>(chunk->bucket[i], sol, goal_norm, prof);
+            fallback_search_sec += bgj_cuda_host_wall_time() - search_t0;
         }
         if (stop_reported) {
-            cuda_fallback_time += bgj_cuda_host_wall_time() - fallback_t0;
+            cuda_fallback_time += fallback_search_sec;
             return 0;
         }
-        cuda_fallback_time += bgj_cuda_host_wall_time() - fallback_t0;
+        cuda_fallback_time += fallback_search_sec;
         cuda_fallback_bucket += batch_size;
         cuda_fallback_ndp += chunk->batch_ndp;
         return 1;
