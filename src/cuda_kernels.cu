@@ -320,7 +320,18 @@ static thread_local bgj_cuda_raw_batch_scratch_t bgj_cuda_raw_batch_scratch;
 
 struct bgj_cuda_raw_async_state_t {
     int active;
+    int split_active;
+    int split_tensor;
+    int split_device_count;
+    int split_devices[BGJ_CUDA_MAX_EXEC_DEVICES];
+    uint64_t split_work_begin[BGJ_CUDA_MAX_EXEC_DEVICES];
+    uint64_t split_work_count[BGJ_CUDA_MAX_EXEC_DEVICES];
+    uint32_t split_submitted_result_count[BGJ_CUDA_MAX_EXEC_DEVICES];
+    uint32_t split_copied_result_count[BGJ_CUDA_MAX_EXEC_DEVICES];
+    int split_submitted_overflow[BGJ_CUDA_MAX_EXEC_DEVICES];
+    int split_copied_overflow[BGJ_CUDA_MAX_EXEC_DEVICES];
     uint64_t estimated_dots;
+    uint64_t full_work;
     uint32_t num_p;
     uint32_t num_n;
     double total_t0;
@@ -328,12 +339,46 @@ struct bgj_cuda_raw_async_state_t {
 
     bgj_cuda_raw_async_state_t()
         : active(0),
+          split_active(0),
+          split_tensor(0),
+          split_device_count(0),
+          split_devices(),
+          split_work_begin(),
+          split_work_count(),
+          split_submitted_result_count(),
+          split_copied_result_count(),
+          split_submitted_overflow(),
+          split_copied_overflow(),
           estimated_dots(0),
+          full_work(0),
           num_p(0),
           num_n(0),
           total_t0(0.0),
           submit_sec(0.0)
     {
+    }
+
+    void reset()
+    {
+        active = 0;
+        split_active = 0;
+        split_tensor = 0;
+        split_device_count = 0;
+        estimated_dots = 0;
+        full_work = 0;
+        num_p = 0;
+        num_n = 0;
+        total_t0 = 0.0;
+        submit_sec = 0.0;
+        for (int i = 0; i < BGJ_CUDA_MAX_EXEC_DEVICES; i++) {
+            split_devices[i] = 0;
+            split_work_begin[i] = 0;
+            split_work_count[i] = 0;
+            split_submitted_result_count[i] = 0;
+            split_copied_result_count[i] = 0;
+            split_submitted_overflow[i] = 0;
+            split_copied_overflow[i] = 0;
+        }
     }
 };
 
@@ -510,6 +555,35 @@ struct bgj_cuda_execution_device_state_t {
 static bgj_cuda_execution_device_state_t bgj_cuda_execution_devices;
 static thread_local int bgj_cuda_thread_device = -1;
 
+static int bgj_cuda_env_flag(const char *name, int default_value)
+{
+    const char *env = getenv(name);
+    if (env && env[0]) return env[0] != '0';
+    return default_value;
+}
+
+static uint64_t bgj_cuda_env_u64(const char *name, uint64_t default_value)
+{
+    const char *env = getenv(name);
+    if (!env || !env[0]) return default_value;
+    char *end = NULL;
+    const unsigned long long value = strtoull(env, &end, 10);
+    if (end == env || value == 0) return default_value;
+    return (uint64_t)value;
+}
+
+static int bgj_cuda_stable_multi_gpu_requested()
+{
+    return bgj_cuda_env_flag("BGJ_CUDA_STABLE_MULTI_GPU", 0);
+}
+
+static int bgj_cuda_primary_thread_device_requested(int device_count)
+{
+    const char *env = getenv("BGJ_CUDA_PRIMARY_THREAD_DEVICE");
+    if (env && env[0]) return env[0] != '0';
+    return device_count > 1 && bgj_cuda_stable_multi_gpu_requested();
+}
+
 struct bgj_cuda_device_profile_entry_t {
     uint64_t calls;
     uint64_t buckets;
@@ -621,6 +695,16 @@ static int bgj_cuda_phase_profile_requested()
 {
     const char *env = getenv("BGJ_CUDA_PHASE_PROFILE");
     return env && env[0] && env[0] != '0';
+}
+
+static int bgj_cuda_split_profile_requested()
+{
+    return bgj_cuda_env_flag("BGJ_CUDA_SPLIT_PROFILE", 0);
+}
+
+static uint64_t bgj_cuda_split_profile_min_dots()
+{
+    return bgj_cuda_env_u64("BGJ_CUDA_SPLIT_PROFILE_MIN_DOTS", 0);
 }
 
 static void bgj_cuda_phase_profile_dump()
@@ -1119,6 +1203,19 @@ extern "C" int bgj_cuda_raw_execution_device_count()
     return count;
 }
 
+static int bgj_cuda_copy_execution_devices(int *devices, int capacity)
+{
+    if (!devices || capacity <= 0) return 0;
+    bgj_cuda_execution_device_state_t *state = &bgj_cuda_execution_devices;
+    pthread_mutex_lock(&state->lock);
+    bgj_cuda_init_execution_devices_locked();
+    int count = state->count;
+    if (count > capacity) count = capacity;
+    for (int i = 0; i < count; i++) devices[i] = state->devices[i];
+    pthread_mutex_unlock(&state->lock);
+    return count;
+}
+
 static int bgj_cuda_current_device(int *device)
 {
     cudaError_t err = cudaGetDevice(device);
@@ -1150,7 +1247,8 @@ static int bgj_cuda_select_thread_device()
             set_plain_error("no CUDA execution devices are configured");
             return 0;
         }
-        const unsigned slot = state->next_slot++;
+        const unsigned slot = bgj_cuda_primary_thread_device_requested(state->count) ?
+                              0u : state->next_slot++;
         bgj_cuda_thread_device = state->devices[slot % (unsigned)state->count];
         pthread_mutex_unlock(&state->lock);
     }
@@ -1595,6 +1693,88 @@ void bgj_cuda_search_np_tensor_reordered_kernel(const uint64_t *p_a_frags,
     }
 }
 
+__global__ __launch_bounds__(BGJ_CUDA_TENSOR_THREADS_PER_BLOCK, 2)
+void bgj_cuda_search_np_tensor_reordered_range_kernel(const uint64_t *p_a_frags,
+                                                      const uint64_t *n_b_frags,
+                                                      const uint32_t *p_ids,
+                                                      const uint32_t *n_ids,
+                                                      const int32_t *p_norm,
+                                                      const int32_t *n_norm,
+                                                      const int32_t *p_dot,
+                                                      const int32_t *n_dot,
+                                                      uint32_t tensor_blocks_n,
+                                                      uint64_t tile_begin,
+                                                      uint64_t tile_count,
+                                                      uint32_t k_blocks,
+                                                      int32_t goal_norm,
+                                                      int32_t center_goal_norm,
+                                                      int record_dp,
+                                                      int raw_center_dp,
+                                                      bgj_cuda_result_t *results,
+                                                      uint32_t result_capacity,
+                                                      uint32_t *result_count,
+                                                      int *overflow)
+{
+    const uint32_t warp_id = threadIdx.x / BGJ_CUDA_WARP_SIZE;
+    const uint32_t lane_id = threadIdx.x % BGJ_CUDA_WARP_SIZE;
+    const uint64_t local_tile =
+        (uint64_t)blockIdx.x * BGJ_CUDA_TENSOR_WARPS_PER_BLOCK + warp_id;
+    if (local_tile >= tile_count) return;
+
+    const uint64_t tensor_tile = tile_begin + local_tile;
+    const uint32_t tile_block_p = (uint32_t)(tensor_tile / tensor_blocks_n);
+    const uint32_t tile_block_n =
+        (uint32_t)(tensor_tile - (uint64_t)tile_block_p * tensor_blocks_n);
+    const uint32_t tile_p = tile_block_p * 16u;
+    const uint32_t tile_n = tile_block_n * 16u;
+
+    bgj_cuda_i8_a_frag_u a_frag;
+    bgj_cuda_i8_b_frag_u b_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, int> c_frag;
+    wmma::fill_fragment(c_frag, 0);
+
+    for (uint32_t k_block = 0; k_block < k_blocks; k_block++) {
+        const uint64_t *a_src = p_a_frags +
+                                (((uint64_t)tile_block_p * k_blocks + k_block) *
+                                 BGJ_CUDA_WARP_SIZE + lane_id) *
+                                BGJ_CUDA_I8_A_FRAG_WORDS;
+        const uint64_t *b_src = n_b_frags +
+                                (((uint64_t)tile_block_n * k_blocks + k_block) *
+                                 BGJ_CUDA_WARP_SIZE + lane_id) *
+                                BGJ_CUDA_I8_B_FRAG_WORDS;
+        #pragma unroll
+        for (uint32_t word = 0; word < BGJ_CUDA_I8_A_FRAG_WORDS; word++) {
+            a_frag.word[word] = __ldg(a_src + word);
+        }
+        #pragma unroll
+        for (uint32_t word = 0; word < BGJ_CUDA_I8_B_FRAG_WORDS; word++) {
+            b_frag.word[word] = __ldg(b_src + word);
+        }
+        wmma::mma_sync(c_frag, a_frag.frag, b_frag.frag, c_frag);
+    }
+
+    #pragma unroll
+    for (uint32_t element = 0; element < c_frag.num_elements; element++) {
+        uint32_t row;
+        uint32_t col;
+        bgj_cuda_tensor_accumulator_coord(lane_id, element, &row, &col);
+        const uint32_t p = tile_p + row;
+        const uint32_t n = tile_n + col;
+        const int32_t dp = c_frag.x[element];
+
+        if (p_norm[p] + n_norm[n] + dp < goal_norm) {
+            bgj_cuda_push_result(results, result_count, overflow, result_capacity,
+                                 BGJ_CUDA_SOL_A, p_ids[p], n_ids[n]);
+        }
+        if (record_dp &&
+            bgj_cuda_p_center_dot(p_norm, p_dot, p, raw_center_dp) +
+            bgj_cuda_n_center_dot(n_norm, n_dot, n, raw_center_dp) - dp < center_goal_norm) {
+            bgj_cuda_push_result(results, result_count, overflow, result_capacity,
+                                 BGJ_CUDA_SOL_SA, p_ids[p], n_ids[n]);
+        }
+    }
+}
+
 __global__ __launch_bounds__(BGJ_CUDA_TENSOR_THREADS_PER_BLOCK, 1)
 void bgj_cuda_search_np_tensor_multi_kernel(const uint64_t *p_a_frags,
                                             const uint64_t *n_b_frags,
@@ -1727,6 +1907,99 @@ void bgj_cuda_search_np_tensor_wide_reordered_kernel(const uint64_t *p_a_frags,
     const uint32_t lane_id = threadIdx.x % BGJ_CUDA_WARP_SIZE;
     const uint32_t group_p = blockIdx.x / group_blocks_n;
     const uint32_t group_n = blockIdx.x - group_p * group_blocks_n;
+    const uint32_t tile_block_p = group_p * BGJ_CUDA_TENSOR_WARPS_PER_BLOCK + warp_id;
+    const uint32_t base_n_block = group_n * BGJ_CUDA_TENSOR_NP_WIDE_TILES;
+
+    bgj_cuda_i8_a_frag_u a_frag;
+    bgj_cuda_i8_b_frag_u b_frag[BGJ_CUDA_TENSOR_NP_WIDE_TILES];
+    wmma::fragment<wmma::accumulator, 16, 16, 16, int> c_frag[BGJ_CUDA_TENSOR_NP_WIDE_TILES];
+
+    #pragma unroll
+    for (uint32_t col_tile = 0; col_tile < BGJ_CUDA_TENSOR_NP_WIDE_TILES; col_tile++) {
+        wmma::fill_fragment(c_frag[col_tile], 0);
+    }
+
+    for (uint32_t k_block = 0; k_block < k_blocks; k_block++) {
+        const uint64_t *a_src = p_a_frags +
+                                (((uint64_t)tile_block_p * k_blocks + k_block) *
+                                 BGJ_CUDA_WARP_SIZE + lane_id) *
+                                BGJ_CUDA_I8_A_FRAG_WORDS;
+        #pragma unroll
+        for (uint32_t word = 0; word < BGJ_CUDA_I8_A_FRAG_WORDS; word++) {
+            a_frag.word[word] = __ldg(a_src + word);
+        }
+        #pragma unroll
+        for (uint32_t col_tile = 0; col_tile < BGJ_CUDA_TENSOR_NP_WIDE_TILES; col_tile++) {
+            const uint64_t *b_src = n_b_frags +
+                                    (((uint64_t)(base_n_block + col_tile) * k_blocks + k_block) *
+                                     BGJ_CUDA_WARP_SIZE + lane_id) *
+                                    BGJ_CUDA_I8_B_FRAG_WORDS;
+            #pragma unroll
+            for (uint32_t word = 0; word < BGJ_CUDA_I8_B_FRAG_WORDS; word++) {
+                b_frag[col_tile].word[word] = __ldg(b_src + word);
+            }
+            wmma::mma_sync(c_frag[col_tile], a_frag.frag, b_frag[col_tile].frag, c_frag[col_tile]);
+        }
+    }
+
+    #pragma unroll
+    for (uint32_t col_tile = 0; col_tile < BGJ_CUDA_TENSOR_NP_WIDE_TILES; col_tile++) {
+        const uint32_t tile_p = tile_block_p * 16u;
+        const uint32_t tile_n = (base_n_block + col_tile) * 16u;
+        #pragma unroll
+        for (uint32_t element = 0; element < c_frag[col_tile].num_elements; element++) {
+            uint32_t row;
+            uint32_t col;
+            bgj_cuda_tensor_accumulator_coord(lane_id, element, &row, &col);
+            const uint32_t p = tile_p + row;
+            const uint32_t n = tile_n + col;
+            const int32_t dp = c_frag[col_tile].x[element];
+
+            if (p_norm[p] + n_norm[n] + dp < goal_norm) {
+                bgj_cuda_push_result(results, result_count, overflow, result_capacity,
+                                     BGJ_CUDA_SOL_A, p_ids[p], n_ids[n]);
+            }
+            if (record_dp &&
+                bgj_cuda_p_center_dot(p_norm, p_dot, p, raw_center_dp) +
+                bgj_cuda_n_center_dot(n_norm, n_dot, n, raw_center_dp) - dp < center_goal_norm) {
+                bgj_cuda_push_result(results, result_count, overflow, result_capacity,
+                                     BGJ_CUDA_SOL_SA, p_ids[p], n_ids[n]);
+            }
+        }
+    }
+}
+
+__global__ __launch_bounds__(BGJ_CUDA_TENSOR_THREADS_PER_BLOCK, 1)
+void bgj_cuda_search_np_tensor_wide_reordered_range_kernel(const uint64_t *p_a_frags,
+                                                           const uint64_t *n_b_frags,
+                                                           const uint32_t *p_ids,
+                                                           const uint32_t *n_ids,
+                                                           const int32_t *p_norm,
+                                                           const int32_t *n_norm,
+                                                           const int32_t *p_dot,
+                                                           const int32_t *n_dot,
+                                                           uint32_t group_blocks_n,
+                                                           uint64_t group_begin,
+                                                           uint64_t group_count,
+                                                           uint32_t k_blocks,
+                                                           int32_t goal_norm,
+                                                           int32_t center_goal_norm,
+                                                           int record_dp,
+                                                           int raw_center_dp,
+                                                           bgj_cuda_result_t *results,
+                                                           uint32_t result_capacity,
+                                                           uint32_t *result_count,
+                                                           int *overflow)
+{
+    const uint32_t warp_id = threadIdx.x / BGJ_CUDA_WARP_SIZE;
+    const uint32_t lane_id = threadIdx.x % BGJ_CUDA_WARP_SIZE;
+    const uint64_t local_group = (uint64_t)blockIdx.x;
+    if (local_group >= group_count) return;
+
+    const uint64_t tensor_group = group_begin + local_group;
+    const uint32_t group_p = (uint32_t)(tensor_group / group_blocks_n);
+    const uint32_t group_n =
+        (uint32_t)(tensor_group - (uint64_t)group_p * group_blocks_n);
     const uint32_t tile_block_p = group_p * BGJ_CUDA_TENSOR_WARPS_PER_BLOCK + warp_id;
     const uint32_t base_n_block = group_n * BGJ_CUDA_TENSOR_NP_WIDE_TILES;
 
@@ -2096,6 +2369,89 @@ void bgj_cuda_search_same_tensor_reordered_kernel(const uint64_t *a_frags,
     }
 }
 
+__global__ __launch_bounds__(BGJ_CUDA_TENSOR_THREADS_PER_BLOCK, 2)
+void bgj_cuda_search_same_tensor_reordered_range_kernel(const uint64_t *a_frags,
+                                                        const uint64_t *b_frags,
+                                                        const uint32_t *ids,
+                                                        const int32_t *norm,
+                                                        const int32_t *center_dot,
+                                                        uint32_t num_tiles,
+                                                        uint64_t tile_begin,
+                                                        uint64_t tile_count,
+                                                        uint32_t k_blocks,
+                                                        int32_t goal_norm,
+                                                        int32_t center_goal_norm,
+                                                        int record_dp,
+                                                        int raw_center_dp,
+                                                        int negative_bucket,
+                                                        bgj_cuda_result_t *results,
+                                                        uint32_t result_capacity,
+                                                        uint32_t *result_count,
+                                                        int *overflow)
+{
+    const uint32_t warp_id = threadIdx.x / BGJ_CUDA_WARP_SIZE;
+    const uint32_t lane_id = threadIdx.x % BGJ_CUDA_WARP_SIZE;
+    const uint64_t local_tile =
+        (uint64_t)blockIdx.x * BGJ_CUDA_TENSOR_WARPS_PER_BLOCK + warp_id;
+    if (local_tile >= tile_count) return;
+
+    const uint64_t tensor_tile = tile_begin + local_tile;
+    uint32_t tile_i;
+    uint32_t tile_j;
+    bgj_cuda_upper_tile_from_linear((uint32_t)tensor_tile, num_tiles, &tile_i, &tile_j);
+    const uint32_t base_i = tile_i * 16u;
+    const uint32_t base_j = tile_j * 16u;
+
+    bgj_cuda_i8_a_frag_u a_frag;
+    bgj_cuda_i8_b_frag_u b_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, int> c_frag;
+    wmma::fill_fragment(c_frag, 0);
+
+    for (uint32_t k_block = 0; k_block < k_blocks; k_block++) {
+        const uint64_t *a_src = a_frags +
+                                (((uint64_t)tile_i * k_blocks + k_block) *
+                                 BGJ_CUDA_WARP_SIZE + lane_id) *
+                                BGJ_CUDA_I8_A_FRAG_WORDS;
+        const uint64_t *b_src = b_frags +
+                                (((uint64_t)tile_j * k_blocks + k_block) *
+                                 BGJ_CUDA_WARP_SIZE + lane_id) *
+                                BGJ_CUDA_I8_B_FRAG_WORDS;
+        #pragma unroll
+        for (uint32_t word = 0; word < BGJ_CUDA_I8_A_FRAG_WORDS; word++) {
+            a_frag.word[word] = __ldg(a_src + word);
+        }
+        #pragma unroll
+        for (uint32_t word = 0; word < BGJ_CUDA_I8_B_FRAG_WORDS; word++) {
+            b_frag.word[word] = __ldg(b_src + word);
+        }
+        wmma::mma_sync(c_frag, a_frag.frag, b_frag.frag, c_frag);
+    }
+
+    #pragma unroll
+    for (uint32_t element = 0; element < c_frag.num_elements; element++) {
+        uint32_t row;
+        uint32_t col;
+        bgj_cuda_tensor_accumulator_coord(lane_id, element, &row, &col);
+        const uint32_t i = base_i + row;
+        const uint32_t j = base_j + col;
+        if (j <= i) continue;
+
+        const int32_t dp = c_frag.x[element];
+        if (norm[i] + norm[j] - dp < goal_norm) {
+            bgj_cuda_push_result(results, result_count, overflow, result_capacity,
+                                 BGJ_CUDA_SOL_S, ids[i], ids[j]);
+        }
+        if (record_dp &&
+            bgj_cuda_same_center_dot(norm, center_dot, i, raw_center_dp, negative_bucket) +
+            bgj_cuda_same_center_dot(norm, center_dot, j, raw_center_dp, negative_bucket) +
+            dp < center_goal_norm) {
+            bgj_cuda_push_result(results, result_count, overflow, result_capacity,
+                                 negative_bucket ? BGJ_CUDA_SOL_AA : BGJ_CUDA_SOL_SS,
+                                 ids[i], ids[j]);
+        }
+    }
+}
+
 __global__ void bgj_cuda_search_bucket_kernel(const int8_t *p_vecs,
                                               const int8_t *n_vecs,
                                               const uint32_t *p_ids,
@@ -2219,6 +2575,155 @@ __global__ void bgj_cuda_search_bucket_kernel(const int8_t *p_vecs,
                 j = (uint32_t)(local - (uint64_t)i * num_n);
             }
             if (j <= i) continue;
+
+            const int32_t dp = bgj_cuda_dot_i8(n_vecs + (uint64_t)i * vec_length,
+                                               n_vecs + (uint64_t)j * vec_length,
+                                               vec_length);
+
+            if (n_norm[i] + n_norm[j] - dp < goal_norm) {
+                bgj_cuda_push_result(results, result_count, overflow, result_capacity,
+                                     BGJ_CUDA_SOL_S, n_ids[i], n_ids[j]);
+            }
+            if (record_dp &&
+                bgj_cuda_n_center_dot(n_norm, n_dot, i, raw_center_dp) +
+                bgj_cuda_n_center_dot(n_norm, n_dot, j, raw_center_dp) + dp < center_goal_norm) {
+                bgj_cuda_push_result(results, result_count, overflow, result_capacity,
+                                     BGJ_CUDA_SOL_AA, n_ids[i], n_ids[j]);
+            }
+        }
+    }
+}
+
+__global__ void bgj_cuda_search_bucket_range_kernel(const int8_t *p_vecs,
+                                                    const int8_t *n_vecs,
+                                                    const uint32_t *p_ids,
+                                                    const uint32_t *n_ids,
+                                                    const int32_t *p_norm,
+                                                    const int32_t *n_norm,
+                                                    const int32_t *p_dot,
+                                                    const int32_t *n_dot,
+                                                    uint32_t num_p,
+                                                    uint32_t num_n,
+                                                    uint32_t tensor_np_num_p,
+                                                    uint32_t tensor_np_num_n,
+                                                    uint32_t tensor_same_num_p,
+                                                    uint32_t tensor_same_num_n,
+                                                    uint32_t vec_length,
+                                                    int32_t goal_norm,
+                                                    int32_t center_goal_norm,
+                                                    int record_dp,
+                                                    int raw_center_dp,
+                                                    uint64_t work_offset,
+                                                    uint64_t work_count,
+                                                    bgj_cuda_result_t *results,
+                                                    uint32_t result_capacity,
+                                                    uint32_t *result_count,
+                                                    int *overflow)
+{
+    const int tensor_active = tensor_np_num_p != 0 && tensor_np_num_n != 0;
+    const uint32_t tensor_n_tail = num_n - tensor_np_num_n;
+    const uint64_t np_tensor_n_tail = tensor_active ? (uint64_t)tensor_np_num_p * (uint64_t)tensor_n_tail : 0;
+    const uint64_t np_tensor_p_tail = tensor_active ? (uint64_t)(num_p - tensor_np_num_p) * (uint64_t)num_n : 0;
+    const uint64_t np_total = tensor_active ? np_tensor_n_tail + np_tensor_p_tail :
+                                             (uint64_t)num_p * (uint64_t)num_n;
+    const int tensor_p_same_active = tensor_same_num_p != 0;
+    const int tensor_n_same_active = tensor_same_num_n != 0;
+    const uint32_t p_tail = num_p - tensor_same_num_p;
+    const uint32_t n_tail = num_n - tensor_same_num_n;
+    const uint64_t pp_head_tail = tensor_p_same_active ? (uint64_t)tensor_same_num_p * (uint64_t)p_tail : 0;
+    const uint64_t nn_head_tail = tensor_n_same_active ? (uint64_t)tensor_same_num_n * (uint64_t)n_tail : 0;
+    const uint64_t pp_tail_rows = tensor_p_same_active ? (uint64_t)p_tail * (uint64_t)num_p : 0;
+    const uint64_t nn_tail_rows = tensor_n_same_active ? (uint64_t)n_tail * (uint64_t)num_n : 0;
+    const uint64_t pp_total = num_p > 1 ? (tensor_p_same_active ? pp_head_tail + pp_tail_rows :
+                                                                  (uint64_t)num_p * (uint64_t)num_p) : 0;
+    const uint64_t nn_total = num_n > 1 ? (tensor_n_same_active ? nn_head_tail + nn_tail_rows :
+                                                                  (uint64_t)num_n * (uint64_t)num_n) : 0;
+    const uint64_t full_total = np_total + pp_total + nn_total;
+    if (work_offset >= full_total || work_count == 0) return;
+    if (work_count > full_total - work_offset) work_count = full_total - work_offset;
+
+    const uint64_t stride = (uint64_t)blockDim.x * (uint64_t)gridDim.x;
+    uint64_t local = (uint64_t)blockIdx.x * (uint64_t)blockDim.x + (uint64_t)threadIdx.x;
+
+    for (; local < work_count; local += stride) {
+        const uint64_t work = work_offset + local;
+        if (work < np_total) {
+            uint32_t p;
+            uint32_t n;
+            if (tensor_active && work < np_tensor_n_tail) {
+                p = (uint32_t)(work / tensor_n_tail);
+                n = tensor_np_num_n + (uint32_t)(work - (uint64_t)p * tensor_n_tail);
+            } else if (tensor_active) {
+                const uint64_t tail_local = work - np_tensor_n_tail;
+                p = tensor_np_num_p + (uint32_t)(tail_local / num_n);
+                n = (uint32_t)(tail_local - (uint64_t)(p - tensor_np_num_p) * num_n);
+            } else {
+                p = num_n ? (uint32_t)(work / num_n) : 0;
+                n = num_n ? (uint32_t)(work - (uint64_t)p * num_n) : 0;
+            }
+            if (p >= num_p || n >= num_n) continue;
+
+            const int32_t dp = bgj_cuda_dot_i8(p_vecs + (uint64_t)p * vec_length,
+                                               n_vecs + (uint64_t)n * vec_length,
+                                               vec_length);
+
+            if (p_norm[p] + n_norm[n] + dp < goal_norm) {
+                bgj_cuda_push_result(results, result_count, overflow, result_capacity,
+                                     BGJ_CUDA_SOL_A, p_ids[p], n_ids[n]);
+            }
+            if (record_dp &&
+                bgj_cuda_p_center_dot(p_norm, p_dot, p, raw_center_dp) +
+                bgj_cuda_n_center_dot(n_norm, n_dot, n, raw_center_dp) - dp < center_goal_norm) {
+                bgj_cuda_push_result(results, result_count, overflow, result_capacity,
+                                     BGJ_CUDA_SOL_SA, p_ids[p], n_ids[n]);
+            }
+        } else if (work < np_total + pp_total) {
+            const uint64_t w = work - np_total;
+            uint32_t i;
+            uint32_t j;
+            if (tensor_p_same_active && w < pp_head_tail) {
+                i = (uint32_t)(w / p_tail);
+                j = tensor_same_num_p + (uint32_t)(w - (uint64_t)i * p_tail);
+            } else if (tensor_p_same_active) {
+                const uint64_t tail_local = w - pp_head_tail;
+                i = tensor_same_num_p + (uint32_t)(tail_local / num_p);
+                j = (uint32_t)(tail_local - (uint64_t)(i - tensor_same_num_p) * num_p);
+            } else {
+                i = num_p ? (uint32_t)(w / num_p) : 0;
+                j = num_p ? (uint32_t)(w - (uint64_t)i * num_p) : 0;
+            }
+            if (i >= num_p || j >= num_p || j <= i) continue;
+
+            const int32_t dp = bgj_cuda_dot_i8(p_vecs + (uint64_t)i * vec_length,
+                                               p_vecs + (uint64_t)j * vec_length,
+                                               vec_length);
+
+            if (p_norm[i] + p_norm[j] - dp < goal_norm) {
+                bgj_cuda_push_result(results, result_count, overflow, result_capacity,
+                                     BGJ_CUDA_SOL_S, p_ids[i], p_ids[j]);
+            }
+            if (record_dp &&
+                bgj_cuda_p_center_dot(p_norm, p_dot, i, raw_center_dp) +
+                bgj_cuda_p_center_dot(p_norm, p_dot, j, raw_center_dp) + dp < center_goal_norm) {
+                bgj_cuda_push_result(results, result_count, overflow, result_capacity,
+                                     BGJ_CUDA_SOL_SS, p_ids[i], p_ids[j]);
+            }
+        } else {
+            const uint64_t w = work - np_total - pp_total;
+            uint32_t i;
+            uint32_t j;
+            if (tensor_n_same_active && w < nn_head_tail) {
+                i = (uint32_t)(w / n_tail);
+                j = tensor_same_num_n + (uint32_t)(w - (uint64_t)i * n_tail);
+            } else if (tensor_n_same_active) {
+                const uint64_t tail_local = w - nn_head_tail;
+                i = tensor_same_num_n + (uint32_t)(tail_local / num_n);
+                j = (uint32_t)(tail_local - (uint64_t)(i - tensor_same_num_n) * num_n);
+            } else {
+                i = num_n ? (uint32_t)(w / num_n) : 0;
+                j = num_n ? (uint32_t)(w - (uint64_t)i * num_n) : 0;
+            }
+            if (i >= num_n || j >= num_n || j <= i) continue;
 
             const int32_t dp = bgj_cuda_dot_i8(n_vecs + (uint64_t)i * vec_length,
                                                n_vecs + (uint64_t)j * vec_length,
@@ -3322,6 +3827,11 @@ static int bgj_cuda_prepare_stream(bgj_cuda_raw_scratch_t *scratch)
     if (!bgj_cuda_current_device(&device)) return 0;
     if (scratch->device >= 0 && scratch->device != device) {
         scratch->release();
+        cudaError_t err = cudaSetDevice(device);
+        if (err != cudaSuccess) {
+            set_cuda_error("cudaSetDevice prepare stream", err);
+            return 0;
+        }
     }
     if (scratch->stream_ready) return 1;
     cudaError_t err = cudaStreamCreateWithFlags(&scratch->stream, cudaStreamNonBlocking);
@@ -3381,7 +3891,8 @@ static int bgj_cuda_prepare_search_profile_events(bgj_cuda_raw_scratch_t *scratc
 
 static int bgj_cuda_search_profile_reset(bgj_cuda_raw_scratch_t *scratch)
 {
-    scratch->phase_profile_active = bgj_cuda_phase_profile_requested();
+    scratch->phase_profile_active =
+        bgj_cuda_phase_profile_requested() || bgj_cuda_split_profile_requested();
     for (int i = 0; i < BGJ_CUDA_SEARCH_PHASE_COUNT; i++) {
         scratch->profile_ran[i] = 0;
         scratch->last_phase_profile.sec[i] = 0.0;
@@ -3447,6 +3958,11 @@ static int bgj_cuda_prepare_bucket_stream(bgj_cuda_bucket_scratch_t *scratch)
     if (!bgj_cuda_current_device(&device)) return 0;
     if (scratch->device >= 0 && scratch->device != device) {
         scratch->release();
+        cudaError_t err = cudaSetDevice(device);
+        if (err != cudaSuccess) {
+            set_cuda_error("cudaSetDevice prepare bucket stream", err);
+            return 0;
+        }
     }
     if (scratch->stream_ready) return 1;
     cudaError_t err = cudaStreamCreateWithFlags(&scratch->stream, cudaStreamNonBlocking);
@@ -3800,6 +4316,11 @@ static int bgj_cuda_prepare_materialize_stream(bgj_cuda_materialize_scratch_t *s
     if (!bgj_cuda_current_device(&device)) return 0;
     if (scratch->device >= 0 && scratch->device != device) {
         scratch->release();
+        cudaError_t err = cudaSetDevice(device);
+        if (err != cudaSuccess) {
+            set_cuda_error("cudaSetDevice prepare materialize stream", err);
+            return 0;
+        }
     }
     if (!scratch->stream_ready) {
         cudaError_t err = cudaStreamCreateWithFlags(&scratch->stream, cudaStreamNonBlocking);
@@ -5111,6 +5632,64 @@ static int bgj_cuda_deterministic_results_requested()
     return env && env[0] && env[0] != '0';
 }
 
+static int bgj_cuda_multi_gpu_batch_requested()
+{
+    return bgj_cuda_env_flag("BGJ_CUDA_MULTI_GPU_BATCH",
+                             bgj_cuda_stable_multi_gpu_requested());
+}
+
+static uint64_t bgj_cuda_multi_gpu_batch_min_dots()
+{
+    // Smaller batch thresholds have reproduced CUDA state corruption on SVP-120.
+    const uint64_t floor = 64ULL * 1024ULL * 1024ULL;
+    const uint64_t value =
+        bgj_cuda_env_u64("BGJ_CUDA_MULTI_GPU_BATCH_MIN_DOTS", floor);
+    if (value < floor) {
+        return bgj_cuda_env_flag("BGJ_CUDA_MULTI_GPU_BATCH_ALLOW_SMALL", 0) ?
+               value : floor;
+    }
+    return value;
+}
+
+static int bgj_cuda_multi_gpu_batch_split_requested()
+{
+    return bgj_cuda_env_flag("BGJ_CUDA_MULTI_GPU_BATCH_SPLIT", 0);
+}
+
+static uint64_t bgj_cuda_multi_gpu_batch_split_min_dots()
+{
+    return bgj_cuda_env_u64("BGJ_CUDA_MULTI_GPU_BATCH_SPLIT_MIN_DOTS",
+                            bgj_cuda_multi_gpu_batch_min_dots());
+}
+
+static uint32_t bgj_cuda_multi_gpu_batch_split_min_share_pct()
+{
+    uint64_t value = bgj_cuda_env_u64("BGJ_CUDA_MULTI_GPU_BATCH_SPLIT_MIN_SHARE_PCT", 0);
+    if (value > 100) value = 100;
+    return (uint32_t)value;
+}
+
+static int bgj_cuda_multi_gpu_batch_tensor_split_requested()
+{
+    return bgj_cuda_env_flag("BGJ_CUDA_MULTI_GPU_BATCH_TENSOR_SPLIT", 1);
+}
+
+static int bgj_cuda_single_bucket_split_requested()
+{
+    return bgj_cuda_env_flag("BGJ_CUDA_SINGLE_BUCKET_SPLIT", 0);
+}
+
+static int bgj_cuda_single_bucket_tensor_split_requested()
+{
+    return bgj_cuda_env_flag("BGJ_CUDA_SINGLE_BUCKET_TENSOR_SPLIT", 1);
+}
+
+static uint64_t bgj_cuda_single_bucket_split_min_dots()
+{
+    return bgj_cuda_env_u64("BGJ_CUDA_SINGLE_BUCKET_SPLIT_MIN_DOTS",
+                            64ULL * 1024ULL * 1024ULL);
+}
+
 static int bgj_cuda_tensor_same_requested()
 {
     const char *env = getenv("BGJ_CUDA_TENSOR_SAME");
@@ -5581,6 +6160,10 @@ static int bgj_cuda_search_bucket_raw_submit(bgj_cuda_raw_scratch_t *scratch,
                                              int device_transform_dp,
                                              int raw_center_dp,
                                              int record_dot_copy_event,
+                                             uint64_t work_offset,
+                                             uint64_t work_count,
+                                             uint32_t tensor_split_slot,
+                                             uint32_t tensor_split_count,
                                              uint32_t result_capacity,
                                              uint32_t *submitted_result_count,
                                              int *submitted_overflow)
@@ -5592,6 +6175,8 @@ static int bgj_cuda_search_bucket_raw_submit(bgj_cuda_raw_scratch_t *scratch,
     uint32_t tensor_np_min_tiles = 0;
     uint32_t tensor_same_min_tiles = 0;
     const int use_pool = pool_vecs_host != NULL;
+    const int range_active = work_offset != 0 || work_count != 0;
+    const int tensor_split_active = tensor_split_count > 1;
     int8_t *pool_vecs_device = NULL;
     uint32_t *h_det_counts = NULL;
     uint32_t *h_det_offsets = NULL;
@@ -5602,6 +6187,30 @@ static int bgj_cuda_search_bucket_raw_submit(bgj_cuda_raw_scratch_t *scratch,
     }
     if (record_dp && (transform_dp + device_transform_dp + raw_center_dp) > 1) {
         set_plain_error("conflicting CUDA dot transforms");
+        return 0;
+    }
+    if (range_active && tensor_split_active) {
+        set_plain_error("conflicting CUDA bucket split modes");
+        return 0;
+    }
+    if (tensor_split_active && tensor_split_slot >= tensor_split_count) {
+        set_plain_error("invalid CUDA tensor split slot");
+        return 0;
+    }
+    if (tensor_split_active && transform_dp) {
+        set_plain_error("tensor CUDA bucket split does not support device CRED transform");
+        return 0;
+    }
+    if (range_active && transform_dp) {
+        set_plain_error("range CUDA bucket split does not support device CRED transform");
+        return 0;
+    }
+    if (range_active && bgj_cuda_deterministic_results_requested()) {
+        set_plain_error("range CUDA bucket split does not support deterministic results");
+        return 0;
+    }
+    if (tensor_split_active && bgj_cuda_deterministic_results_requested()) {
+        set_plain_error("tensor CUDA bucket split does not support deterministic results");
         return 0;
     }
     if (raw_center_dp && bgj_cuda_deterministic_results_requested()) {
@@ -5765,7 +6374,7 @@ static int bgj_cuda_search_bucket_raw_submit(bgj_cuda_raw_scratch_t *scratch,
         if (!bgj_cuda_search_profile_end(scratch, BGJ_CUDA_SEARCH_PHASE_CRED)) goto fail;
     }
 
-    if (bgj_cuda_deterministic_results_requested()) {
+    if (!range_active && !tensor_split_active && bgj_cuda_deterministic_results_requested()) {
         const uint64_t np_pairs = (uint64_t)num_p * (uint64_t)num_n;
         const uint64_t pp_pairs = num_p > 1 ? (uint64_t)num_p * (uint64_t)num_p : 0ull;
         const uint64_t nn_pairs = num_n > 1 ? (uint64_t)num_n * (uint64_t)num_n : 0ull;
@@ -5918,7 +6527,373 @@ static int bgj_cuda_search_bucket_raw_submit(bgj_cuda_raw_scratch_t *scratch,
         return 1;
     }
 
-    if (bgj_cuda_tensor_requested() &&
+    if (tensor_split_active &&
+        bgj_cuda_tensor_requested() &&
+        bgj_cuda_tensor_capable() &&
+        bgj_cuda_tensor_reorder_requested() &&
+        vec_length % 16 == 0) {
+        const uint32_t k_blocks = vec_length / 16u;
+        tensor_np_min_tiles = bgj_cuda_tensor_np_min_tiles();
+        tensor_same_min_tiles = bgj_cuda_tensor_same_min_tiles();
+
+        if (num_p >= 16 && num_n >= 16) {
+            if (!bgj_cuda_search_profile_begin(scratch, BGJ_CUDA_SEARCH_PHASE_TENSOR_NP)) goto fail;
+            tensor_np_num_p = (num_p / 16u) * 16u;
+            tensor_np_num_n = (num_n / 16u) * 16u;
+            const uint32_t tensor_blocks_p = tensor_np_num_p / 16u;
+            const uint32_t tensor_blocks_n = tensor_np_num_n / 16u;
+            const uint64_t tensor_tiles =
+                (uint64_t)tensor_blocks_p * (uint64_t)tensor_blocks_n;
+            int tensor_np_launched = 0;
+            if (tensor_tiles >= tensor_np_min_tiles &&
+                bgj_cuda_tensor_np_wide_requested() &&
+                tensor_blocks_p >= BGJ_CUDA_TENSOR_NP_WIDE_TILES &&
+                tensor_blocks_n >= BGJ_CUDA_TENSOR_NP_WIDE_TILES) {
+                const uint32_t wide_blocks_p =
+                    (tensor_blocks_p / BGJ_CUDA_TENSOR_NP_WIDE_TILES) *
+                    BGJ_CUDA_TENSOR_NP_WIDE_TILES;
+                const uint32_t wide_blocks_n =
+                    (tensor_blocks_n / BGJ_CUDA_TENSOR_NP_WIDE_TILES) *
+                    BGJ_CUDA_TENSOR_NP_WIDE_TILES;
+                const uint32_t wide_group_blocks_n = wide_blocks_n / BGJ_CUDA_TENSOR_NP_WIDE_TILES;
+                const uint64_t wide_groups =
+                    (uint64_t)(wide_blocks_p / BGJ_CUDA_TENSOR_NP_WIDE_TILES) *
+                    (uint64_t)wide_group_blocks_n;
+                const uint64_t p_frag_words =
+                    (uint64_t)wide_blocks_p * k_blocks * BGJ_CUDA_WARP_SIZE *
+                    BGJ_CUDA_I8_A_FRAG_WORDS;
+                const uint64_t n_frag_words =
+                    (uint64_t)wide_blocks_n * k_blocks * BGJ_CUDA_WARP_SIZE *
+                    BGJ_CUDA_I8_B_FRAG_WORDS;
+                const uint64_t p_pack_grid =
+                    ((uint64_t)wide_blocks_p * k_blocks + BGJ_CUDA_TENSOR_WARPS_PER_BLOCK - 1u) /
+                    BGJ_CUDA_TENSOR_WARPS_PER_BLOCK;
+                const uint64_t n_pack_grid =
+                    ((uint64_t)wide_blocks_n * k_blocks + BGJ_CUDA_TENSOR_WARPS_PER_BLOCK - 1u) /
+                    BGJ_CUDA_TENSOR_WARPS_PER_BLOCK;
+                const uint64_t group_begin =
+                    ((uint64_t)tensor_split_slot * wide_groups) / (uint64_t)tensor_split_count;
+                const uint64_t group_end =
+                    ((uint64_t)(tensor_split_slot + 1u) * wide_groups) / (uint64_t)tensor_split_count;
+                const uint64_t group_count = group_end > group_begin ? group_end - group_begin : 0;
+                if (wide_groups <= 0x7fffffffu &&
+                    group_count <= 0x7fffffffu &&
+                    p_pack_grid <= 0x7fffffffu &&
+                    n_pack_grid <= 0x7fffffffu) {
+                    CUDA_ENSURE(scratch->p_tensor_a_frags,
+                                scratch->p_tensor_a_frag_capacity,
+                                (size_t)p_frag_words * sizeof(uint64_t));
+                    CUDA_ENSURE(scratch->n_tensor_b_frags,
+                                scratch->n_tensor_b_frag_capacity,
+                                (size_t)n_frag_words * sizeof(uint64_t));
+                    bgj_cuda_pack_a_frag_kernel<<<(uint32_t)p_pack_grid,
+                                                  BGJ_CUDA_TENSOR_THREADS_PER_BLOCK,
+                                                  0,
+                                                  stream>>>(scratch->p_vecs,
+                                                            wide_blocks_p,
+                                                            k_blocks,
+                                                            vec_length,
+                                                            scratch->p_tensor_a_frags);
+                    CUDA_TRY(cudaGetLastError());
+                    bgj_cuda_pack_b_frag_kernel<<<(uint32_t)n_pack_grid,
+                                                  BGJ_CUDA_TENSOR_THREADS_PER_BLOCK,
+                                                  0,
+                                                  stream>>>(scratch->n_vecs,
+                                                            wide_blocks_n,
+                                                            k_blocks,
+                                                            vec_length,
+                                                            scratch->n_tensor_b_frags);
+                    CUDA_TRY(cudaGetLastError());
+                    if (group_count) {
+                        bgj_cuda_search_np_tensor_wide_reordered_range_kernel<<<(uint32_t)group_count,
+                                                                                BGJ_CUDA_TENSOR_THREADS_PER_BLOCK,
+                                                                                0,
+                                                                                stream>>>(scratch->p_tensor_a_frags,
+                                                                                          scratch->n_tensor_b_frags,
+                                                                                          scratch->p_ids,
+                                                                                          scratch->n_ids,
+                                                                                          scratch->p_norm,
+                                                                                          scratch->n_norm,
+                                                                                          scratch->p_dot,
+                                                                                          scratch->n_dot,
+                                                                                          wide_group_blocks_n,
+                                                                                          group_begin,
+                                                                                          group_count,
+                                                                                          k_blocks,
+                                                                                          goal_norm,
+                                                                                          goal_norm - center_norm,
+                                                                                          record_dp,
+                                                                                          raw_center_dp,
+                                                                                          scratch->results,
+                                                                                          result_capacity,
+                                                                                          scratch->result_count,
+                                                                                          scratch->overflow);
+                        CUDA_TRY(cudaGetLastError());
+                    }
+                    tensor_np_num_p = wide_blocks_p * 16u;
+                    tensor_np_num_n = wide_blocks_n * 16u;
+                    tensor_np_launched = 1;
+                }
+            }
+            if (!tensor_np_launched &&
+                tensor_tiles >= tensor_np_min_tiles &&
+                tensor_tiles <= 0xffffffffULL) {
+                const uint64_t p_frag_words =
+                    (uint64_t)tensor_blocks_p * k_blocks * BGJ_CUDA_WARP_SIZE *
+                    BGJ_CUDA_I8_A_FRAG_WORDS;
+                const uint64_t n_frag_words =
+                    (uint64_t)tensor_blocks_n * k_blocks * BGJ_CUDA_WARP_SIZE *
+                    BGJ_CUDA_I8_B_FRAG_WORDS;
+                const uint64_t p_pack_grid =
+                    ((uint64_t)tensor_blocks_p * k_blocks + BGJ_CUDA_TENSOR_WARPS_PER_BLOCK - 1u) /
+                    BGJ_CUDA_TENSOR_WARPS_PER_BLOCK;
+                const uint64_t n_pack_grid =
+                    ((uint64_t)tensor_blocks_n * k_blocks + BGJ_CUDA_TENSOR_WARPS_PER_BLOCK - 1u) /
+                    BGJ_CUDA_TENSOR_WARPS_PER_BLOCK;
+                const uint64_t tile_begin =
+                    ((uint64_t)tensor_split_slot * tensor_tiles) / (uint64_t)tensor_split_count;
+                const uint64_t tile_end =
+                    ((uint64_t)(tensor_split_slot + 1u) * tensor_tiles) / (uint64_t)tensor_split_count;
+                const uint64_t tile_count = tile_end > tile_begin ? tile_end - tile_begin : 0;
+                const uint64_t tensor_grid =
+                    (tile_count + BGJ_CUDA_TENSOR_WARPS_PER_BLOCK - 1u) /
+                    BGJ_CUDA_TENSOR_WARPS_PER_BLOCK;
+                if (p_pack_grid <= 0x7fffffffu &&
+                    n_pack_grid <= 0x7fffffffu &&
+                    tensor_grid <= 0x7fffffffu) {
+                    CUDA_ENSURE(scratch->p_tensor_a_frags,
+                                scratch->p_tensor_a_frag_capacity,
+                                (size_t)p_frag_words * sizeof(uint64_t));
+                    CUDA_ENSURE(scratch->n_tensor_b_frags,
+                                scratch->n_tensor_b_frag_capacity,
+                                (size_t)n_frag_words * sizeof(uint64_t));
+                    bgj_cuda_pack_a_frag_kernel<<<(uint32_t)p_pack_grid,
+                                                  BGJ_CUDA_TENSOR_THREADS_PER_BLOCK,
+                                                  0,
+                                                  stream>>>(scratch->p_vecs,
+                                                            tensor_blocks_p,
+                                                            k_blocks,
+                                                            vec_length,
+                                                            scratch->p_tensor_a_frags);
+                    CUDA_TRY(cudaGetLastError());
+                    bgj_cuda_pack_b_frag_kernel<<<(uint32_t)n_pack_grid,
+                                                  BGJ_CUDA_TENSOR_THREADS_PER_BLOCK,
+                                                  0,
+                                                  stream>>>(scratch->n_vecs,
+                                                            tensor_blocks_n,
+                                                            k_blocks,
+                                                            vec_length,
+                                                            scratch->n_tensor_b_frags);
+                    CUDA_TRY(cudaGetLastError());
+                    if (tile_count) {
+                        bgj_cuda_search_np_tensor_reordered_range_kernel<<<(uint32_t)tensor_grid,
+                                                                           BGJ_CUDA_TENSOR_THREADS_PER_BLOCK,
+                                                                           0,
+                                                                           stream>>>(scratch->p_tensor_a_frags,
+                                                                                     scratch->n_tensor_b_frags,
+                                                                                     scratch->p_ids,
+                                                                                     scratch->n_ids,
+                                                                                     scratch->p_norm,
+                                                                                     scratch->n_norm,
+                                                                                     scratch->p_dot,
+                                                                                     scratch->n_dot,
+                                                                                     tensor_blocks_n,
+                                                                                     tile_begin,
+                                                                                     tile_count,
+                                                                                     k_blocks,
+                                                                                     goal_norm,
+                                                                                     goal_norm - center_norm,
+                                                                                     record_dp,
+                                                                                     raw_center_dp,
+                                                                                     scratch->results,
+                                                                                     result_capacity,
+                                                                                     scratch->result_count,
+                                                                                     scratch->overflow);
+                        CUDA_TRY(cudaGetLastError());
+                    }
+                } else {
+                    tensor_np_num_p = 0;
+                    tensor_np_num_n = 0;
+                }
+            } else {
+                if (!tensor_np_launched) {
+                    tensor_np_num_p = 0;
+                    tensor_np_num_n = 0;
+                }
+            }
+            if (!bgj_cuda_search_profile_end(scratch, BGJ_CUDA_SEARCH_PHASE_TENSOR_NP)) goto fail;
+        }
+
+        if (bgj_cuda_tensor_same_requested() && num_p >= 16) {
+            if (!bgj_cuda_search_profile_begin(scratch, BGJ_CUDA_SEARCH_PHASE_TENSOR_PP)) goto fail;
+            tensor_same_num_p = (num_p / 16u) * 16u;
+            const uint32_t tensor_blocks_p = tensor_same_num_p / 16u;
+            const uint64_t tensor_tiles_p =
+                ((uint64_t)tensor_blocks_p * (tensor_blocks_p + 1u)) / 2u;
+            if (tensor_blocks_p >= tensor_same_min_tiles &&
+                tensor_tiles_p <= 0x7fffffffu) {
+                const uint64_t a_frag_words =
+                    (uint64_t)tensor_blocks_p * k_blocks * BGJ_CUDA_WARP_SIZE *
+                    BGJ_CUDA_I8_A_FRAG_WORDS;
+                const uint64_t b_frag_words =
+                    (uint64_t)tensor_blocks_p * k_blocks * BGJ_CUDA_WARP_SIZE *
+                    BGJ_CUDA_I8_B_FRAG_WORDS;
+                const uint64_t pack_grid =
+                    ((uint64_t)tensor_blocks_p * k_blocks + BGJ_CUDA_TENSOR_WARPS_PER_BLOCK - 1u) /
+                    BGJ_CUDA_TENSOR_WARPS_PER_BLOCK;
+                const uint64_t tile_begin =
+                    ((uint64_t)tensor_split_slot * tensor_tiles_p) / (uint64_t)tensor_split_count;
+                const uint64_t tile_end =
+                    ((uint64_t)(tensor_split_slot + 1u) * tensor_tiles_p) / (uint64_t)tensor_split_count;
+                const uint64_t tile_count = tile_end > tile_begin ? tile_end - tile_begin : 0;
+                const uint64_t tensor_grid =
+                    (tile_count + BGJ_CUDA_TENSOR_WARPS_PER_BLOCK - 1u) /
+                    BGJ_CUDA_TENSOR_WARPS_PER_BLOCK;
+                if (pack_grid <= 0x7fffffffu && tensor_grid <= 0x7fffffffu) {
+                    CUDA_ENSURE(scratch->p_tensor_a_frags,
+                                scratch->p_tensor_a_frag_capacity,
+                                (size_t)a_frag_words * sizeof(uint64_t));
+                    CUDA_ENSURE(scratch->p_tensor_b_frags,
+                                scratch->p_tensor_b_frag_capacity,
+                                (size_t)b_frag_words * sizeof(uint64_t));
+                    bgj_cuda_pack_a_frag_kernel<<<(uint32_t)pack_grid,
+                                                  BGJ_CUDA_TENSOR_THREADS_PER_BLOCK,
+                                                  0,
+                                                  stream>>>(scratch->p_vecs,
+                                                            tensor_blocks_p,
+                                                            k_blocks,
+                                                            vec_length,
+                                                            scratch->p_tensor_a_frags);
+                    CUDA_TRY(cudaGetLastError());
+                    bgj_cuda_pack_b_frag_kernel<<<(uint32_t)pack_grid,
+                                                  BGJ_CUDA_TENSOR_THREADS_PER_BLOCK,
+                                                  0,
+                                                  stream>>>(scratch->p_vecs,
+                                                            tensor_blocks_p,
+                                                            k_blocks,
+                                                            vec_length,
+                                                            scratch->p_tensor_b_frags);
+                    CUDA_TRY(cudaGetLastError());
+                    if (tile_count) {
+                        bgj_cuda_search_same_tensor_reordered_range_kernel<<<(uint32_t)tensor_grid,
+                                                                             BGJ_CUDA_TENSOR_THREADS_PER_BLOCK,
+                                                                             0,
+                                                                             stream>>>(scratch->p_tensor_a_frags,
+                                                                                       scratch->p_tensor_b_frags,
+                                                                                       scratch->p_ids,
+                                                                                       scratch->p_norm,
+                                                                                       scratch->p_dot,
+                                                                                       tensor_blocks_p,
+                                                                                       tile_begin,
+                                                                                       tile_count,
+                                                                                       k_blocks,
+                                                                                       goal_norm,
+                                                                                       goal_norm - center_norm,
+                                                                                       record_dp,
+                                                                                       raw_center_dp,
+                                                                                       0,
+                                                                                       scratch->results,
+                                                                                       result_capacity,
+                                                                                       scratch->result_count,
+                                                                                       scratch->overflow);
+                        CUDA_TRY(cudaGetLastError());
+                    }
+                } else {
+                    tensor_same_num_p = 0;
+                }
+            } else {
+                tensor_same_num_p = 0;
+            }
+            if (!bgj_cuda_search_profile_end(scratch, BGJ_CUDA_SEARCH_PHASE_TENSOR_PP)) goto fail;
+        }
+
+        if (bgj_cuda_tensor_same_requested() && num_n >= 16) {
+            if (!bgj_cuda_search_profile_begin(scratch, BGJ_CUDA_SEARCH_PHASE_TENSOR_NN)) goto fail;
+            tensor_same_num_n = (num_n / 16u) * 16u;
+            const uint32_t tensor_blocks_n = tensor_same_num_n / 16u;
+            const uint64_t tensor_tiles_n =
+                ((uint64_t)tensor_blocks_n * (tensor_blocks_n + 1u)) / 2u;
+            if (tensor_blocks_n >= tensor_same_min_tiles &&
+                tensor_tiles_n <= 0x7fffffffu) {
+                const uint64_t a_frag_words =
+                    (uint64_t)tensor_blocks_n * k_blocks * BGJ_CUDA_WARP_SIZE *
+                    BGJ_CUDA_I8_A_FRAG_WORDS;
+                const uint64_t b_frag_words =
+                    (uint64_t)tensor_blocks_n * k_blocks * BGJ_CUDA_WARP_SIZE *
+                    BGJ_CUDA_I8_B_FRAG_WORDS;
+                const uint64_t pack_grid =
+                    ((uint64_t)tensor_blocks_n * k_blocks + BGJ_CUDA_TENSOR_WARPS_PER_BLOCK - 1u) /
+                    BGJ_CUDA_TENSOR_WARPS_PER_BLOCK;
+                const uint64_t tile_begin =
+                    ((uint64_t)tensor_split_slot * tensor_tiles_n) / (uint64_t)tensor_split_count;
+                const uint64_t tile_end =
+                    ((uint64_t)(tensor_split_slot + 1u) * tensor_tiles_n) / (uint64_t)tensor_split_count;
+                const uint64_t tile_count = tile_end > tile_begin ? tile_end - tile_begin : 0;
+                const uint64_t tensor_grid =
+                    (tile_count + BGJ_CUDA_TENSOR_WARPS_PER_BLOCK - 1u) /
+                    BGJ_CUDA_TENSOR_WARPS_PER_BLOCK;
+                if (pack_grid <= 0x7fffffffu && tensor_grid <= 0x7fffffffu) {
+                    CUDA_ENSURE(scratch->n_tensor_a_frags,
+                                scratch->n_tensor_a_frag_capacity,
+                                (size_t)a_frag_words * sizeof(uint64_t));
+                    CUDA_ENSURE(scratch->n_tensor_b_frags,
+                                scratch->n_tensor_b_frag_capacity,
+                                (size_t)b_frag_words * sizeof(uint64_t));
+                    bgj_cuda_pack_a_frag_kernel<<<(uint32_t)pack_grid,
+                                                  BGJ_CUDA_TENSOR_THREADS_PER_BLOCK,
+                                                  0,
+                                                  stream>>>(scratch->n_vecs,
+                                                            tensor_blocks_n,
+                                                            k_blocks,
+                                                            vec_length,
+                                                            scratch->n_tensor_a_frags);
+                    CUDA_TRY(cudaGetLastError());
+                    bgj_cuda_pack_b_frag_kernel<<<(uint32_t)pack_grid,
+                                                  BGJ_CUDA_TENSOR_THREADS_PER_BLOCK,
+                                                  0,
+                                                  stream>>>(scratch->n_vecs,
+                                                            tensor_blocks_n,
+                                                            k_blocks,
+                                                            vec_length,
+                                                            scratch->n_tensor_b_frags);
+                    CUDA_TRY(cudaGetLastError());
+                    if (tile_count) {
+                        bgj_cuda_search_same_tensor_reordered_range_kernel<<<(uint32_t)tensor_grid,
+                                                                             BGJ_CUDA_TENSOR_THREADS_PER_BLOCK,
+                                                                             0,
+                                                                             stream>>>(scratch->n_tensor_a_frags,
+                                                                                       scratch->n_tensor_b_frags,
+                                                                                       scratch->n_ids,
+                                                                                       scratch->n_norm,
+                                                                                       scratch->n_dot,
+                                                                                       tensor_blocks_n,
+                                                                                       tile_begin,
+                                                                                       tile_count,
+                                                                                       k_blocks,
+                                                                                       goal_norm,
+                                                                                       goal_norm - center_norm,
+                                                                                       record_dp,
+                                                                                       raw_center_dp,
+                                                                                       1,
+                                                                                       scratch->results,
+                                                                                       result_capacity,
+                                                                                       scratch->result_count,
+                                                                                       scratch->overflow);
+                        CUDA_TRY(cudaGetLastError());
+                    }
+                } else {
+                    tensor_same_num_n = 0;
+                }
+            } else {
+                tensor_same_num_n = 0;
+            }
+            if (!bgj_cuda_search_profile_end(scratch, BGJ_CUDA_SEARCH_PHASE_TENSOR_NN)) goto fail;
+        }
+    }
+
+    if (!range_active &&
+        !tensor_split_active &&
+        bgj_cuda_tensor_requested() &&
         bgj_cuda_tensor_capable() &&
         vec_length % 16 == 0) {
         tensor_np_min_tiles = bgj_cuda_tensor_np_min_tiles();
@@ -6486,6 +7461,58 @@ static int bgj_cuda_search_bucket_raw_submit(bgj_cuda_raw_scratch_t *scratch,
         const uint64_t total = np_total +
                                pp_total +
                                nn_total;
+        if (range_active || tensor_split_active) {
+            uint64_t active_offset = 0;
+            uint64_t active_count = 0;
+            if (range_active && work_offset < total) {
+                active_offset = work_offset;
+                active_count = work_count;
+                if (active_count == 0 || active_count > total - work_offset) {
+                    active_count = total - work_offset;
+                }
+            } else if (tensor_split_active && total) {
+                active_offset =
+                    ((uint64_t)tensor_split_slot * total) / (uint64_t)tensor_split_count;
+                const uint64_t active_end =
+                    ((uint64_t)(tensor_split_slot + 1u) * total) / (uint64_t)tensor_split_count;
+                active_count = active_end > active_offset ? active_end - active_offset : 0;
+            }
+            const uint32_t threads = 256;
+            uint32_t blocks = (uint32_t)((active_count + threads - 1) / threads);
+            if (blocks == 0) blocks = 1;
+            if (blocks > 65535) blocks = 65535;
+            if (active_count) {
+                if (!bgj_cuda_search_profile_begin(scratch, BGJ_CUDA_SEARCH_PHASE_SCALAR)) goto fail;
+                bgj_cuda_search_bucket_range_kernel<<<blocks, threads, 0, stream>>>(scratch->p_vecs,
+                                                                                    scratch->n_vecs,
+                                                                                    scratch->p_ids,
+                                                                                    scratch->n_ids,
+                                                                                    scratch->p_norm,
+                                                                                    scratch->n_norm,
+                                                                                    scratch->p_dot,
+                                                                                    scratch->n_dot,
+                                                                                    num_p,
+                                                                                    num_n,
+                                                                                    tensor_np_num_p,
+                                                                                    tensor_np_num_n,
+                                                                                    tensor_same_num_p,
+                                                                                    tensor_same_num_n,
+                                                                                    vec_length,
+                                                                                    goal_norm,
+                                                                                    goal_norm - center_norm,
+                                                                                    record_dp,
+                                                                                    raw_center_dp,
+                                                                                    active_offset,
+                                                                                    active_count,
+                                                                                    scratch->results,
+                                                                                    result_capacity,
+                                                                                    scratch->result_count,
+                                                                                    scratch->overflow);
+                CUDA_TRY(cudaGetLastError());
+                if (!bgj_cuda_search_profile_end(scratch, BGJ_CUDA_SEARCH_PHASE_SCALAR)) goto fail;
+            }
+            goto scalar_done;
+        }
         const uint32_t threads = 256;
         uint32_t blocks = (uint32_t)((total + threads - 1) / threads);
         if (blocks == 0) blocks = 1;
@@ -6520,6 +7547,7 @@ static int bgj_cuda_search_bucket_raw_submit(bgj_cuda_raw_scratch_t *scratch,
         }
     }
 
+scalar_done:
     if (!bgj_cuda_search_profile_begin(scratch, BGJ_CUDA_SEARCH_PHASE_COUNT_COPY)) goto fail;
     CUDA_TRY(cudaMemcpyAsync(scratch->host_result_count, scratch->result_count, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
     CUDA_TRY(cudaMemcpyAsync(scratch->host_overflow, scratch->overflow, sizeof(int), cudaMemcpyDeviceToHost, stream));
@@ -6562,6 +7590,673 @@ fail:
     return 0;
 }
 
+static uint64_t bgj_cuda_full_pair_work(uint32_t num_p, uint32_t num_n)
+{
+    return (uint64_t)num_p * (uint64_t)num_n +
+           (num_p > 1 ? (uint64_t)num_p * (uint64_t)num_p : 0ull) +
+           (num_n > 1 ? (uint64_t)num_n * (uint64_t)num_n : 0ull);
+}
+
+static uint64_t bgj_cuda_scale_work(uint64_t total, uint64_t part, uint64_t full)
+{
+    if (!full || !part || !total) return 0;
+    long double value = (long double)total * (long double)part / (long double)full;
+    if (value < 1.0L) return 1;
+    if (value > (long double)0xffffffffffffffffull) return 0xffffffffffffffffull;
+    return (uint64_t)value;
+}
+
+static void bgj_cuda_split_profile_print_phases(FILE *out,
+                                                const bgj_cuda_search_phase_profile_t *profile)
+{
+    if (!out || !profile) return;
+    for (int phase = 0; phase < BGJ_CUDA_SEARCH_PHASE_COUNT; phase++) {
+        if (profile->sec[phase] > 0.0) {
+            fprintf(out, " %s=%.6fs",
+                    bgj_cuda_search_phase_name(phase),
+                    profile->sec[phase]);
+        }
+    }
+}
+
+static int bgj_cuda_search_bucket_pool_raw_split_impl(const int8_t *pool_vecs_host,
+                                                      uint64_t pool_epoch,
+                                                      uint32_t pool_size,
+                                                      const uint32_t *p_ids,
+                                                      const uint32_t *n_ids,
+                                                      const int32_t *p_norm,
+                                                      const int32_t *n_norm,
+                                                      const int32_t *p_dot,
+                                                      const int32_t *n_dot,
+                                                      uint32_t num_p,
+                                                      uint32_t num_n,
+                                                      uint32_t vec_length,
+                                                      int32_t goal_norm,
+                                                      uint32_t center_id,
+                                                      int32_t center_norm,
+                                                      int record_dp,
+                                                      int raw_center_dp,
+                                                      int tensor_split,
+                                                      bgj_cuda_result_t *results,
+                                                      uint32_t result_capacity,
+                                                      uint32_t *result_count,
+                                                      int *overflow)
+{
+    if (!pool_vecs_host || !results || !result_count || !overflow) return 0;
+    if (bgj_cuda_deterministic_results_requested()) return 0;
+
+    int selected_device = -1;
+    bgj_cuda_current_device(&selected_device);
+
+    int devices[BGJ_CUDA_MAX_EXEC_DEVICES];
+    int device_count =
+        bgj_cuda_copy_execution_devices(devices, BGJ_CUDA_MAX_EXEC_DEVICES);
+    if (device_count <= 1) return 0;
+
+    const uint64_t estimated_dots = bgj_cuda_estimated_pair_dots(num_p, num_n);
+    const uint64_t full_work = bgj_cuda_full_pair_work(num_p, num_n);
+    if (!full_work || estimated_dots < bgj_cuda_single_bucket_split_min_dots()) {
+        return 0;
+    }
+    const int split_profile =
+        bgj_cuda_split_profile_requested() &&
+        estimated_dots >= bgj_cuda_split_profile_min_dots();
+    if ((uint64_t)device_count > full_work) device_count = (int)full_work;
+    if (device_count <= 1) return 0;
+
+    uint64_t work_begin[BGJ_CUDA_MAX_EXEC_DEVICES] = {};
+    uint64_t work_count[BGJ_CUDA_MAX_EXEC_DEVICES] = {};
+    uint32_t submitted_result_count[BGJ_CUDA_MAX_EXEC_DEVICES] = {};
+    uint32_t copied_result_count[BGJ_CUDA_MAX_EXEC_DEVICES] = {};
+    int submitted_overflow[BGJ_CUDA_MAX_EXEC_DEVICES] = {};
+    int copied_overflow[BGJ_CUDA_MAX_EXEC_DEVICES] = {};
+    bgj_cuda_search_phase_profile_t phase_profile_sum = {};
+    double submit_sec = 0.0;
+    double wait_sec = 0.0;
+    double copy_sec = 0.0;
+    double total_sec = 0.0;
+    double wait_t0 = 0.0;
+    double copy_t0 = 0.0;
+    uint32_t out_count = 0;
+    int out_overflow = 0;
+
+    for (int i = 0; i < device_count; i++) {
+        const uint64_t begin = ((uint64_t)i * full_work) / (uint64_t)device_count;
+        const uint64_t end = ((uint64_t)(i + 1) * full_work) / (uint64_t)device_count;
+        work_begin[i] = begin;
+        work_count[i] = end > begin ? end - begin : 0;
+    }
+
+    const double total_t0 = bgj_cuda_wall_time();
+    const double submit_t0 = bgj_cuda_wall_time();
+    uint32_t submitted = 0;
+    for (int i = 0; i < device_count; i++) {
+        if (!work_count[i]) continue;
+        if (!bgj_cuda_set_current_device(devices[i])) goto fail_sync;
+        bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get((uint32_t)i);
+        if (!scratch) {
+            set_plain_error("out of host memory");
+            goto fail_sync;
+        }
+        const uint64_t split_work_begin = tensor_split ? 0 : work_begin[i];
+        const uint64_t split_work_count = tensor_split ? 0 : work_count[i];
+        const uint32_t split_tensor_slot = tensor_split ? (uint32_t)i : 0u;
+        const uint32_t split_tensor_count = tensor_split ? (uint32_t)device_count : 0u;
+        if (!bgj_cuda_search_bucket_raw_submit(scratch,
+                                               NULL,
+                                               NULL,
+                                               pool_vecs_host,
+                                               pool_epoch,
+                                               pool_size,
+                                               p_ids,
+                                               n_ids,
+                                               p_norm,
+                                               n_norm,
+                                               p_dot,
+                                               n_dot,
+                                               num_p,
+                                               num_n,
+                                               vec_length,
+                                               goal_norm,
+                                               center_id,
+                                               center_norm,
+                                               record_dp,
+                                               0,
+                                               0,
+                                               raw_center_dp,
+                                               0,
+                                               split_work_begin,
+                                               split_work_count,
+                                               split_tensor_slot,
+                                               split_tensor_count,
+                                               result_capacity,
+                                               &submitted_result_count[i],
+                                               &submitted_overflow[i])) {
+            goto fail_sync;
+        }
+        submitted++;
+    }
+    submit_sec = bgj_cuda_wall_time() - submit_t0;
+    if (!submitted) return 0;
+
+    wait_t0 = bgj_cuda_wall_time();
+    for (int i = 0; i < device_count; i++) {
+        if (!work_count[i]) continue;
+        bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get((uint32_t)i);
+        if (!scratch || !scratch->stream_ready) goto fail_sync;
+        if (scratch->device >= 0 && !bgj_cuda_set_current_device(scratch->device)) {
+            goto fail_sync;
+        }
+        cudaError_t err = cudaStreamSynchronize(scratch->stream);
+        if (err != cudaSuccess) {
+            set_cuda_error("cudaStreamSynchronize split bucket counts", err);
+            goto fail_sync;
+        }
+        bgj_cuda_get_submitted_counts(scratch,
+                                      &submitted_result_count[i],
+                                      &submitted_overflow[i]);
+    }
+    wait_sec = bgj_cuda_wall_time() - wait_t0;
+
+    copy_t0 = bgj_cuda_wall_time();
+    for (int i = 0; i < device_count; i++) {
+        if (!work_count[i]) continue;
+        bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get((uint32_t)i);
+        if (!scratch || !scratch->stream_ready) goto fail_sync;
+        if (scratch->device >= 0 && !bgj_cuda_set_current_device(scratch->device)) {
+            goto fail_sync;
+        }
+        const uint32_t remaining =
+            out_count < result_capacity ? result_capacity - out_count : 0u;
+        if (!bgj_cuda_finish_submitted_bucket(scratch,
+                                              results + out_count,
+                                              remaining,
+                                              submitted_result_count[i],
+                                              submitted_overflow[i],
+                                              &copied_result_count[i],
+                                              &copied_overflow[i])) {
+            goto fail_sync;
+        }
+        out_count += copied_result_count[i];
+        if (copied_overflow[i]) out_overflow = 1;
+    }
+
+    for (int i = 0; i < device_count; i++) {
+        if (!work_count[i]) continue;
+        bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get((uint32_t)i);
+        if (scratch->device >= 0 && !bgj_cuda_set_current_device(scratch->device)) {
+            goto fail_sync;
+        }
+        cudaError_t err = cudaStreamSynchronize(scratch->stream);
+        if (err != cudaSuccess) {
+            set_cuda_error("cudaStreamSynchronize split bucket results", err);
+            goto fail_sync;
+        }
+        if (!bgj_cuda_search_profile_collect(scratch)) goto fail_sync;
+        if (scratch->phase_profile_active) {
+            bgj_cuda_search_phase_profile_add(&phase_profile_sum,
+                                              &scratch->last_phase_profile);
+        }
+    }
+    copy_sec = bgj_cuda_wall_time() - copy_t0;
+
+    *result_count = out_count;
+    *overflow = out_overflow;
+    set_plain_error("no CUDA error");
+
+    total_sec = bgj_cuda_wall_time() - total_t0;
+    if (split_profile) {
+        fprintf(stderr,
+                "cuda_split_profile: mode=%s devices=%d num_p=%u num_n=%u dots=%lu "
+                "full_work=%lu results=%u overflow=%d submit=%.6fs wait=%.6fs "
+                "copy=%.6fs total=%.6fs",
+                tensor_split ? "tensor" : "range",
+                device_count,
+                num_p,
+                num_n,
+                (unsigned long)estimated_dots,
+                (unsigned long)full_work,
+                out_count,
+                out_overflow,
+                submit_sec,
+                wait_sec,
+                copy_sec,
+                total_sec);
+        bgj_cuda_split_profile_print_phases(stderr, &phase_profile_sum);
+        fprintf(stderr, "\n");
+        for (int i = 0; i < device_count; i++) {
+            if (!work_count[i]) continue;
+            bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get((uint32_t)i);
+            const uint64_t device_dots =
+                bgj_cuda_scale_work(estimated_dots, work_count[i], full_work);
+            fprintf(stderr,
+                    "cuda_split_device_profile: mode=%s slot=%d/%d device=%d "
+                    "work_begin=%lu work_count=%lu dots=%lu submitted=%u copied=%u "
+                    "submitted_overflow=%d copied_overflow=%d",
+                    tensor_split ? "tensor" : "range",
+                    i,
+                    device_count,
+                    devices[i],
+                    (unsigned long)work_begin[i],
+                    (unsigned long)work_count[i],
+                    (unsigned long)device_dots,
+                    submitted_result_count[i],
+                    copied_result_count[i],
+                    submitted_overflow[i],
+                    copied_overflow[i]);
+            if (scratch && scratch->phase_profile_active) {
+                bgj_cuda_split_profile_print_phases(stderr, &scratch->last_phase_profile);
+            }
+            fprintf(stderr, "\n");
+        }
+        fflush(stderr);
+    }
+
+    bgj_cuda_bucket_profile_record(BGJ_CUDA_BUCKET_PROFILE_SINGLE,
+                                   selected_device >= 0 ? selected_device : devices[0],
+                                   1,
+                                   0,
+                                   num_p,
+                                   num_n,
+                                   estimated_dots,
+                                   out_count,
+                                   out_overflow,
+                                   0,
+                                   submit_sec,
+                                   wait_sec,
+                                   copy_sec,
+                                   total_sec,
+                                   &phase_profile_sum);
+    for (int i = 0; i < device_count; i++) {
+        if (!work_count[i]) continue;
+        const uint64_t device_dots =
+            bgj_cuda_scale_work(estimated_dots, work_count[i], full_work);
+        bgj_cuda_device_profile_record(devices[i],
+                                       1,
+                                       device_dots,
+                                       submitted_result_count[i],
+                                       copied_overflow[i] ? 1 : 0,
+                                       0,
+                                       submit_sec,
+                                       wait_sec,
+                                       copy_sec,
+                                       total_sec);
+    }
+    bgj_cuda_phase_profile_record(1,
+                                  estimated_dots,
+                                  out_count,
+                                  out_overflow,
+                                  0,
+                                  &phase_profile_sum);
+    if (selected_device >= 0) bgj_cuda_set_current_device(selected_device);
+    return 1;
+
+fail_sync:
+    for (int i = 0; i < device_count; i++) {
+        if (!work_count[i]) continue;
+        bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get((uint32_t)i);
+        if (scratch && scratch->stream_ready) {
+            if (scratch->device >= 0) cudaSetDevice(scratch->device);
+            cudaStreamSynchronize(scratch->stream);
+        }
+    }
+    if (selected_device >= 0) bgj_cuda_set_current_device(selected_device);
+    return 0;
+}
+
+static int bgj_cuda_search_bucket_pool_raw_split_submit_async(const int8_t *pool_vecs_host,
+                                                              uint64_t pool_epoch,
+                                                              uint32_t pool_size,
+                                                              const uint32_t *p_ids,
+                                                              const uint32_t *n_ids,
+                                                              const int32_t *p_norm,
+                                                              const int32_t *n_norm,
+                                                              const int32_t *p_dot,
+                                                              const int32_t *n_dot,
+                                                              uint32_t num_p,
+                                                              uint32_t num_n,
+                                                              uint32_t vec_length,
+                                                              int32_t goal_norm,
+                                                              uint32_t center_id,
+                                                              int32_t center_norm,
+                                                              int record_dp,
+                                                              int transform_dp,
+                                                              int device_transform_dp,
+                                                              int raw_center_dp,
+                                                              int record_dot_copy_event,
+                                                              int tensor_split,
+                                                              uint32_t result_capacity,
+                                                              uint32_t *submitted_result_count,
+                                                              int *submitted_overflow)
+{
+    if (!pool_vecs_host || !submitted_result_count || !submitted_overflow) return 0;
+    if (bgj_cuda_deterministic_results_requested()) return 0;
+    if (transform_dp || device_transform_dp) return 0;
+
+    int selected_device = -1;
+    bgj_cuda_current_device(&selected_device);
+
+    int devices[BGJ_CUDA_MAX_EXEC_DEVICES];
+    int device_count =
+        bgj_cuda_copy_execution_devices(devices, BGJ_CUDA_MAX_EXEC_DEVICES);
+    if (device_count <= 1) return 0;
+
+    const uint64_t estimated_dots = bgj_cuda_estimated_pair_dots(num_p, num_n);
+    const uint64_t full_work = bgj_cuda_full_pair_work(num_p, num_n);
+    if (!full_work || estimated_dots < bgj_cuda_single_bucket_split_min_dots()) {
+        return 0;
+    }
+    if ((uint64_t)device_count > full_work) device_count = (int)full_work;
+    if (device_count <= 1) return 0;
+
+    bgj_cuda_raw_async_state_t *state = &bgj_cuda_raw_async_state;
+    state->reset();
+    state->split_active = 1;
+    state->split_tensor = tensor_split ? 1 : 0;
+    state->split_device_count = device_count;
+    state->estimated_dots = estimated_dots;
+    state->full_work = full_work;
+    state->num_p = num_p;
+    state->num_n = num_n;
+    state->total_t0 = bgj_cuda_wall_time();
+
+    for (int i = 0; i < device_count; i++) {
+        const uint64_t begin = ((uint64_t)i * full_work) / (uint64_t)device_count;
+        const uint64_t end = ((uint64_t)(i + 1) * full_work) / (uint64_t)device_count;
+        state->split_devices[i] = devices[i];
+        state->split_work_begin[i] = begin;
+        state->split_work_count[i] = end > begin ? end - begin : 0;
+    }
+
+    const double submit_t0 = bgj_cuda_wall_time();
+    uint32_t submitted = 0;
+    for (int i = 0; i < device_count; i++) {
+        if (!state->split_work_count[i]) continue;
+        if (!bgj_cuda_set_current_device(devices[i])) goto fail_sync;
+        bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get((uint32_t)i);
+        if (!scratch) {
+            set_plain_error("out of host memory");
+            goto fail_sync;
+        }
+        const uint64_t split_work_begin = tensor_split ? 0 : state->split_work_begin[i];
+        const uint64_t split_work_count = tensor_split ? 0 : state->split_work_count[i];
+        const uint32_t split_tensor_slot = tensor_split ? (uint32_t)i : 0u;
+        const uint32_t split_tensor_count = tensor_split ? (uint32_t)device_count : 0u;
+        if (!bgj_cuda_search_bucket_raw_submit(scratch,
+                                               NULL,
+                                               NULL,
+                                               pool_vecs_host,
+                                               pool_epoch,
+                                               pool_size,
+                                               p_ids,
+                                               n_ids,
+                                               p_norm,
+                                               n_norm,
+                                               p_dot,
+                                               n_dot,
+                                               num_p,
+                                               num_n,
+                                               vec_length,
+                                               goal_norm,
+                                               center_id,
+                                               center_norm,
+                                               record_dp,
+                                               0,
+                                               0,
+                                               raw_center_dp,
+                                               record_dot_copy_event,
+                                               split_work_begin,
+                                               split_work_count,
+                                               split_tensor_slot,
+                                               split_tensor_count,
+                                               result_capacity,
+                                               &state->split_submitted_result_count[i],
+                                               &state->split_submitted_overflow[i])) {
+            goto fail_sync;
+        }
+        submitted++;
+    }
+    if (!submitted) {
+        state->reset();
+        if (selected_device >= 0) bgj_cuda_set_current_device(selected_device);
+        return 0;
+    }
+
+    state->submit_sec = bgj_cuda_wall_time() - submit_t0;
+    state->active = 1;
+    *submitted_result_count = 0;
+    *submitted_overflow = 0;
+    set_plain_error("no CUDA error");
+    if (selected_device >= 0) bgj_cuda_set_current_device(selected_device);
+    return 1;
+
+fail_sync:
+    for (int i = 0; i < device_count; i++) {
+        if (!state->split_work_count[i]) continue;
+        bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get((uint32_t)i);
+        if (scratch && scratch->stream_ready) {
+            if (scratch->device >= 0) cudaSetDevice(scratch->device);
+            cudaStreamSynchronize(scratch->stream);
+        }
+    }
+    state->reset();
+    if (selected_device >= 0) bgj_cuda_set_current_device(selected_device);
+    return 0;
+}
+
+static int bgj_cuda_search_bucket_pool_raw_split_finish_async(bgj_cuda_result_t *results,
+                                                              uint32_t result_capacity,
+                                                              uint32_t *submitted_result_count,
+                                                              int *submitted_overflow,
+                                                              uint32_t *result_count,
+                                                              int *overflow)
+{
+    bgj_cuda_raw_async_state_t *state = &bgj_cuda_raw_async_state;
+    if (!state->active || !state->split_active) {
+        set_plain_error("no active async split CUDA bucket");
+        return 0;
+    }
+
+    int selected_device = -1;
+    bgj_cuda_current_device(&selected_device);
+
+    const int device_count = state->split_device_count;
+    const int split_profile =
+        bgj_cuda_split_profile_requested() &&
+        state->estimated_dots >= bgj_cuda_split_profile_min_dots();
+    bgj_cuda_search_phase_profile_t phase_profile_sum = {};
+    double wait_sec = 0.0;
+    double copy_sec = 0.0;
+    double copy_t0 = 0.0;
+    double total_sec = 0.0;
+    const char *mode = state->split_tensor ? "tensor_async" : "range_async";
+    uint32_t out_count = 0;
+    int out_overflow = 0;
+    uint64_t submitted_total = 0;
+    int submitted_any_overflow = 0;
+
+    const double wait_t0 = bgj_cuda_wall_time();
+    for (int i = 0; i < device_count; i++) {
+        if (!state->split_work_count[i]) continue;
+        bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get((uint32_t)i);
+        if (!scratch || !scratch->stream_ready) goto fail_sync;
+        if (scratch->device >= 0 && !bgj_cuda_set_current_device(scratch->device)) {
+            goto fail_sync;
+        }
+        cudaError_t err = cudaStreamSynchronize(scratch->stream);
+        if (err != cudaSuccess) {
+            set_cuda_error("cudaStreamSynchronize async split bucket counts", err);
+            goto fail_sync;
+        }
+        bgj_cuda_get_submitted_counts(scratch,
+                                      &state->split_submitted_result_count[i],
+                                      &state->split_submitted_overflow[i]);
+        submitted_total += state->split_submitted_result_count[i];
+        if (state->split_submitted_overflow[i]) submitted_any_overflow = 1;
+    }
+    wait_sec = bgj_cuda_wall_time() - wait_t0;
+    if (submitted_result_count) {
+        *submitted_result_count = submitted_total > 0xffffffffull ?
+                                  0xffffffffu : (uint32_t)submitted_total;
+    }
+    if (submitted_overflow) {
+        *submitted_overflow = submitted_any_overflow ||
+                              submitted_total > (uint64_t)result_capacity;
+    }
+
+    copy_t0 = bgj_cuda_wall_time();
+    for (int i = 0; i < device_count; i++) {
+        if (!state->split_work_count[i]) continue;
+        bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get((uint32_t)i);
+        if (!scratch || !scratch->stream_ready) goto fail_sync;
+        if (scratch->device >= 0 && !bgj_cuda_set_current_device(scratch->device)) {
+            goto fail_sync;
+        }
+        const uint32_t remaining =
+            out_count < result_capacity ? result_capacity - out_count : 0u;
+        if (!bgj_cuda_finish_submitted_bucket(scratch,
+                                              results + out_count,
+                                              remaining,
+                                              state->split_submitted_result_count[i],
+                                              state->split_submitted_overflow[i],
+                                              &state->split_copied_result_count[i],
+                                              &state->split_copied_overflow[i])) {
+            goto fail_sync;
+        }
+        out_count += state->split_copied_result_count[i];
+        if (state->split_copied_overflow[i]) out_overflow = 1;
+    }
+
+    for (int i = 0; i < device_count; i++) {
+        if (!state->split_work_count[i]) continue;
+        bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get((uint32_t)i);
+        if (!scratch || !scratch->stream_ready) goto fail_sync;
+        if (scratch->device >= 0 && !bgj_cuda_set_current_device(scratch->device)) {
+            goto fail_sync;
+        }
+        cudaError_t err = cudaStreamSynchronize(scratch->stream);
+        if (err != cudaSuccess) {
+            set_cuda_error("cudaStreamSynchronize async split bucket results", err);
+            goto fail_sync;
+        }
+        if (!bgj_cuda_search_profile_collect(scratch)) goto fail_sync;
+        if (scratch->phase_profile_active) {
+            bgj_cuda_search_phase_profile_add(&phase_profile_sum,
+                                              &scratch->last_phase_profile);
+        }
+    }
+    copy_sec = bgj_cuda_wall_time() - copy_t0;
+
+    if (result_count) *result_count = out_count;
+    if (overflow) *overflow = out_overflow;
+    set_plain_error("no CUDA error");
+
+    total_sec = bgj_cuda_wall_time() - state->total_t0;
+    if (split_profile) {
+        fprintf(stderr,
+                "cuda_split_profile: mode=%s devices=%d num_p=%u num_n=%u dots=%lu "
+                "full_work=%lu results=%u overflow=%d submit=%.6fs wait=%.6fs "
+                "copy=%.6fs total=%.6fs",
+                mode,
+                device_count,
+                state->num_p,
+                state->num_n,
+                (unsigned long)state->estimated_dots,
+                (unsigned long)state->full_work,
+                out_count,
+                out_overflow,
+                state->submit_sec,
+                wait_sec,
+                copy_sec,
+                total_sec);
+        bgj_cuda_split_profile_print_phases(stderr, &phase_profile_sum);
+        fprintf(stderr, "\n");
+        for (int i = 0; i < device_count; i++) {
+            if (!state->split_work_count[i]) continue;
+            bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get((uint32_t)i);
+            const uint64_t device_dots =
+                bgj_cuda_scale_work(state->estimated_dots,
+                                    state->split_work_count[i],
+                                    state->full_work);
+            fprintf(stderr,
+                    "cuda_split_device_profile: mode=%s slot=%d/%d device=%d "
+                    "work_begin=%lu work_count=%lu dots=%lu submitted=%u copied=%u "
+                    "submitted_overflow=%d copied_overflow=%d",
+                    mode,
+                    i,
+                    device_count,
+                    state->split_devices[i],
+                    (unsigned long)state->split_work_begin[i],
+                    (unsigned long)state->split_work_count[i],
+                    (unsigned long)device_dots,
+                    state->split_submitted_result_count[i],
+                    state->split_copied_result_count[i],
+                    state->split_submitted_overflow[i],
+                    state->split_copied_overflow[i]);
+            if (scratch && scratch->phase_profile_active) {
+                bgj_cuda_split_profile_print_phases(stderr, &scratch->last_phase_profile);
+            }
+            fprintf(stderr, "\n");
+        }
+        fflush(stderr);
+    }
+
+    bgj_cuda_bucket_profile_record(BGJ_CUDA_BUCKET_PROFILE_ASYNC,
+                                   device_count > 0 ? state->split_devices[0] : selected_device,
+                                   (uint32_t)device_count,
+                                   0,
+                                   state->num_p,
+                                   state->num_n,
+                                   state->estimated_dots,
+                                   out_count,
+                                   out_overflow,
+                                   0,
+                                   state->submit_sec,
+                                   wait_sec,
+                                   copy_sec,
+                                   total_sec,
+                                   &phase_profile_sum);
+    for (int i = 0; i < device_count; i++) {
+        if (!state->split_work_count[i]) continue;
+        const uint64_t device_dots =
+            bgj_cuda_scale_work(state->estimated_dots,
+                                state->split_work_count[i],
+                                state->full_work);
+        bgj_cuda_device_profile_record(state->split_devices[i],
+                                       1,
+                                       device_dots,
+                                       state->split_copied_result_count[i],
+                                       state->split_copied_overflow[i] ? 1 : 0,
+                                       0,
+                                       state->submit_sec,
+                                       wait_sec,
+                                       copy_sec,
+                                       total_sec);
+    }
+    bgj_cuda_phase_profile_record(1,
+                                  state->estimated_dots,
+                                  out_count,
+                                  out_overflow,
+                                  0,
+                                  &phase_profile_sum);
+    state->reset();
+    if (selected_device >= 0) bgj_cuda_set_current_device(selected_device);
+    return 1;
+
+fail_sync:
+    for (int i = 0; i < device_count; i++) {
+        if (!state->split_work_count[i]) continue;
+        bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get((uint32_t)i);
+        if (scratch && scratch->stream_ready) {
+            if (scratch->device >= 0) cudaSetDevice(scratch->device);
+            cudaStreamSynchronize(scratch->stream);
+        }
+    }
+    state->reset();
+    if (selected_device >= 0) bgj_cuda_set_current_device(selected_device);
+    return 0;
+}
+
 static int bgj_cuda_search_bucket_raw_impl(const int8_t *p_vecs,
                                            const int8_t *n_vecs,
                                            const int8_t *pool_vecs_host,
@@ -6599,6 +8294,35 @@ static int bgj_cuda_search_bucket_raw_impl(const int8_t *p_vecs,
     double copy_t0 = 0.0;
     const bgj_cuda_search_phase_profile_t *phase_profile = NULL;
 
+    if (bgj_cuda_single_bucket_split_requested() &&
+        pool_vecs_host &&
+        !transform_dp) {
+        if (bgj_cuda_search_bucket_pool_raw_split_impl(pool_vecs_host,
+                                                       pool_epoch,
+                                                       pool_size,
+                                                       p_ids,
+                                                       n_ids,
+                                                       p_norm,
+                                                       n_norm,
+                                                       p_dot,
+                                                       n_dot,
+                                                       num_p,
+                                                       num_n,
+                                                       vec_length,
+                                                       goal_norm,
+                                                       center_id,
+                                                       center_norm,
+                                                       record_dp,
+                                                       0,
+                                                       bgj_cuda_single_bucket_tensor_split_requested(),
+                                                       results,
+                                                       result_capacity,
+                                                       result_count,
+                                                       overflow)) {
+            return 1;
+        }
+    }
+
     const double submit_t0 = bgj_cuda_wall_time();
     if (!bgj_cuda_search_bucket_raw_submit(scratch,
                                            p_vecs,
@@ -6620,6 +8344,10 @@ static int bgj_cuda_search_bucket_raw_impl(const int8_t *p_vecs,
                                            center_norm,
                                            record_dp,
                                            transform_dp,
+                                           0,
+                                           0,
+                                           0,
+                                           0,
                                            0,
                                            0,
                                            0,
@@ -6784,8 +8512,39 @@ extern "C" int bgj_cuda_search_bucket_pool_raw_submit_async(const int8_t *pool_v
                                                             uint32_t *submitted_result_count,
                                                             int *submitted_overflow)
 {
-    bgj_cuda_raw_async_state.active = 0;
+    bgj_cuda_raw_async_state.reset();
     if (!bgj_cuda_select_thread_device()) return 0;
+    if (bgj_cuda_single_bucket_split_requested() &&
+        pool_vecs &&
+        !transform_dp &&
+        !device_transform_dp) {
+        if (bgj_cuda_search_bucket_pool_raw_split_submit_async(pool_vecs,
+                                                               pool_epoch,
+                                                               pool_size,
+                                                               p_ids,
+                                                               n_ids,
+                                                               p_norm,
+                                                               n_norm,
+                                                               p_dot,
+                                                               n_dot,
+                                                               num_p,
+                                                               num_n,
+                                                               vec_length,
+                                                               goal_norm,
+                                                               center_id,
+                                                               center_norm,
+                                                               record_dp,
+                                                               transform_dp,
+                                                               device_transform_dp,
+                                                               raw_center_dp,
+                                                               record_dot_copy_event,
+                                                               bgj_cuda_single_bucket_tensor_split_requested(),
+                                                               result_capacity,
+                                                               submitted_result_count,
+                                                               submitted_overflow)) {
+            return 1;
+        }
+    }
     bgj_cuda_raw_scratch_t *scratch = &bgj_cuda_raw_scratch;
     const uint64_t estimated_dots = bgj_cuda_estimated_pair_dots(num_p, num_n);
     const double total_t0 = bgj_cuda_wall_time();
@@ -6814,6 +8573,10 @@ extern "C" int bgj_cuda_search_bucket_pool_raw_submit_async(const int8_t *pool_v
                                            device_transform_dp,
                                            raw_center_dp,
                                            record_dot_copy_event,
+                                           0,
+                                           0,
+                                           0,
+                                           0,
                                            result_capacity,
                                            submitted_result_count,
                                            submitted_overflow)) {
@@ -6862,6 +8625,40 @@ extern "C" int bgj_cuda_search_bucket_raw_wait_dot_copy_async()
         set_plain_error("no active async CUDA bucket");
         return 0;
     }
+    if (bgj_cuda_raw_async_state.split_active) {
+        bgj_cuda_raw_async_state_t *state = &bgj_cuda_raw_async_state;
+        int selected_device = -1;
+        bgj_cuda_current_device(&selected_device);
+        for (int i = 0; i < state->split_device_count; i++) {
+            if (!state->split_work_count[i]) continue;
+            bgj_cuda_raw_scratch_t *split_scratch =
+                bgj_cuda_raw_batch_scratch.get((uint32_t)i);
+            if (!split_scratch || !split_scratch->stream_ready) {
+                set_plain_error("missing async split CUDA bucket stream");
+                if (selected_device >= 0) bgj_cuda_set_current_device(selected_device);
+                return 0;
+            }
+            if (split_scratch->device >= 0 &&
+                !bgj_cuda_set_current_device(split_scratch->device)) {
+                if (selected_device >= 0) bgj_cuda_set_current_device(selected_device);
+                return 0;
+            }
+            if (!split_scratch->dot_event_ready) {
+                set_plain_error("no async split CUDA dot-copy event");
+                if (selected_device >= 0) bgj_cuda_set_current_device(selected_device);
+                return 0;
+            }
+            cudaError_t err = cudaEventSynchronize(split_scratch->dot_copy_done);
+            if (err != cudaSuccess) {
+                set_cuda_error("cudaEventSynchronize split dot copy", err);
+                if (selected_device >= 0) bgj_cuda_set_current_device(selected_device);
+                return 0;
+            }
+        }
+        set_plain_error("no CUDA error");
+        if (selected_device >= 0) bgj_cuda_set_current_device(selected_device);
+        return 1;
+    }
     if (scratch->device >= 0 && !bgj_cuda_set_current_device(scratch->device)) return 0;
     if (!scratch->dot_event_ready) {
         set_plain_error("no async CUDA dot-copy event");
@@ -6883,6 +8680,14 @@ extern "C" int bgj_cuda_search_bucket_raw_finish_async(bgj_cuda_result_t *result
                                                        uint32_t *result_count,
                                                        int *overflow)
 {
+    if (bgj_cuda_raw_async_state.active && bgj_cuda_raw_async_state.split_active) {
+        return bgj_cuda_search_bucket_pool_raw_split_finish_async(results,
+                                                                  result_capacity,
+                                                                  submitted_result_count,
+                                                                  submitted_overflow,
+                                                                  result_count,
+                                                                  overflow);
+    }
     bgj_cuda_raw_scratch_t *scratch = &bgj_cuda_raw_scratch;
     if (!bgj_cuda_raw_async_state.active) {
         set_plain_error("no active async CUDA bucket");
@@ -7143,6 +8948,101 @@ extern "C" int bgj_cuda_search_bucket_pool_batch_raw(const int8_t *pool_vecs,
 
     int selected_device = -1;
     bgj_cuda_current_device(&selected_device);
+    const int multi_gpu_batch_enabled = bgj_cuda_multi_gpu_batch_requested();
+    int execution_devices[BGJ_CUDA_MAX_EXEC_DEVICES] = {selected_device};
+    int execution_device_count = 1;
+    if (multi_gpu_batch_enabled) {
+        execution_device_count =
+            bgj_cuda_copy_execution_devices(execution_devices, BGJ_CUDA_MAX_EXEC_DEVICES);
+        if (execution_device_count <= 0) {
+            execution_devices[0] = selected_device;
+            execution_device_count = 1;
+        }
+    }
+    uint64_t item_dots_stack[64];
+    int item_devices_stack[64];
+    uint32_t scratch_items_stack[64 + BGJ_CUDA_MAX_EXEC_DEVICES];
+    uint32_t scratch_split_slots_stack[64 + BGJ_CUDA_MAX_EXEC_DEVICES];
+    uint32_t scratch_split_counts_stack[64 + BGJ_CUDA_MAX_EXEC_DEVICES];
+    int scratch_devices_stack[64 + BGJ_CUDA_MAX_EXEC_DEVICES];
+    uint64_t scratch_work_begin_stack[64 + BGJ_CUDA_MAX_EXEC_DEVICES];
+    uint64_t scratch_work_count_stack[64 + BGJ_CUDA_MAX_EXEC_DEVICES];
+    uint32_t scratch_result_counts_stack[64 + BGJ_CUDA_MAX_EXEC_DEVICES];
+    uint32_t scratch_copied_counts_stack[64 + BGJ_CUDA_MAX_EXEC_DEVICES];
+    int scratch_overflows_stack[64 + BGJ_CUDA_MAX_EXEC_DEVICES];
+    int scratch_copied_overflows_stack[64 + BGJ_CUDA_MAX_EXEC_DEVICES];
+    uint64_t *item_dots = batch_size <= 64 ? item_dots_stack :
+                          (uint64_t *)malloc((size_t)batch_size * sizeof(uint64_t));
+    int *item_devices = batch_size <= 64 ? item_devices_stack :
+                        (int *)malloc((size_t)batch_size * sizeof(int));
+    const uint32_t scratch_stack_capacity = 64u + BGJ_CUDA_MAX_EXEC_DEVICES;
+    const uint32_t max_scratch_count =
+        batch_size + (execution_device_count > 1 ? (uint32_t)execution_device_count - 1u : 0u);
+    uint32_t *scratch_items = max_scratch_count <= scratch_stack_capacity ?
+                              scratch_items_stack :
+                              (uint32_t *)malloc((size_t)max_scratch_count * sizeof(uint32_t));
+    uint32_t *scratch_split_slots = max_scratch_count <= scratch_stack_capacity ?
+                                    scratch_split_slots_stack :
+                                    (uint32_t *)malloc((size_t)max_scratch_count * sizeof(uint32_t));
+    uint32_t *scratch_split_counts = max_scratch_count <= scratch_stack_capacity ?
+                                     scratch_split_counts_stack :
+                                     (uint32_t *)malloc((size_t)max_scratch_count * sizeof(uint32_t));
+    int *scratch_devices = max_scratch_count <= scratch_stack_capacity ?
+                           scratch_devices_stack :
+                           (int *)malloc((size_t)max_scratch_count * sizeof(int));
+    uint64_t *scratch_work_begin = max_scratch_count <= scratch_stack_capacity ?
+                                   scratch_work_begin_stack :
+                                   (uint64_t *)malloc((size_t)max_scratch_count * sizeof(uint64_t));
+    uint64_t *scratch_work_count = max_scratch_count <= scratch_stack_capacity ?
+                                   scratch_work_count_stack :
+                                   (uint64_t *)malloc((size_t)max_scratch_count * sizeof(uint64_t));
+    uint32_t *scratch_result_counts = max_scratch_count <= scratch_stack_capacity ?
+                                      scratch_result_counts_stack :
+                                      (uint32_t *)malloc((size_t)max_scratch_count * sizeof(uint32_t));
+    uint32_t *scratch_copied_counts = max_scratch_count <= scratch_stack_capacity ?
+                                      scratch_copied_counts_stack :
+                                      (uint32_t *)malloc((size_t)max_scratch_count * sizeof(uint32_t));
+    int *scratch_overflows = max_scratch_count <= scratch_stack_capacity ?
+                             scratch_overflows_stack :
+                             (int *)malloc((size_t)max_scratch_count * sizeof(int));
+    int *scratch_copied_overflows = max_scratch_count <= scratch_stack_capacity ?
+                                    scratch_copied_overflows_stack :
+                                    (int *)malloc((size_t)max_scratch_count * sizeof(int));
+    if (!item_dots || !item_devices) {
+        if (item_dots != item_dots_stack) free(item_dots);
+        if (item_devices != item_devices_stack) free(item_devices);
+        if (scratch_items != scratch_items_stack) free(scratch_items);
+        if (scratch_split_slots != scratch_split_slots_stack) free(scratch_split_slots);
+        if (scratch_split_counts != scratch_split_counts_stack) free(scratch_split_counts);
+        if (scratch_devices != scratch_devices_stack) free(scratch_devices);
+        if (scratch_work_begin != scratch_work_begin_stack) free(scratch_work_begin);
+        if (scratch_work_count != scratch_work_count_stack) free(scratch_work_count);
+        if (scratch_result_counts != scratch_result_counts_stack) free(scratch_result_counts);
+        if (scratch_copied_counts != scratch_copied_counts_stack) free(scratch_copied_counts);
+        if (scratch_overflows != scratch_overflows_stack) free(scratch_overflows);
+        if (scratch_copied_overflows != scratch_copied_overflows_stack) free(scratch_copied_overflows);
+        set_plain_error("out of host memory");
+        return 0;
+    }
+    if (!scratch_items || !scratch_split_slots || !scratch_split_counts ||
+        !scratch_devices || !scratch_work_begin || !scratch_work_count ||
+        !scratch_result_counts || !scratch_copied_counts || !scratch_overflows ||
+        !scratch_copied_overflows) {
+        if (item_dots != item_dots_stack) free(item_dots);
+        if (item_devices != item_devices_stack) free(item_devices);
+        if (scratch_items != scratch_items_stack) free(scratch_items);
+        if (scratch_split_slots != scratch_split_slots_stack) free(scratch_split_slots);
+        if (scratch_split_counts != scratch_split_counts_stack) free(scratch_split_counts);
+        if (scratch_devices != scratch_devices_stack) free(scratch_devices);
+        if (scratch_work_begin != scratch_work_begin_stack) free(scratch_work_begin);
+        if (scratch_work_count != scratch_work_count_stack) free(scratch_work_count);
+        if (scratch_result_counts != scratch_result_counts_stack) free(scratch_result_counts);
+        if (scratch_copied_counts != scratch_copied_counts_stack) free(scratch_copied_counts);
+        if (scratch_overflows != scratch_overflows_stack) free(scratch_overflows);
+        if (scratch_copied_overflows != scratch_copied_overflows_stack) free(scratch_copied_overflows);
+        set_plain_error("out of host memory");
+        return 0;
+    }
     uint32_t submitted = 0;
     uint64_t estimated_dots = 0;
     uint64_t total_results = 0;
@@ -7155,17 +9055,128 @@ extern "C" int bgj_cuda_search_bucket_pool_batch_raw(const int8_t *pool_vecs,
     double copy_sec = 0.0;
     double wait_t0 = 0.0;
     double copy_t0 = 0.0;
-    bgj_cuda_search_phase_profile_t phase_profile_sum;
+    bgj_cuda_search_phase_profile_t phase_profile_sum = {};
+    bgj_cuda_search_phase_profile_t split_item_phase_profile = {};
     const bgj_cuda_search_phase_profile_t *batch_phase_profile = NULL;
+    int multi_gpu_batch = 0;
+    int batch_split = 0;
+    uint32_t split_item = batch_size;
+    uint64_t split_full_work = 0;
+    uint32_t scratch_count = 0;
 
-    const double submit_t0 = bgj_cuda_wall_time();
     for (uint32_t i = 0; i < batch_size; i++) {
         result_count[i] = 0;
         overflow[i] = 0;
-        estimated_dots += bgj_cuda_estimated_pair_dots(num_p[i], num_n[i]);
+        item_dots[i] = bgj_cuda_estimated_pair_dots(num_p[i], num_n[i]);
+        item_devices[i] = selected_device;
+        estimated_dots += item_dots[i];
         if (num_p[i] > max_num_p) max_num_p = num_p[i];
         if (num_n[i] > max_num_n) max_num_n = num_n[i];
-        bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get(i);
+    }
+
+    if (execution_device_count > 1 &&
+        estimated_dots >= bgj_cuda_multi_gpu_batch_min_dots() &&
+        multi_gpu_batch_enabled) {
+        uint64_t device_work[BGJ_CUDA_MAX_EXEC_DEVICES] = {};
+        if (bgj_cuda_multi_gpu_batch_split_requested() &&
+            !transform_dp &&
+            !bgj_cuda_deterministic_results_requested()) {
+            uint32_t max_item = 0;
+            for (uint32_t i = 1; i < batch_size; i++) {
+                if (item_dots[i] > item_dots[max_item]) max_item = i;
+            }
+            const uint64_t min_split_dots = bgj_cuda_multi_gpu_batch_split_min_dots();
+            const uint32_t min_share_pct =
+                bgj_cuda_multi_gpu_batch_split_min_share_pct();
+            split_full_work = bgj_cuda_full_pair_work(num_p[max_item], num_n[max_item]);
+            const int share_ok =
+                !min_share_pct ||
+                (estimated_dots &&
+                 (long double)item_dots[max_item] * 100.0L >=
+                 (long double)estimated_dots * (long double)min_share_pct);
+            if (item_dots[max_item] >= min_split_dots &&
+                split_full_work >= (uint64_t)execution_device_count &&
+                share_ok) {
+                batch_split = 1;
+                split_item = max_item;
+                item_devices[split_item] = execution_devices[0];
+                for (int slot = 0; slot < execution_device_count; slot++) {
+                    const uint64_t begin =
+                        ((uint64_t)slot * split_full_work) /
+                        (uint64_t)execution_device_count;
+                    const uint64_t end =
+                        ((uint64_t)(slot + 1) * split_full_work) /
+                        (uint64_t)execution_device_count;
+                    const uint64_t count = end > begin ? end - begin : 0;
+                    device_work[slot] =
+                        bgj_cuda_scale_work(item_dots[split_item],
+                                            count,
+                                            split_full_work);
+                }
+            }
+        }
+        if (batch_size < (uint32_t)execution_device_count && !batch_split) {
+            goto build_batch_scratch_plan;
+        }
+        for (uint32_t i = 0; i < batch_size; i++) {
+            if (batch_split && i == split_item) continue;
+            int best_slot = 0;
+            for (int slot = 1; slot < execution_device_count; slot++) {
+                if (device_work[slot] < device_work[best_slot]) best_slot = slot;
+            }
+            item_devices[i] = execution_devices[best_slot];
+            device_work[best_slot] += item_dots[i];
+        }
+        multi_gpu_batch = 1;
+    }
+
+build_batch_scratch_plan:
+    for (uint32_t i = 0; i < batch_size; i++) {
+        if (batch_split && i == split_item) {
+            const int tensor_split =
+                bgj_cuda_multi_gpu_batch_tensor_split_requested();
+            for (int slot = 0; slot < execution_device_count; slot++) {
+                const uint64_t begin =
+                    ((uint64_t)slot * split_full_work) /
+                    (uint64_t)execution_device_count;
+                const uint64_t end =
+                    ((uint64_t)(slot + 1) * split_full_work) /
+                    (uint64_t)execution_device_count;
+                scratch_items[scratch_count] = i;
+                scratch_split_slots[scratch_count] = tensor_split ? (uint32_t)slot : 0u;
+                scratch_split_counts[scratch_count] =
+                    tensor_split ? (uint32_t)execution_device_count : 0u;
+                scratch_devices[scratch_count] = execution_devices[slot];
+                scratch_work_begin[scratch_count] = begin;
+                scratch_work_count[scratch_count] = end > begin ? end - begin : 0ull;
+                scratch_result_counts[scratch_count] = 0;
+                scratch_copied_counts[scratch_count] = 0;
+                scratch_overflows[scratch_count] = 0;
+                scratch_copied_overflows[scratch_count] = 0;
+                scratch_count++;
+            }
+        } else {
+            scratch_items[scratch_count] = i;
+            scratch_split_slots[scratch_count] = 0;
+            scratch_split_counts[scratch_count] = 0;
+            scratch_devices[scratch_count] = item_devices[i];
+            scratch_work_begin[scratch_count] = 0;
+            scratch_work_count[scratch_count] = 0;
+            scratch_result_counts[scratch_count] = 0;
+            scratch_copied_counts[scratch_count] = 0;
+            scratch_overflows[scratch_count] = 0;
+            scratch_copied_overflows[scratch_count] = 0;
+            scratch_count++;
+        }
+    }
+
+    const double submit_t0 = bgj_cuda_wall_time();
+    for (uint32_t s = 0; s < scratch_count; s++) {
+        const uint32_t i = scratch_items[s];
+        if (multi_gpu_batch && !bgj_cuda_set_current_device(scratch_devices[s])) {
+            goto fail_sync;
+        }
+        bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get(s);
         if (!scratch) {
             set_plain_error("out of host memory");
             goto fail_sync;
@@ -7193,9 +9204,13 @@ extern "C" int bgj_cuda_search_bucket_pool_batch_raw(const int8_t *pool_vecs,
                                                0,
                                                0,
                                                0,
+                                               scratch_split_counts[s] ? 0ull : scratch_work_begin[s],
+                                               scratch_split_counts[s] ? 0ull : scratch_work_count[s],
+                                               scratch_split_slots[s],
+                                               scratch_split_counts[s],
                                                result_capacity[i],
-                                               &result_count[i],
-                                               &overflow[i])) {
+                                               &scratch_result_counts[s],
+                                               &scratch_overflows[s])) {
             goto fail_sync;
         }
         submitted++;
@@ -7205,33 +9220,53 @@ extern "C" int bgj_cuda_search_bucket_pool_batch_raw(const int8_t *pool_vecs,
     wait_t0 = bgj_cuda_wall_time();
     for (uint32_t i = 0; i < submitted; i++) {
         bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get(i);
+        if (scratch && scratch->device >= 0 &&
+            !bgj_cuda_set_current_device(scratch->device)) {
+            goto fail_sync;
+        }
         cudaError_t err = cudaStreamSynchronize(scratch->stream);
         if (err != cudaSuccess) {
             set_cuda_error("cudaStreamSynchronize batch counts", err);
             goto fail_sync;
         }
-        bgj_cuda_get_submitted_counts(scratch, &result_count[i], &overflow[i]);
+        bgj_cuda_get_submitted_counts(scratch,
+                                      &scratch_result_counts[i],
+                                      &scratch_overflows[i]);
     }
     wait_sec = bgj_cuda_wall_time() - wait_t0;
 
     copy_t0 = bgj_cuda_wall_time();
-    for (uint32_t i = 0; i < submitted; i++) {
-        bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get(i);
-        const uint32_t submitted_count = result_count[i];
-        const int submitted_overflow = overflow[i];
-        if (!bgj_cuda_finish_submitted_bucket(scratch,
-                                              results[i],
-                                              result_capacity[i],
-                                              submitted_count,
-                                              submitted_overflow,
-                                              &result_count[i],
-                                              &overflow[i])) {
+    for (uint32_t s = 0; s < submitted; s++) {
+        const uint32_t i = scratch_items[s];
+        bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get(s);
+        if (scratch && scratch->device >= 0 &&
+            !bgj_cuda_set_current_device(scratch->device)) {
             goto fail_sync;
         }
+        const uint32_t submitted_count = scratch_result_counts[s];
+        const int submitted_overflow = scratch_overflows[s];
+        const uint32_t existing_count = result_count[i];
+        const uint32_t remaining =
+            existing_count < result_capacity[i] ? result_capacity[i] - existing_count : 0u;
+        if (!bgj_cuda_finish_submitted_bucket(scratch,
+                                              results[i] + existing_count,
+                                              remaining,
+                                              submitted_count,
+                                              submitted_overflow,
+                                              &scratch_copied_counts[s],
+                                              &scratch_copied_overflows[s])) {
+            goto fail_sync;
+        }
+        result_count[i] += scratch_copied_counts[s];
+        if (scratch_copied_overflows[s]) overflow[i] = 1;
     }
 
     for (uint32_t i = 0; i < submitted; i++) {
         bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get(i);
+        if (scratch && scratch->device >= 0 &&
+            !bgj_cuda_set_current_device(scratch->device)) {
+            goto fail_sync;
+        }
         cudaError_t err = cudaStreamSynchronize(scratch->stream);
         if (err != cudaSuccess) {
             set_cuda_error("cudaStreamSynchronize batch results", err);
@@ -7241,23 +9276,39 @@ extern "C" int bgj_cuda_search_bucket_pool_batch_raw(const int8_t *pool_vecs,
         if (scratch->phase_profile_active) {
             bgj_cuda_search_phase_profile_add(&phase_profile_sum,
                                               &scratch->last_phase_profile);
+            if (batch_split && scratch_items[i] == split_item) {
+                bgj_cuda_search_phase_profile_add(&split_item_phase_profile,
+                                                  &scratch->last_phase_profile);
+            }
         }
     }
     copy_sec = bgj_cuda_wall_time() - copy_t0;
-    for (uint32_t i = 0; i < submitted; i++) {
+    for (uint32_t i = 0; i < batch_size; i++) {
         total_results += result_count[i];
         if (overflow[i]) total_overflows++;
     }
     batch_phase_profile = bgj_cuda_phase_profile_requested() ? &phase_profile_sum : NULL;
 
     set_plain_error("no CUDA error");
-    for (uint32_t i = 0; i < submitted; i++) {
-        bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get(i);
-        const bgj_cuda_search_phase_profile_t *item_phase_profile =
-            scratch && scratch->phase_profile_active ? &scratch->last_phase_profile : NULL;
+    for (uint32_t i = 0; i < batch_size; i++) {
+        bgj_cuda_raw_scratch_t *scratch = NULL;
+        for (uint32_t s = 0; s < submitted; s++) {
+            if (scratch_items[s] == i) {
+                scratch = bgj_cuda_raw_batch_scratch.get(s);
+                break;
+            }
+        }
+        const bgj_cuda_search_phase_profile_t *item_phase_profile = NULL;
+        if (batch_split && i == split_item) {
+            item_phase_profile = bgj_cuda_phase_profile_requested() ?
+                                 &split_item_phase_profile : NULL;
+        } else {
+            item_phase_profile =
+                scratch && scratch->phase_profile_active ? &scratch->last_phase_profile : NULL;
+        }
         bgj_cuda_bucket_profile_record(BGJ_CUDA_BUCKET_PROFILE_BATCH_ITEM,
                                        scratch ? scratch->device : selected_device,
-                                       submitted,
+                                       batch_size,
                                        i,
                                        num_p[i],
                                        num_n[i],
@@ -7273,7 +9324,7 @@ extern "C" int bgj_cuda_search_bucket_pool_batch_raw(const int8_t *pool_vecs,
     }
     bgj_cuda_bucket_profile_record(BGJ_CUDA_BUCKET_PROFILE_BATCH,
                                    selected_device,
-                                   submitted,
+                                   batch_size,
                                    0,
                                    max_num_p,
                                    max_num_n,
@@ -7286,38 +9337,120 @@ extern "C" int bgj_cuda_search_bucket_pool_batch_raw(const int8_t *pool_vecs,
                                    copy_sec,
                                    bgj_cuda_wall_time() - total_t0,
                                    batch_phase_profile);
-    bgj_cuda_device_profile_record(selected_device,
-                                   submitted,
-                                   estimated_dots,
-                                   total_results,
-                                   total_overflows,
-                                   0,
-                                   submit_sec,
-                                   wait_sec,
-                                   copy_sec,
-                                   bgj_cuda_wall_time() - total_t0);
-    bgj_cuda_phase_profile_record(submitted,
+    if (multi_gpu_batch) {
+        uint64_t device_buckets[BGJ_CUDA_MAX_EXEC_DEVICES] = {};
+        uint64_t device_dots[BGJ_CUDA_MAX_EXEC_DEVICES] = {};
+        uint64_t device_results[BGJ_CUDA_MAX_EXEC_DEVICES] = {};
+        uint64_t device_overflows[BGJ_CUDA_MAX_EXEC_DEVICES] = {};
+        for (uint32_t s = 0; s < submitted; s++) {
+            const uint32_t item = scratch_items[s];
+            bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get(s);
+            const int device = scratch ? scratch->device : scratch_devices[s];
+            if (device < 0 || device >= BGJ_CUDA_MAX_EXEC_DEVICES) continue;
+            device_buckets[device]++;
+            if (batch_split && item == split_item) {
+                device_dots[device] +=
+                    bgj_cuda_scale_work(item_dots[item],
+                                        scratch_work_count[s],
+                                        split_full_work);
+            } else {
+                device_dots[device] += item_dots[item];
+            }
+            device_results[device] += scratch_copied_counts[s];
+            if (scratch_copied_overflows[s]) device_overflows[device]++;
+        }
+        for (int device = 0; device < BGJ_CUDA_MAX_EXEC_DEVICES; device++) {
+            if (!device_buckets[device]) continue;
+            bgj_cuda_device_profile_record(device,
+                                           device_buckets[device],
+                                           device_dots[device],
+                                           device_results[device],
+                                           device_overflows[device],
+                                           0,
+                                           submit_sec,
+                                           wait_sec,
+                                           copy_sec,
+                                           bgj_cuda_wall_time() - total_t0);
+        }
+    } else {
+        bgj_cuda_device_profile_record(selected_device,
+                                       submitted,
+                                       estimated_dots,
+                                       total_results,
+                                       total_overflows,
+                                       0,
+                                       submit_sec,
+                                       wait_sec,
+                                       copy_sec,
+                                       bgj_cuda_wall_time() - total_t0);
+    }
+    bgj_cuda_phase_profile_record(batch_size,
                                   estimated_dots,
                                   total_results,
                                   total_overflows,
                                   0,
                                   batch_phase_profile);
+    if (batch_split && bgj_cuda_split_profile_requested() &&
+        item_dots[split_item] >= bgj_cuda_split_profile_min_dots()) {
+        fprintf(stderr,
+                "cuda_batch_split_profile: item=%u/%u devices=%d num_p=%u num_n=%u "
+                "item_dots=%lu batch_dots=%lu results=%u overflow=%d "
+                "submit=%.6fs wait=%.6fs copy=%.6fs total=%.6fs",
+                split_item,
+                batch_size,
+                execution_device_count,
+                num_p[split_item],
+                num_n[split_item],
+                (unsigned long)item_dots[split_item],
+                (unsigned long)estimated_dots,
+                result_count[split_item],
+                overflow[split_item],
+                submit_sec,
+                wait_sec,
+                copy_sec,
+                bgj_cuda_wall_time() - total_t0);
+        bgj_cuda_split_profile_print_phases(stderr, &split_item_phase_profile);
+        fprintf(stderr, "\n");
+        fflush(stderr);
+    }
+    if (selected_device >= 0) bgj_cuda_set_current_device(selected_device);
+    if (item_dots != item_dots_stack) free(item_dots);
+    if (item_devices != item_devices_stack) free(item_devices);
+    if (scratch_items != scratch_items_stack) free(scratch_items);
+    if (scratch_split_slots != scratch_split_slots_stack) free(scratch_split_slots);
+    if (scratch_split_counts != scratch_split_counts_stack) free(scratch_split_counts);
+    if (scratch_devices != scratch_devices_stack) free(scratch_devices);
+    if (scratch_work_begin != scratch_work_begin_stack) free(scratch_work_begin);
+    if (scratch_work_count != scratch_work_count_stack) free(scratch_work_count);
+    if (scratch_result_counts != scratch_result_counts_stack) free(scratch_result_counts);
+    if (scratch_copied_counts != scratch_copied_counts_stack) free(scratch_copied_counts);
+    if (scratch_overflows != scratch_overflows_stack) free(scratch_overflows);
+    if (scratch_copied_overflows != scratch_copied_overflows_stack) free(scratch_copied_overflows);
     return 1;
 
 fail_sync:
     for (uint32_t i = 0; i < submitted; i++) {
         bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get(i);
-        if (scratch && scratch->stream_ready) cudaStreamSynchronize(scratch->stream);
+        if (scratch && scratch->stream_ready) {
+            if (scratch->device >= 0) cudaSetDevice(scratch->device);
+            cudaStreamSynchronize(scratch->stream);
+        }
     }
-    for (uint32_t i = 0; i < submitted; i++) {
+    for (uint32_t i = 0; i < batch_size; i++) {
         total_results += result_count[i];
         if (overflow[i]) total_overflows++;
     }
-    for (uint32_t i = 0; i < submitted; i++) {
-        bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get(i);
+    for (uint32_t i = 0; i < batch_size; i++) {
+        bgj_cuda_raw_scratch_t *scratch = NULL;
+        for (uint32_t s = 0; s < submitted; s++) {
+            if (scratch_items[s] == i) {
+                scratch = bgj_cuda_raw_batch_scratch.get(s);
+                break;
+            }
+        }
         bgj_cuda_bucket_profile_record(BGJ_CUDA_BUCKET_PROFILE_BATCH_ITEM,
                                        scratch ? scratch->device : selected_device,
-                                       submitted,
+                                       batch_size,
                                        i,
                                        num_p[i],
                                        num_n[i],
@@ -7332,7 +9465,7 @@ fail_sync:
     }
     bgj_cuda_bucket_profile_record(BGJ_CUDA_BUCKET_PROFILE_BATCH,
                                    selected_device,
-                                   submitted,
+                                   batch_size,
                                    0,
                                    max_num_p,
                                    max_num_n,
@@ -7344,16 +9477,66 @@ fail_sync:
                                    wait_sec,
                                    copy_sec,
                                    bgj_cuda_wall_time() - total_t0);
-    bgj_cuda_device_profile_record(selected_device,
-                                   submitted,
-                                   estimated_dots,
-                                   total_results,
-                                   total_overflows,
-                                   1,
-                                   submit_sec,
-                                   wait_sec,
-                                   copy_sec,
-                                   bgj_cuda_wall_time() - total_t0);
+    if (multi_gpu_batch) {
+        uint64_t device_buckets[BGJ_CUDA_MAX_EXEC_DEVICES] = {};
+        uint64_t device_dots[BGJ_CUDA_MAX_EXEC_DEVICES] = {};
+        uint64_t device_results[BGJ_CUDA_MAX_EXEC_DEVICES] = {};
+        uint64_t device_overflows[BGJ_CUDA_MAX_EXEC_DEVICES] = {};
+        for (uint32_t s = 0; s < submitted; s++) {
+            const uint32_t item = scratch_items[s];
+            bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get(s);
+            const int device = scratch ? scratch->device : scratch_devices[s];
+            if (device < 0 || device >= BGJ_CUDA_MAX_EXEC_DEVICES) continue;
+            device_buckets[device]++;
+            if (batch_split && item == split_item) {
+                device_dots[device] +=
+                    bgj_cuda_scale_work(item_dots[item],
+                                        scratch_work_count[s],
+                                        split_full_work);
+            } else {
+                device_dots[device] += item_dots[item];
+            }
+            device_results[device] += scratch_copied_counts[s];
+            if (scratch_copied_overflows[s]) device_overflows[device]++;
+        }
+        for (int device = 0; device < BGJ_CUDA_MAX_EXEC_DEVICES; device++) {
+            if (!device_buckets[device]) continue;
+            bgj_cuda_device_profile_record(device,
+                                           device_buckets[device],
+                                           device_dots[device],
+                                           device_results[device],
+                                           device_overflows[device],
+                                           1,
+                                           submit_sec,
+                                           wait_sec,
+                                           copy_sec,
+                                           bgj_cuda_wall_time() - total_t0);
+        }
+    } else {
+        bgj_cuda_device_profile_record(selected_device,
+                                       batch_size,
+                                       estimated_dots,
+                                       total_results,
+                                       total_overflows,
+                                       1,
+                                       submit_sec,
+                                       wait_sec,
+                                       copy_sec,
+                                       bgj_cuda_wall_time() - total_t0);
+    }
+    if (selected_device >= 0) bgj_cuda_set_current_device(selected_device);
+    if (item_dots != item_dots_stack) free(item_dots);
+    if (item_devices != item_devices_stack) free(item_devices);
+    if (scratch_items != scratch_items_stack) free(scratch_items);
+    if (scratch_split_slots != scratch_split_slots_stack) free(scratch_split_slots);
+    if (scratch_split_counts != scratch_split_counts_stack) free(scratch_split_counts);
+    if (scratch_devices != scratch_devices_stack) free(scratch_devices);
+    if (scratch_work_begin != scratch_work_begin_stack) free(scratch_work_begin);
+    if (scratch_work_count != scratch_work_count_stack) free(scratch_work_count);
+    if (scratch_result_counts != scratch_result_counts_stack) free(scratch_result_counts);
+    if (scratch_copied_counts != scratch_copied_counts_stack) free(scratch_copied_counts);
+    if (scratch_overflows != scratch_overflows_stack) free(scratch_overflows);
+    if (scratch_copied_overflows != scratch_copied_overflows_stack) free(scratch_copied_overflows);
     return 0;
 }
 

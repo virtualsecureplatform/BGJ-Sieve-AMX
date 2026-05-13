@@ -9,7 +9,9 @@
 #include <sys/time.h>
 #include <malloc.h>
 #include <algorithm>
+#include <memory>
 #include <type_traits>
+#include <vector>
 
 
 #if 1
@@ -1561,9 +1563,439 @@ int Pool_epi8_t<nb>::bgj2_Sieve(long log_level, long lps_auto_adj){
             // Keep it available for explicit speed experiments but do not use it
             // by default.
             const int cuda_bgj2_search1 = cuda_bgj2_search ? bgj_epi8_env_flag("BGJ_CUDA_BGJ2_SEARCH1", 0) : 0;
+            const int cuda_bgj2_search0_ordered =
+                cuda_bgj2_search0 ? bgj_epi8_env_flag("BGJ_CUDA_BGJ2_SEARCH0_ORDERED",
+                                                       0) : 0;
+            const int cuda_bgj2_search0_staged =
+                cuda_bgj2_search0 ? bgj_epi8_env_flag("BGJ_CUDA_BGJ2_SEARCH0_STAGED",
+                                                       0) : 0;
             #endif
 
             ///////////////// search0 /////////////////
+            #if defined(HAVE_CUDA)
+            if (cuda_bgj2_search0_staged && bgj_cuda_search_requested() && cuda_bgj2_search0) {
+                TIMER_START;
+                struct bgj2_cuda_search0_staged_task_t {
+                    bucket_epi8_t<BGJ2_EPI8_REUSE_USE_3RED> *buckets[BGJ2_EPI8_BUCKET0_BATCHSIZE];
+                    long num_bucket = 0;
+                    long owner = 0;
+                    int use_cuda = 0;
+                    int cuda_done = 0;
+                    int cred_done = 0;
+                    long batch_ndp_long = 0;
+                    uint64_t batch_ndp = 0;
+                    double cred_sec = 0.0;
+                    double cuda_sec = 0.0;
+                    std::unique_ptr<bgj_cuda_result_t[]> results;
+                    std::vector<bgj_cuda_result_t *> result_ptrs;
+                    std::vector<uint32_t> result_counts;
+                    std::vector<int> overflows;
+                };
+
+                std::vector<bgj2_cuda_search0_staged_task_t> staged_tasks;
+                int staged_build_ok = 1;
+                try {
+                    staged_tasks.reserve(BGJ2_EPI8_BUCKET0_BATCHSIZE);
+                } catch (...) {
+                    staged_build_ok = 0;
+                }
+
+                auto staged_finish_task =
+                    [&](bgj2_cuda_search0_staged_task_t &task) {
+                        task.batch_ndp_long = 0;
+                        task.batch_ndp = 0;
+                        for (long i = 0; i < task.num_bucket; i++) {
+                            const long ndp = bgj_epi8_search0_profile_ndp(task.buckets[i]->num_pvec,
+                                                                          task.buckets[i]->num_nvec);
+                            task.batch_ndp_long += ndp;
+                            if (ndp > 0) task.batch_ndp += (uint64_t)ndp;
+                        }
+                    };
+
+                auto staged_push_single =
+                    [&](bucket_epi8_t<BGJ2_EPI8_REUSE_USE_3RED> *bkt) {
+                        bgj2_cuda_search0_staged_task_t task;
+                        task.buckets[0] = bkt;
+                        task.num_bucket = 1;
+                        task.use_cuda =
+                            bgj_epi8_bucket_pair_dots(bkt->num_pvec, bkt->num_nvec) >= cuda_batch_min_dots;
+                        staged_finish_task(task);
+                        staged_tasks.push_back(std::move(task));
+                    };
+
+                if (staged_build_ok) {
+                    long nrem_rbucket = BGJ2_EPI8_BUCKET0_BATCHSIZE;
+                    while (nrem_rbucket > 0) {
+                        if (local_profile.succ_add2 + local_profile.succ_add3 >
+                            num_empty + sorted_index - goal_index) {
+                            local_profile.report_bucket_not_used(2, nrem_rbucket, 0);
+                            nrem_rbucket = 0;
+                            break;
+                        }
+
+                        bucket_epi8_t<BGJ2_EPI8_REUSE_USE_3RED> *bkt = rbucket[nrem_rbucket - 1];
+                        nrem_rbucket--;
+                        if (!bkt) continue;
+
+                        if (cuda_batch_capacity > 1 &&
+                            bgj_epi8_bucket_pair_dots(bkt->num_pvec, bkt->num_nvec) >= cuda_batch_min_dots) {
+                            bgj2_cuda_search0_staged_task_t task;
+                            task.buckets[0] = bkt;
+                            task.num_bucket = 1;
+                            task.use_cuda = 1;
+
+                            while (task.num_bucket < (long)cuda_batch_capacity &&
+                                   task.num_bucket < BGJ2_EPI8_BUCKET0_BATCHSIZE &&
+                                   nrem_rbucket > 0) {
+                                if (local_profile.succ_add2 + local_profile.succ_add3 >
+                                    num_empty + sorted_index - goal_index) {
+                                    local_profile.report_bucket_not_used(2, nrem_rbucket, 0);
+                                    nrem_rbucket = 0;
+                                    break;
+                                }
+                                bucket_epi8_t<BGJ2_EPI8_REUSE_USE_3RED> *next = rbucket[nrem_rbucket - 1];
+                                nrem_rbucket--;
+                                if (next) task.buckets[task.num_bucket++] = next;
+                            }
+
+                            if (task.num_bucket >= (long)cuda_min_batch) {
+                                staged_finish_task(task);
+                                staged_tasks.push_back(std::move(task));
+                            } else {
+                                for (long i = 0; i < task.num_bucket; i++) staged_push_single(task.buckets[i]);
+                            }
+                        } else {
+                            staged_push_single(bkt);
+                        }
+                    }
+                }
+
+                const uint32_t staged_result_capacity = bgj_cuda_result_capacity();
+                const int cuda_cred_on_device = bgj_cuda_cred_transform_requested();
+
+                if (staged_build_ok && staged_result_capacity != 0) {
+                    #pragma omp parallel for schedule(dynamic)
+                    for (long task_ind = 0; task_ind < (long)staged_tasks.size(); task_ind++) {
+                        bgj2_cuda_search0_staged_task_t &task = staged_tasks[task_ind];
+                        const long owner = omp_get_thread_num();
+                        task.owner = owner;
+                        if (!task.use_cuda) continue;
+
+                        if (!cuda_cred_on_device) {
+                            const double t0 = bgj_epi8_wall_time();
+                            for (long i = 0; i < task.num_bucket; i++) {
+                                _search_cred<BGJ2_EPI8_REUSE_USE_3RED, 1>(task.buckets[i],
+                                                                          sol_list[owner],
+                                                                          goal_norm,
+                                                                          &local_profile);
+                            }
+                            task.cred_sec += bgj_epi8_wall_time() - t0;
+                            task.cred_done = 1;
+                        }
+
+                        int storage_ok = 1;
+                        try {
+                            const size_t total_capacity =
+                                (size_t)task.num_bucket * (size_t)staged_result_capacity;
+                            task.results.reset(new bgj_cuda_result_t[total_capacity]);
+                            task.result_ptrs.resize((size_t)task.num_bucket);
+                            task.result_counts.assign((size_t)task.num_bucket, 0);
+                            task.overflows.assign((size_t)task.num_bucket, 0);
+                        } catch (...) {
+                            storage_ok = 0;
+                        }
+                        if (!storage_ok) continue;
+
+                        const double t0 = bgj_epi8_wall_time();
+                        task.cuda_done =
+                            _search_bgj1_cuda_batch_collect<BGJ2_EPI8_REUSE_USE_3RED, 1>(
+                                task.buckets,
+                                task.num_bucket,
+                                goal_norm,
+                                task.results.get(),
+                                staged_result_capacity,
+                                task.result_ptrs.data(),
+                                task.result_counts.data(),
+                                task.overflows.data()) > 0;
+                        task.cuda_sec += bgj_epi8_wall_time() - t0;
+                    }
+                }
+
+                long __search0_ndp = 0;
+                double __cuda_cred_time0 = 0.0;
+                double __cuda_single_time0 = 0.0;
+                double __cuda_batch_time0 = 0.0;
+                double __cuda_fallback_time0 = 0.0;
+                uint64_t __cuda_single_ndp0 = 0;
+                uint64_t __cuda_batch_ndp0 = 0;
+                uint64_t __cuda_fallback_ndp0 = 0;
+                uint64_t __cuda_single_bucket0 = 0;
+                uint64_t __cuda_batch_bucket0 = 0;
+                uint64_t __cuda_batch_call0 = 0;
+                uint64_t __cuda_fallback_bucket0 = 0;
+
+                for (long task_ind = 0; task_ind < (long)staged_tasks.size(); task_ind++) {
+                    bgj2_cuda_search0_staged_task_t &task = staged_tasks[task_ind];
+                    const long owner = (task.owner >= 0 && task.owner < num_threads) ? task.owner : 0;
+                    __search0_ndp += task.batch_ndp_long;
+                    __cuda_cred_time0 += task.cred_sec;
+
+                    if (task.use_cuda) {
+                        if (task.num_bucket > 1) {
+                            __cuda_batch_time0 += task.cuda_sec;
+                            __cuda_batch_call0++;
+                        } else {
+                            __cuda_single_time0 += task.cuda_sec;
+                        }
+                    }
+
+                    if (task.cuda_done) {
+                        int consume_ok = 1;
+                        for (long i = 0; i < task.num_bucket; i++) {
+                            if (!_consume_bgj1_cuda_results<BGJ2_EPI8_REUSE_USE_3RED, 1>(
+                                    task.buckets[i],
+                                    sol_list[owner],
+                                    &local_profile,
+                                    task.result_ptrs[i],
+                                    task.result_counts[i])) {
+                                consume_ok = 0;
+                                break;
+                            }
+                        }
+                        if (consume_ok) {
+                            if (task.num_bucket > 1) {
+                                __cuda_batch_bucket0 += (uint64_t)task.num_bucket;
+                                __cuda_batch_ndp0 += task.batch_ndp;
+                            } else {
+                                __cuda_single_bucket0++;
+                                __cuda_single_ndp0 += task.batch_ndp;
+                            }
+                            continue;
+                        }
+                    }
+
+                    if (!task.cred_done) {
+                        const double t0 = bgj_epi8_wall_time();
+                        for (long i = 0; i < task.num_bucket; i++) {
+                            _search_cred<BGJ2_EPI8_REUSE_USE_3RED, 1>(task.buckets[i],
+                                                                      sol_list[owner],
+                                                                      goal_norm,
+                                                                      &local_profile);
+                        }
+                        const double cred_sec = bgj_epi8_wall_time() - t0;
+                        __cuda_cred_time0 += cred_sec;
+                        task.cred_done = 1;
+                    }
+
+                    const double t0 = bgj_epi8_wall_time();
+                    for (long i = 0; i < task.num_bucket; i++) {
+                        _search_np<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, BGJ2_EPI8_REUSE_USE_3RED, 1>(task.buckets[i], sol_list[owner], goal_norm, &local_profile);
+                        _search_pp<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, BGJ2_EPI8_REUSE_USE_3RED, 1>(task.buckets[i], sol_list[owner], goal_norm, &local_profile);
+                        _search_nn<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, BGJ2_EPI8_REUSE_USE_3RED, 1>(task.buckets[i], sol_list[owner], goal_norm, &local_profile);
+                    }
+                    __cuda_fallback_time0 += bgj_epi8_wall_time() - t0;
+                    __cuda_fallback_bucket0 += (uint64_t)task.num_bucket;
+                    __cuda_fallback_ndp0 += task.batch_ndp;
+                }
+
+                local_profile.search0_ndp += __search0_ndp;
+                local_profile.cuda_cred_time0 += __cuda_cred_time0;
+                local_profile.cuda_single_time0 += __cuda_single_time0;
+                local_profile.cuda_batch_time0 += __cuda_batch_time0;
+                local_profile.cuda_fallback_time0 += __cuda_fallback_time0;
+                local_profile.cuda_single_ndp0 += __cuda_single_ndp0;
+                local_profile.cuda_batch_ndp0 += __cuda_batch_ndp0;
+                local_profile.cuda_fallback_ndp0 += __cuda_fallback_ndp0;
+                local_profile.cuda_single_bucket0 += __cuda_single_bucket0;
+                local_profile.cuda_batch_bucket0 += __cuda_batch_bucket0;
+                local_profile.cuda_batch_call0 += __cuda_batch_call0;
+                local_profile.cuda_fallback_bucket0 += __cuda_fallback_bucket0;
+            } else if (cuda_bgj2_search0_ordered && bgj_cuda_search_requested() && cuda_bgj2_search0) {
+                TIMER_START;
+                long __search0_ndp = 0;
+                double __cuda_cred_time0 = 0.0;
+                double __cuda_single_time0 = 0.0;
+                double __cuda_batch_time0 = 0.0;
+                double __cuda_fallback_time0 = 0.0;
+                uint64_t __cuda_single_ndp0 = 0;
+                uint64_t __cuda_batch_ndp0 = 0;
+                uint64_t __cuda_fallback_ndp0 = 0;
+                uint64_t __cuda_single_bucket0 = 0;
+                uint64_t __cuda_batch_bucket0 = 0;
+                uint64_t __cuda_batch_call0 = 0;
+                uint64_t __cuda_fallback_bucket0 = 0;
+
+                const long thread = 0;
+                const int cuda_cred_on_device = bgj_cuda_cred_transform_requested();
+                const int cuda_overlap_cred = !cuda_cred_on_device && bgj_cuda_overlap_cred_requested();
+
+                auto run_cpu_search0_bucket =
+                    [&](bucket_epi8_t<BGJ2_EPI8_REUSE_USE_3RED> *bkt,
+                        bool cred_done,
+                        uint64_t ndp) {
+                        if (!cred_done) {
+                            const double t0 = bgj_epi8_wall_time();
+                            _search_cred<BGJ2_EPI8_REUSE_USE_3RED, 1>(bkt, sol_list[thread], goal_norm, &local_profile);
+                            __cuda_cred_time0 += bgj_epi8_wall_time() - t0;
+                        }
+                        const double t0 = bgj_epi8_wall_time();
+                        _search_np<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, BGJ2_EPI8_REUSE_USE_3RED, 1>(bkt, sol_list[thread], goal_norm, &local_profile);
+                        _search_pp<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, BGJ2_EPI8_REUSE_USE_3RED, 1>(bkt, sol_list[thread], goal_norm, &local_profile);
+                        _search_nn<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, BGJ2_EPI8_REUSE_USE_3RED, 1>(bkt, sol_list[thread], goal_norm, &local_profile);
+                        __cuda_fallback_time0 += bgj_epi8_wall_time() - t0;
+                        __cuda_fallback_bucket0++;
+                        __cuda_fallback_ndp0 += ndp;
+                    };
+
+                auto run_single_search0_bucket =
+                    [&](bucket_epi8_t<BGJ2_EPI8_REUSE_USE_3RED> *bkt) {
+                        const long ndp_long = bgj_epi8_search0_profile_ndp(bkt->num_pvec, bkt->num_nvec);
+                        const uint64_t ndp = ndp_long > 0 ? (uint64_t)ndp_long : 0;
+                        bool cred_done = false;
+                        bool cuda_done = false;
+
+                        if (bgj_epi8_bucket_pair_dots(bkt->num_pvec, bkt->num_nvec) >= cuda_batch_min_dots) {
+                            double t0 = 0.0;
+                            if (cuda_overlap_cred) {
+                                t0 = bgj_epi8_wall_time();
+                                cuda_done = _search_bgj1_cuda_overlap<BGJ2_EPI8_REUSE_USE_3RED, 1>(bkt,
+                                                                                                  sol_list[thread],
+                                                                                                  goal_norm,
+                                                                                                  &local_profile) > 0;
+                                __cuda_single_time0 += bgj_epi8_wall_time() - t0;
+                                cred_done = true;
+                            } else {
+                                if (!cuda_cred_on_device) {
+                                    t0 = bgj_epi8_wall_time();
+                                    _search_cred<BGJ2_EPI8_REUSE_USE_3RED, 1>(bkt, sol_list[thread], goal_norm, &local_profile);
+                                    __cuda_cred_time0 += bgj_epi8_wall_time() - t0;
+                                    cred_done = true;
+                                }
+                                t0 = bgj_epi8_wall_time();
+                                cuda_done = _search_bgj1_cuda<BGJ2_EPI8_REUSE_USE_3RED, 1>(bkt,
+                                                                                          sol_list[thread],
+                                                                                          goal_norm,
+                                                                                          &local_profile) > 0;
+                                __cuda_single_time0 += bgj_epi8_wall_time() - t0;
+                            }
+                            if (cuda_done) {
+                                __cuda_single_bucket0++;
+                                __cuda_single_ndp0 += ndp;
+                            }
+                        }
+
+                        if (!cuda_done) run_cpu_search0_bucket(bkt, cred_done, ndp);
+                        __search0_ndp += ndp_long;
+                    };
+
+                long nrem_rbucket = BGJ2_EPI8_BUCKET0_BATCHSIZE;
+                while (nrem_rbucket > 0) {
+                    if (local_profile.succ_add2 + local_profile.succ_add3 >
+                        num_empty + sorted_index - goal_index) {
+                        local_profile.report_bucket_not_used(2, nrem_rbucket, 0);
+                        nrem_rbucket = 0;
+                        break;
+                    }
+
+                    bucket_epi8_t<BGJ2_EPI8_REUSE_USE_3RED> *bkt = rbucket[nrem_rbucket - 1];
+                    nrem_rbucket--;
+                    if (!bkt) continue;
+
+                    if (cuda_batch_capacity > 1 &&
+                        bgj_epi8_bucket_pair_dots(bkt->num_pvec, bkt->num_nvec) >= cuda_batch_min_dots) {
+                        bucket_epi8_t<BGJ2_EPI8_REUSE_USE_3RED> *cuda_batch[BGJ2_EPI8_BUCKET0_BATCHSIZE];
+                        long cuda_num_bucket = 1;
+                        cuda_batch[0] = bkt;
+
+                        while (cuda_num_bucket < (long)cuda_batch_capacity &&
+                               cuda_num_bucket < BGJ2_EPI8_BUCKET0_BATCHSIZE &&
+                               nrem_rbucket > 0) {
+                            if (local_profile.succ_add2 + local_profile.succ_add3 >
+                                num_empty + sorted_index - goal_index) {
+                                local_profile.report_bucket_not_used(2, nrem_rbucket, 0);
+                                nrem_rbucket = 0;
+                                break;
+                            }
+                            bucket_epi8_t<BGJ2_EPI8_REUSE_USE_3RED> *next = rbucket[nrem_rbucket - 1];
+                            nrem_rbucket--;
+                            if (next) cuda_batch[cuda_num_bucket++] = next;
+                        }
+
+                        if (cuda_num_bucket >= (long)cuda_min_batch) {
+                            long batch_ndp_long = 0;
+                            uint64_t batch_ndp = 0;
+                            for (long i = 0; i < cuda_num_bucket; i++) {
+                                const long ndp = bgj_epi8_search0_profile_ndp(cuda_batch[i]->num_pvec,
+                                                                              cuda_batch[i]->num_nvec);
+                                batch_ndp_long += ndp;
+                                if (ndp > 0) batch_ndp += (uint64_t)ndp;
+                            }
+                            double t0 = 0.0;
+                            if (!cuda_cred_on_device) {
+                                t0 = bgj_epi8_wall_time();
+                                for (long i = 0; i < cuda_num_bucket; i++) {
+                                    _search_cred<BGJ2_EPI8_REUSE_USE_3RED, 1>(cuda_batch[i], sol_list[thread], goal_norm, &local_profile);
+                                }
+                                __cuda_cred_time0 += bgj_epi8_wall_time() - t0;
+                            }
+                            t0 = bgj_epi8_wall_time();
+                            const bool cuda_done =
+                                _search_bgj1_cuda_batch<BGJ2_EPI8_REUSE_USE_3RED, 1>(cuda_batch,
+                                                                                     cuda_num_bucket,
+                                                                                     sol_list[thread],
+                                                                                     goal_norm,
+                                                                                     &local_profile) > 0;
+                            __cuda_batch_time0 += bgj_epi8_wall_time() - t0;
+                            __cuda_batch_call0++;
+                            if (!cuda_done) {
+                                if (cuda_cred_on_device) {
+                                    t0 = bgj_epi8_wall_time();
+                                    for (long i = 0; i < cuda_num_bucket; i++) {
+                                        _search_cred<BGJ2_EPI8_REUSE_USE_3RED, 1>(cuda_batch[i], sol_list[thread], goal_norm, &local_profile);
+                                    }
+                                    __cuda_cred_time0 += bgj_epi8_wall_time() - t0;
+                                }
+                                t0 = bgj_epi8_wall_time();
+                                for (long i = 0; i < cuda_num_bucket; i++) {
+                                    _search_np<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, BGJ2_EPI8_REUSE_USE_3RED, 1>(cuda_batch[i], sol_list[thread], goal_norm, &local_profile);
+                                    _search_pp<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, BGJ2_EPI8_REUSE_USE_3RED, 1>(cuda_batch[i], sol_list[thread], goal_norm, &local_profile);
+                                    _search_nn<SEARCH_L2_BLOCK, SEARCH_L1_BLOCK, BGJ2_EPI8_REUSE_USE_3RED, 1>(cuda_batch[i], sol_list[thread], goal_norm, &local_profile);
+                                }
+                                __cuda_fallback_time0 += bgj_epi8_wall_time() - t0;
+                                __cuda_fallback_bucket0 += (uint64_t)cuda_num_bucket;
+                                __cuda_fallback_ndp0 += batch_ndp;
+                            } else {
+                                __cuda_batch_bucket0 += (uint64_t)cuda_num_bucket;
+                                __cuda_batch_ndp0 += batch_ndp;
+                            }
+                            __search0_ndp += batch_ndp_long;
+                            continue;
+                        }
+
+                        for (long i = 0; i < cuda_num_bucket; i++) {
+                            run_single_search0_bucket(cuda_batch[i]);
+                        }
+                        continue;
+                    }
+
+                    run_single_search0_bucket(bkt);
+                }
+
+                local_profile.search0_ndp += __search0_ndp;
+                local_profile.cuda_cred_time0 += __cuda_cred_time0;
+                local_profile.cuda_single_time0 += __cuda_single_time0;
+                local_profile.cuda_batch_time0 += __cuda_batch_time0;
+                local_profile.cuda_fallback_time0 += __cuda_fallback_time0;
+                local_profile.cuda_single_ndp0 += __cuda_single_ndp0;
+                local_profile.cuda_batch_ndp0 += __cuda_batch_ndp0;
+                local_profile.cuda_fallback_ndp0 += __cuda_fallback_ndp0;
+                local_profile.cuda_single_bucket0 += __cuda_single_bucket0;
+                local_profile.cuda_batch_bucket0 += __cuda_batch_bucket0;
+                local_profile.cuda_batch_call0 += __cuda_batch_call0;
+                local_profile.cuda_fallback_bucket0 += __cuda_fallback_bucket0;
+            } else
+            #endif
+            {
             pthread_spinlock_t rbucket_list_lock;
             pthread_spin_init(&rbucket_list_lock, PTHREAD_PROCESS_SHARED);
             long nrem_rbucket = BGJ2_EPI8_BUCKET0_BATCHSIZE;
@@ -1793,6 +2225,7 @@ int Pool_epi8_t<nb>::bgj2_Sieve(long log_level, long lps_auto_adj){
                 local_profile.cuda_batch_call0 += __cuda_batch_call0;
                 local_profile.cuda_fallback_bucket0 += __cuda_fallback_bucket0;
                 pthread_spin_unlock(&local_profile.profile_lock);
+            }
             }
             TIMER_END;
             local_profile.search0_time += CURRENT_TIME;
