@@ -133,6 +133,36 @@ static inline int lsh_env_trace_mblock_enabled()
     return env != NULL && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
 }
 
+static inline int lsh_endpoint_profile_enabled()
+{
+    const char *env = getenv("BGJ_LSH_ENDPOINT_PROFILE");
+    return env != NULL && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
+}
+
+static uint64_t lsh_count_unique_endpoints(const uint32_t *ptr_buffer,
+                                           uint64_t begin,
+                                           uint64_t end,
+                                           long mbound)
+{
+    if (ptr_buffer == NULL || end <= begin || mbound <= 0) return 0;
+
+    std::vector<uint8_t> seen((size_t)mbound, 0);
+    uint64_t unique = 0;
+    for (uint64_t i = begin; i < end; i++) {
+        const uint32_t x = ptr_buffer[i * 3 + 1];
+        const uint32_t y = ptr_buffer[i * 3 + 2];
+        if (x < (uint32_t)mbound && !seen[x]) {
+            seen[x] = 1;
+            unique++;
+        }
+        if (y < (uint32_t)mbound && !seen[y]) {
+            seen[y] = 1;
+            unique++;
+        }
+    }
+    return unique;
+}
+
 static inline uint64_t lsh_pair_count(long mbound)
 {
     return ((uint64_t)mbound * (uint64_t)(mbound + 1)) / 2;
@@ -333,6 +363,8 @@ struct lsh_profile_data_t {
     uint64_t cuda_chunk_calls, cuda_chunk_successes, cuda_chunk_overflows;
     uint64_t cuda_pairs, cpu_pairs, cpu_mblocks;
     uint64_t lift_flushes, max_buffer_entries;
+    uint64_t endpoint_mblocks, endpoint_members, endpoint_results, endpoint_unique;
+    uint64_t endpoint_max_mbound, endpoint_max_results, endpoint_max_unique;
     uint64_t worst_mbound, worst_candidates;
     double cuda_time, inline_lift_time, worst_search_time, worst_lift_time;
     pthread_spinlock_t profile_lock;
@@ -361,6 +393,13 @@ struct lsh_profile_data_t {
         cpu_mblocks = 0;
         lift_flushes = 0;
         max_buffer_entries = 0;
+        endpoint_mblocks = 0;
+        endpoint_members = 0;
+        endpoint_results = 0;
+        endpoint_unique = 0;
+        endpoint_max_mbound = 0;
+        endpoint_max_results = 0;
+        endpoint_max_unique = 0;
         worst_mbound = 0;
         worst_candidates = 0;
         cuda_time = 0.0;
@@ -372,6 +411,17 @@ struct lsh_profile_data_t {
     void observe_buffer(uint64_t entries) {
         pthread_spin_lock(&profile_lock);
         if (entries > max_buffer_entries) max_buffer_entries = entries;
+        pthread_spin_unlock(&profile_lock);
+    }
+    void observe_endpoint_mblock(long mbound, uint64_t results, uint64_t unique) {
+        pthread_spin_lock(&profile_lock);
+        endpoint_mblocks++;
+        endpoint_members += (uint64_t)mbound;
+        endpoint_results += results;
+        endpoint_unique += unique;
+        if ((uint64_t)mbound > endpoint_max_mbound) endpoint_max_mbound = (uint64_t)mbound;
+        if (results > endpoint_max_results) endpoint_max_results = results;
+        if (unique > endpoint_max_unique) endpoint_max_unique = unique;
         pthread_spin_unlock(&profile_lock);
     }
     void observe_mblock(long mbound, double search_time, double lift_time, uint64_t candidates) {
@@ -418,9 +468,9 @@ struct lsh_profile_data_t {
     }
     void final_log(float *min_norm, long ID) {
         if (log_level >= 0) {
-            fprintf(stdout, "search done, bucketing_time = %.2fs(%.2f M, %.3f Mops), dp_time = %.2fs(%.2f G, %.3f Gops), lift_time = %.2fs(%.2f M, %.3f Mops)\n", 
-                            bucketing_time, bucketing_ops/1048576.0, bucketing_ops / bucketing_time / 1048576.0, 
-                            dp_time, dp_ops/1073741824.0, dp_ops / dp_time / 1073741824.0, 
+            fprintf(stdout, "search done, bucketing_time = %.2fs(%.2f M, %.3f Mops), dp_time = %.2fs(%.2f G, %.3f Gops), lift_time = %.2fs(%.2f M, %.3f Mops)\n",
+                            bucketing_time, bucketing_ops/1048576.0, bucketing_ops / bucketing_time / 1048576.0,
+                            dp_time, dp_ops/1073741824.0, dp_ops / dp_time / 1073741824.0,
                             lift_time, lift_ops/1048576.0, lift_ops / lift_time / 1048576.0);
             if (log_level >= 1) {
                 fprintf(stdout, "min_norm = [");
@@ -432,6 +482,26 @@ struct lsh_profile_data_t {
             }
             fflush(stdout);
         }
+    }
+    void endpoint_log() {
+        if (endpoint_mblocks == 0) return;
+
+        const double member_ratio = endpoint_members ?
+                (double)endpoint_unique / (double)endpoint_members : 0.0;
+        const double result_endpoint_ratio = endpoint_results ?
+                (double)endpoint_unique / (2.0 * (double)endpoint_results) : 0.0;
+        fprintf(stderr,
+                "lsh_endpoint_profile: mblocks=%llu members=%llu results=%llu unique=%llu unique_per_mblock=%.2f unique_member_ratio=%.6f unique_result_endpoint_ratio=%.6f max_mbound=%llu max_results=%llu max_unique=%llu\n",
+                (unsigned long long)endpoint_mblocks,
+                (unsigned long long)endpoint_members,
+                (unsigned long long)endpoint_results,
+                (unsigned long long)endpoint_unique,
+                (double)endpoint_unique / (double)endpoint_mblocks,
+                member_ratio,
+                result_endpoint_ratio,
+                (unsigned long long)endpoint_max_mbound,
+                (unsigned long long)endpoint_max_results,
+                (unsigned long long)endpoint_max_unique);
     }
 };
 
@@ -1535,6 +1605,7 @@ int Pool_epi8_t<nb>::_lsfsh_insert(long target_index, double eta, long log_level
     const long LSH_RBATCH = ((LSH_MBLOCK_BATCH / num_threads) * num_threads) > 0 ? ((LSH_MBLOCK_BATCH / num_threads) * num_threads) : LSH_MBLOCK_BATCH;
     const int env_profile = lsh_env_profile_enabled();
     const int env_trace = lsh_env_trace_mblock_enabled();
+    const int endpoint_profile = lsh_endpoint_profile_enabled();
     long profile_batch_id = 0;
     if (env_profile || env_trace) {
         fprintf(stderr,
@@ -1586,6 +1657,12 @@ int Pool_epi8_t<nb>::_lsfsh_insert(long target_index, double eta, long log_level
                 const double search_elapsed = CURRENT_TIME;
                 const uint64_t buffer_after_search = ptr_buffer_num[thread];
                 _search_time += search_elapsed;
+                if (endpoint_profile) {
+                    const uint64_t results = buffer_after_search - buffer_before;
+                    const uint64_t unique = lsh_count_unique_endpoints(ptr_buffer[thread], buffer_before,
+                                                                       buffer_after_search, mb[ind].Mbound);
+                    profile_data.observe_endpoint_mblock(mb[ind].Mbound, results, unique);
+                }
                 TIMER_START;
                 __lift_buffer(mb[ind], target_index, dh_dim, b_full_fp,
                         ptr_buffer+thread, ptr_buffer_size+thread, ptr_buffer_num+thread,
@@ -1635,6 +1712,7 @@ int Pool_epi8_t<nb>::_lsfsh_insert(long target_index, double eta, long log_level
     }
 
     profile_data.final_log(min_norm, ID);
+    if (endpoint_profile) profile_data.endpoint_log();
     if (env_profile || env_trace) {
         fprintf(stderr,
                 "lsh_insert_done: batches=%ld target=%ld mblock=%lu/%lu bucket=%.6fs search=%.6fs lift=%.6fs init=%.6fs\n",
@@ -1908,6 +1986,7 @@ int Pool_epi8_t<nb>::_show_lsfsh_insert(long target_index, double eta, long log_
     mblock_provider.init(this, target_index, dual_vec, compress_pos, num_hbits, b_full_fp, min_norm, min_vec, target_ratio, qratio, &profile_data);
     lsh_mblock_t mb[LSH_MBLOCK_BATCH];
     const long LSH_RBATCH = ((LSH_MBLOCK_BATCH / num_threads) * num_threads) > 0 ? ((LSH_MBLOCK_BATCH / num_threads) * num_threads) : LSH_MBLOCK_BATCH;
+    const int endpoint_profile = lsh_endpoint_profile_enabled();
     while (mblock_provider.batch_pop(mb, LSH_RBATCH, &profile_data)) {
         int wild_mb = 0;
         long num_mb = 0;
@@ -1938,14 +2017,22 @@ int Pool_epi8_t<nb>::_show_lsfsh_insert(long target_index, double eta, long log_
             double _lift_time = 0.0;
             double _search_time = 0.0;
             for (long ind = begin_ind; ind < end_ind; ind++) {
+                const uint64_t buffer_before = ptr_buffer_num[thread];
                 TIMER_START;
                 __mblock_sh_search<shsize, LSH_L1_BLOCK, LSH_L2_BLOCK>(
                     mb[ind], threshold, ptr_buffer+thread, ptr_buffer_size+thread, ptr_buffer_num+thread, &profile_data,
                     target_index, dh_dim, b_full_fp, min_norm, min_vec, min_lock);
                 TIMER_END;
                 _search_time += CURRENT_TIME;
+                const uint64_t buffer_after_search = ptr_buffer_num[thread];
+                if (endpoint_profile) {
+                    const uint64_t results = buffer_after_search - buffer_before;
+                    const uint64_t unique = lsh_count_unique_endpoints(ptr_buffer[thread], buffer_before,
+                                                                       buffer_after_search, mb[ind].Mbound);
+                    profile_data.observe_endpoint_mblock(mb[ind].Mbound, results, unique);
+                }
                 TIMER_START;
-                __lift_buffer(mb[ind], target_index, dh_dim, b_full_fp, 
+                __lift_buffer(mb[ind], target_index, dh_dim, b_full_fp,
                         ptr_buffer+thread, ptr_buffer_size+thread, ptr_buffer_num+thread, 
                         min_norm, min_vec, min_lock, &profile_data);
                 TIMER_END;
@@ -1962,6 +2049,7 @@ int Pool_epi8_t<nb>::_show_lsfsh_insert(long target_index, double eta, long log_
     }
 
     profile_data.final_log(min_norm, ID);
+    if (endpoint_profile) profile_data.endpoint_log();
     mblock_provider.clear();
     for (long i = 0; i < num_threads; i++) free(ptr_buffer[i]);
     FREE_VEC(ptr_buffer);
