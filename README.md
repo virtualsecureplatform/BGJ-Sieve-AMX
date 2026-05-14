@@ -113,9 +113,10 @@ larger margins probe earlier and may shorten later BGJ3 rescue work.
 threshold.
 Plain `--cuda` uses one CUDA execution device unless `BGJ_CUDA_DEVICES` or
 `BGJ_CUDA_NUM_DEVICES` is set. The SVP-120 quality-rescue default is validated
-on that single-device trajectory. Explicit multi-GPU trajectories now use the
-stable staged CUDA schedule by default so large-bucket acceleration preserves
-the single-trajectory candidate consumption order as closely as possible.
+on that single-device trajectory. CUDA BGJ2 first-level search uses the staged
+schedule by default so candidate consumption order is stable; set
+`BGJ_CUDA_BGJ2_SEARCH0_STAGED=0` to restore the older parallel bucket-pull path
+for experiments.
 For BGJ2, CUDA search is enabled for first-level reuse buckets by default.
 Second-level subbucket search is available but off by default for SVP quality.
 `BGJ_CUDA_BGJ2_SEARCH=0` disables BGJ2 search offload,
@@ -217,19 +218,19 @@ waits only for a dot-copy CUDA event before running `_search_cred`. Set
 `BGJ_CUDA_OVERLAP_CRED=0` to disable this path when comparing schedules.
 Multi-GPU execution is opt-in. Set `BGJ_CUDA_DEVICES=0,1` to use two visible
 runtime devices; `BGJ_CUDA_NUM_DEVICES=2` is a shorthand for devices `0,1`.
-Explicit multi-GPU enables the stable schedule by default: the primary host
-thread is pinned to a CUDA device, BGJ2 first-level CUDA work is staged and
-consumed in bucket order, and large single buckets are split across GPUs. Each
-GPU keeps its own pool cache and scratch streams. CUDA sieve wrappers raise the
-host search thread count to at least the active GPU count unless
+Explicit multi-GPU enables the rest of the stable schedule by default: the
+primary host thread is pinned to a CUDA device and large single buckets are
+split across GPUs. Each GPU keeps its own pool cache and scratch streams. CUDA
+sieve wrappers raise the host search thread count to at least the active GPU
+count unless
 `BGJ_CUDA_HOST_THREADS` is set explicitly, so two-device runs have enough host
 work to feed both GPUs. Set `BGJ_CUDA_STABLE_MULTI_GPU=0` to restore the older
-opportunistic schedule for experiments. `BGJ_CUDA_SINGLE_BUCKET_SPLIT=0`
-disables large-bucket splitting; under the stable multi-GPU default the split
-threshold is `16000000` pair dots and can be changed with
-`BGJ_CUDA_SINGLE_BUCKET_SPLIT_MIN_DOTS=<n>`. The SVP-100 benchmark harness
-accepts `--cuda-devices 0,1`, which records the setting in the result
-environment JSON.
+opportunistic schedule for experiments, including the older BGJ2 search0
+default. `BGJ_CUDA_SINGLE_BUCKET_SPLIT=0` disables large-bucket splitting;
+under the stable multi-GPU default the split threshold is `16000000` pair dots
+and can be changed with `BGJ_CUDA_SINGLE_BUCKET_SPLIT_MIN_DOTS=<n>`. The
+SVP-100 benchmark harness accepts `--cuda-devices 0,1`, which records the
+setting in the result environment JSON.
 The `app/bgj_epi8 ... cuda` entry point now follows the stronger CPU `bgjf`
 progression: CUDA BGJ1 for the initial and low-dimensional stages, then BGJ2
 and BGJ3 with CUDA search offload above the same thresholds as `bgjf`. The old
