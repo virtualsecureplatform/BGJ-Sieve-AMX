@@ -105,6 +105,7 @@ extern "C" int bgj_cuda_search_bucket_raw_finish_async(bgj_cuda_result_t *result
                                                        int *submitted_overflow,
                                                        uint32_t *result_count,
                                                        int *overflow);
+extern "C" int bgj_cuda_search_bucket_raw_wait_dot_copy_async();
 
 namespace {
 
@@ -748,6 +749,79 @@ bool search_pool_bucket_async(const char *name,
     return true;
 }
 
+bool search_pool_bucket_async_raw_center_mutation(const char *name,
+                                                  const std::vector<int8_t> &pool,
+                                                  Bucket &bucket,
+                                                  uint32_t vec_length,
+                                                  int32_t goal_norm,
+                                                  int32_t center_norm,
+                                                  std::vector<bgj_cuda_result_t> &out)
+{
+    uint32_t submitted_count = 0;
+    uint32_t result_count = 0;
+    int submitted_overflow = 0;
+    int overflow = 0;
+    const uint32_t num_p = (uint32_t)bucket.p_ids.size();
+    const uint32_t num_n = (uint32_t)bucket.n_ids.size();
+    const uint32_t capacity = (uint32_t)out.size();
+    const int submitted = bgj_cuda_search_bucket_pool_raw_submit_async(pool.data(),
+                                                                       79,
+                                                                       (uint32_t)(pool.size() / vec_length),
+                                                                       bucket.p_ids.data(),
+                                                                       bucket.n_ids.data(),
+                                                                       bucket.p_norm.data(),
+                                                                       bucket.n_norm.data(),
+                                                                       bucket.p_dot.data(),
+                                                                       bucket.n_dot.data(),
+                                                                       num_p,
+                                                                       num_n,
+                                                                       vec_length,
+                                                                       goal_norm,
+                                                                       0,
+                                                                       center_norm,
+                                                                       1,
+                                                                       0,
+                                                                       0,
+                                                                       1,
+                                                                       1,
+                                                                       capacity,
+                                                                       &submitted_count,
+                                                                       &submitted_overflow);
+    if (!submitted) {
+        std::cerr << name << ": CUDA async submit failed: " << bgj_cuda_raw_last_error() << "\n";
+        return false;
+    }
+    if (!bgj_cuda_search_bucket_raw_wait_dot_copy_async()) {
+        std::cerr << name << ": CUDA dot-copy wait failed: " << bgj_cuda_raw_last_error() << "\n";
+        return false;
+    }
+
+    for (uint32_t i = 0; i < num_p; i++) {
+        bucket.p_dot[i] = bucket.p_norm[i] - bucket.p_dot[i];
+    }
+    for (uint32_t i = 0; i < num_n; i++) {
+        bucket.n_dot[i] = bucket.n_norm[i] + bucket.n_dot[i];
+    }
+
+    const int finished = bgj_cuda_search_bucket_raw_finish_async(out.data(),
+                                                                 capacity,
+                                                                 &submitted_count,
+                                                                 &submitted_overflow,
+                                                                 &result_count,
+                                                                 &overflow);
+    if (!finished) {
+        std::cerr << name << ": CUDA async finish failed: " << bgj_cuda_raw_last_error() << "\n";
+        return false;
+    }
+    if (submitted_overflow || overflow) {
+        std::cerr << name << ": unexpected overflow, submitted=" << submitted_overflow
+                  << " finish=" << overflow << "\n";
+        return false;
+    }
+    out.resize(result_count);
+    return true;
+}
+
 bool run_pool_split_equivalence_case()
 {
     if (bgj_cuda_raw_execution_device_count() < 2) {
@@ -825,6 +899,45 @@ bool run_pool_split_equivalence_case()
         }
         if (!compare_results(async_name, async_split, single)) return false;
         std::cout << async_name << ": ok, results=" << async_split.size() << "\n";
+    }
+
+    {
+        Bucket raw_center_bucket = make_compact_bucket(num_p, num_n, vec_length, 333);
+        std::vector<int8_t> raw_center_pool;
+        append_bucket_to_pool(raw_center_bucket, vec_length, raw_center_pool);
+        Bucket transformed = raw_center_bucket;
+        for (uint32_t i = 0; i < num_p; i++) {
+            transformed.p_dot[i] = transformed.p_norm[i] - transformed.p_dot[i];
+        }
+        for (uint32_t i = 0; i < num_n; i++) {
+            transformed.n_dot[i] = transformed.n_norm[i] + transformed.n_dot[i];
+        }
+        const std::vector<bgj_cuda_result_t> raw_center_oracle =
+            cpu_oracle(transformed, vec_length, goal_norm, center_norm, true);
+        std::vector<bgj_cuda_result_t> raw_center_split(
+            std::max<uint32_t>(16u, (uint32_t)raw_center_oracle.size() + 1024u));
+
+        EnvGuard split_guard("BGJ_CUDA_SINGLE_BUCKET_SPLIT");
+        EnvGuard min_guard("BGJ_CUDA_SINGLE_BUCKET_SPLIT_MIN_DOTS");
+        EnvGuard tensor_guard("BGJ_CUDA_SINGLE_BUCKET_TENSOR_SPLIT");
+        EnvGuard verify_guard("BGJ_CUDA_SINGLE_BUCKET_SPLIT_VERIFY");
+        setenv("BGJ_CUDA_SINGLE_BUCKET_SPLIT", "1", 1);
+        setenv("BGJ_CUDA_SINGLE_BUCKET_SPLIT_MIN_DOTS", "1", 1);
+        setenv("BGJ_CUDA_SINGLE_BUCKET_TENSOR_SPLIT", "1", 1);
+        setenv("BGJ_CUDA_SINGLE_BUCKET_SPLIT_VERIFY", "1", 1);
+
+        const char *name = "pool-split-raw-center-async";
+        if (!search_pool_bucket_async_raw_center_mutation(name,
+                                                          raw_center_pool,
+                                                          raw_center_bucket,
+                                                          vec_length,
+                                                          goal_norm,
+                                                          center_norm,
+                                                          raw_center_split)) {
+            return false;
+        }
+        if (!compare_results(name, raw_center_split, raw_center_oracle)) return false;
+        std::cout << name << ": ok, results=" << raw_center_split.size() << "\n";
     }
 
     return true;

@@ -343,6 +343,10 @@ struct bgj_cuda_raw_async_state_t {
     const int32_t *n_norm;
     const int32_t *p_dot;
     const int32_t *n_dot;
+    int32_t *p_dot_snapshot;
+    int32_t *n_dot_snapshot;
+    size_t p_dot_snapshot_capacity;
+    size_t n_dot_snapshot_capacity;
     uint32_t vec_length;
     int32_t goal_norm;
     uint32_t center_id;
@@ -377,6 +381,10 @@ struct bgj_cuda_raw_async_state_t {
           n_norm(NULL),
           p_dot(NULL),
           n_dot(NULL),
+          p_dot_snapshot(NULL),
+          n_dot_snapshot(NULL),
+          p_dot_snapshot_capacity(0),
+          n_dot_snapshot_capacity(0),
           vec_length(0),
           goal_norm(0),
           center_id(0),
@@ -390,6 +398,8 @@ struct bgj_cuda_raw_async_state_t {
 
     void reset()
     {
+        free(p_dot_snapshot);
+        free(n_dot_snapshot);
         active = 0;
         split_active = 0;
         split_tensor = 0;
@@ -407,6 +417,10 @@ struct bgj_cuda_raw_async_state_t {
         n_norm = NULL;
         p_dot = NULL;
         n_dot = NULL;
+        p_dot_snapshot = NULL;
+        n_dot_snapshot = NULL;
+        p_dot_snapshot_capacity = 0;
+        n_dot_snapshot_capacity = 0;
         vec_length = 0;
         goal_norm = 0;
         center_id = 0;
@@ -8287,6 +8301,8 @@ static int bgj_cuda_search_bucket_pool_raw_split_submit_async(const int8_t *pool
     if (device_count <= 1) return 0;
 
     bgj_cuda_raw_async_state_t *state = &bgj_cuda_raw_async_state;
+    double submit_t0 = 0.0;
+    uint32_t submitted = 0;
     state->reset();
     state->split_active = 1;
     state->split_tensor = tensor_split ? 1 : 0;
@@ -8312,6 +8328,41 @@ static int bgj_cuda_search_bucket_pool_raw_split_submit_async(const int8_t *pool
     state->raw_center_dp = raw_center_dp;
     state->total_t0 = bgj_cuda_wall_time();
 
+    const int snapshot_center_dots =
+        record_dp && raw_center_dp && bgj_cuda_single_bucket_split_verify_requested();
+    const int32_t *submit_p_dot = p_dot;
+    const int32_t *submit_n_dot = n_dot;
+    if (snapshot_center_dots) {
+        const size_t p_dot_bytes = (size_t)num_p * sizeof(int32_t);
+        const size_t n_dot_bytes = (size_t)num_n * sizeof(int32_t);
+        if ((num_p && !p_dot) || (num_n && !n_dot)) {
+            set_plain_error("missing CUDA center dots for split verifier");
+            goto fail_sync;
+        }
+        if (p_dot_bytes) {
+            state->p_dot_snapshot = (int32_t *)malloc(p_dot_bytes);
+            if (!state->p_dot_snapshot) {
+                set_plain_error("CUDA split verifier center dot allocation failed");
+                goto fail_sync;
+            }
+            state->p_dot_snapshot_capacity = p_dot_bytes;
+            memcpy(state->p_dot_snapshot, p_dot, p_dot_bytes);
+            submit_p_dot = state->p_dot_snapshot;
+            state->p_dot = state->p_dot_snapshot;
+        }
+        if (n_dot_bytes) {
+            state->n_dot_snapshot = (int32_t *)malloc(n_dot_bytes);
+            if (!state->n_dot_snapshot) {
+                set_plain_error("CUDA split verifier center dot allocation failed");
+                goto fail_sync;
+            }
+            state->n_dot_snapshot_capacity = n_dot_bytes;
+            memcpy(state->n_dot_snapshot, n_dot, n_dot_bytes);
+            submit_n_dot = state->n_dot_snapshot;
+            state->n_dot = state->n_dot_snapshot;
+        }
+    }
+
     for (int i = 0; i < device_count; i++) {
         const uint64_t begin = ((uint64_t)i * full_work) / (uint64_t)device_count;
         const uint64_t end = ((uint64_t)(i + 1) * full_work) / (uint64_t)device_count;
@@ -8320,8 +8371,7 @@ static int bgj_cuda_search_bucket_pool_raw_split_submit_async(const int8_t *pool
         state->split_work_count[i] = end > begin ? end - begin : 0;
     }
 
-    const double submit_t0 = bgj_cuda_wall_time();
-    uint32_t submitted = 0;
+    submit_t0 = bgj_cuda_wall_time();
     for (int i = 0; i < device_count; i++) {
         if (!state->split_work_count[i]) continue;
         if (!bgj_cuda_set_current_device(devices[i])) goto fail_sync;
@@ -8344,8 +8394,8 @@ static int bgj_cuda_search_bucket_pool_raw_split_submit_async(const int8_t *pool
                                                n_ids,
                                                p_norm,
                                                n_norm,
-                                               p_dot,
-                                               n_dot,
+                                               submit_p_dot,
+                                               submit_n_dot,
                                                num_p,
                                                num_n,
                                                vec_length,
