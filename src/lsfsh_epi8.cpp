@@ -146,6 +146,12 @@ static inline int lsh_lift_dup_profile_enabled()
     return env != NULL && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
 }
 
+static inline int lsh_lift_detail_profile_enabled()
+{
+    const char *env = getenv("BGJ_LIFT_DETAIL_PROFILE");
+    return env != NULL && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
+}
+
 static uint64_t lsh_count_unique_endpoints(const uint32_t *ptr_buffer,
                                            uint64_t begin,
                                            uint64_t end,
@@ -424,6 +430,13 @@ struct lsh_profile_data_t {
     double lift_snapshot_time, lift_core_time, lift_profile_time, lift_merge_time;
     uint64_t lift_dup_buffers, lift_dup_candidates, lift_dup_exact_unique, lift_dup_canonical_unique;
     double lift_dup_time;
+    uint64_t lift_detail_buffers, lift_detail_candidates, lift_detail_vec_batches;
+    uint64_t lift_detail_vec_row_iters, lift_detail_scalar_candidates, lift_detail_scalar_row_iters;
+    uint64_t lift_detail_s255_breaks, lift_detail_min0_breaks;
+    uint64_t lift_detail_has_one_checks, lift_detail_has_one_hits, lift_detail_min_updates;
+    uint64_t lift_detail_verify_steps;
+    uint64_t lift_detail_mblocks, lift_detail_mblock_candidates, lift_detail_max_candidates;
+    double lift_detail_mblock_time_sum, lift_detail_max_mblock_time;
     double final_select_time, final_insert_time;
     pthread_spinlock_t profile_lock;
 
@@ -473,6 +486,23 @@ struct lsh_profile_data_t {
         lift_dup_exact_unique = 0;
         lift_dup_canonical_unique = 0;
         lift_dup_time = 0.0;
+        lift_detail_buffers = 0;
+        lift_detail_candidates = 0;
+        lift_detail_vec_batches = 0;
+        lift_detail_vec_row_iters = 0;
+        lift_detail_scalar_candidates = 0;
+        lift_detail_scalar_row_iters = 0;
+        lift_detail_s255_breaks = 0;
+        lift_detail_min0_breaks = 0;
+        lift_detail_has_one_checks = 0;
+        lift_detail_has_one_hits = 0;
+        lift_detail_min_updates = 0;
+        lift_detail_verify_steps = 0;
+        lift_detail_mblocks = 0;
+        lift_detail_mblock_candidates = 0;
+        lift_detail_max_candidates = 0;
+        lift_detail_mblock_time_sum = 0.0;
+        lift_detail_max_mblock_time = 0.0;
         final_select_time = 0.0;
         final_insert_time = 0.0;
         pthread_spin_init(&profile_lock, PTHREAD_PROCESS_SHARED);
@@ -541,6 +571,88 @@ struct lsh_profile_data_t {
                 (unsigned long long)canonical_dup,
                 lift_dup_candidates ? (double)canonical_dup / (double)lift_dup_candidates : 0.0,
                 lift_dup_time);
+    }
+    void observe_lift_detail(uint64_t buffers, uint64_t candidates,
+                             uint64_t vec_batches, uint64_t vec_row_iters,
+                             uint64_t scalar_candidates, uint64_t scalar_row_iters,
+                             uint64_t s255_breaks, uint64_t min0_breaks,
+                             uint64_t has_one_checks, uint64_t has_one_hits,
+                             uint64_t min_updates, uint64_t verify_steps) {
+        pthread_spin_lock(&profile_lock);
+        lift_detail_buffers += buffers;
+        lift_detail_candidates += candidates;
+        lift_detail_vec_batches += vec_batches;
+        lift_detail_vec_row_iters += vec_row_iters;
+        lift_detail_scalar_candidates += scalar_candidates;
+        lift_detail_scalar_row_iters += scalar_row_iters;
+        lift_detail_s255_breaks += s255_breaks;
+        lift_detail_min0_breaks += min0_breaks;
+        lift_detail_has_one_checks += has_one_checks;
+        lift_detail_has_one_hits += has_one_hits;
+        lift_detail_min_updates += min_updates;
+        lift_detail_verify_steps += verify_steps;
+        pthread_spin_unlock(&profile_lock);
+    }
+    void observe_lift_mblock_detail(double lift_time, uint64_t candidates) {
+        pthread_spin_lock(&profile_lock);
+        lift_detail_mblocks++;
+        lift_detail_mblock_candidates += candidates;
+        lift_detail_mblock_time_sum += lift_time;
+        if (lift_time > lift_detail_max_mblock_time) lift_detail_max_mblock_time = lift_time;
+        if (candidates > lift_detail_max_candidates) lift_detail_max_candidates = candidates;
+        pthread_spin_unlock(&profile_lock);
+    }
+    void lift_detail_log(const char *mode, long target, long csd, long fd, long id) {
+        if (lift_detail_buffers == 0 && lift_detail_mblocks == 0) return;
+        const uint64_t vector_candidates = lift_detail_vec_batches * 8;
+        const uint64_t vector_row_reductions = lift_detail_vec_row_iters * 8;
+        const uint64_t total_row_reductions = vector_row_reductions + lift_detail_scalar_row_iters;
+        const double avg_rows = lift_detail_candidates ?
+                (double)total_row_reductions / (double)lift_detail_candidates : 0.0;
+        const double avg_vec_rows = vector_candidates ?
+                (double)vector_row_reductions / (double)vector_candidates : 0.0;
+        const double avg_scalar_rows = lift_detail_scalar_candidates ?
+                (double)lift_detail_scalar_row_iters / (double)lift_detail_scalar_candidates : 0.0;
+        const double s255_rate = lift_detail_vec_batches ?
+                (double)lift_detail_s255_breaks / (double)lift_detail_vec_batches : 0.0;
+        const double min0_rate = lift_detail_scalar_candidates ?
+                (double)lift_detail_min0_breaks / (double)lift_detail_scalar_candidates : 0.0;
+        const double verify_per_candidate = lift_detail_candidates ?
+                (double)lift_detail_has_one_checks / (double)lift_detail_candidates : 0.0;
+        const double verify_rows = lift_detail_has_one_checks ?
+                (double)lift_detail_verify_steps / (double)lift_detail_has_one_checks : 0.0;
+        const double has_one_hit_rate = lift_detail_has_one_checks ?
+                (double)lift_detail_has_one_hits / (double)lift_detail_has_one_checks : 0.0;
+        const double avg_mblock_time = lift_detail_mblocks ?
+                lift_detail_mblock_time_sum / (double)lift_detail_mblocks : 0.0;
+        const double mblock_imbalance = avg_mblock_time > 0.0 ?
+                lift_detail_max_mblock_time / avg_mblock_time : 0.0;
+        fprintf(stderr,
+                "lsh_lift_detail_profile: mode=%s target=%ld csd=%ld fd=%ld id=%ld "
+                "buffers=%llu candidates=%llu vec_batches=%llu scalar_candidates=%llu "
+                "avg_rows=%.6f avg_vec_rows=%.6f avg_scalar_rows=%.6f "
+                "s255_breaks=%llu s255_rate=%.6f min0_breaks=%llu min0_rate=%.6f "
+                "has_one_checks=%llu verify_per_candidate=%.9f verify_avg_steps=%.6f "
+                "has_one_hits=%llu has_one_hit_rate=%.6f min_updates=%llu "
+                "mblocks=%llu avg_mblock_lift=%.6fs max_mblock_lift=%.6fs "
+                "mblock_imbalance=%.6f avg_candidates_per_mblock=%.2f max_candidates=%llu\n",
+                mode, target, csd, fd, id,
+                (unsigned long long)lift_detail_buffers,
+                (unsigned long long)lift_detail_candidates,
+                (unsigned long long)lift_detail_vec_batches,
+                (unsigned long long)lift_detail_scalar_candidates,
+                avg_rows, avg_vec_rows, avg_scalar_rows,
+                (unsigned long long)lift_detail_s255_breaks, s255_rate,
+                (unsigned long long)lift_detail_min0_breaks, min0_rate,
+                (unsigned long long)lift_detail_has_one_checks, verify_per_candidate,
+                verify_rows,
+                (unsigned long long)lift_detail_has_one_hits, has_one_hit_rate,
+                (unsigned long long)lift_detail_min_updates,
+                (unsigned long long)lift_detail_mblocks,
+                avg_mblock_time, lift_detail_max_mblock_time, mblock_imbalance,
+                lift_detail_mblocks ?
+                    (double)lift_detail_mblock_candidates / (double)lift_detail_mblocks : 0.0,
+                (unsigned long long)lift_detail_max_candidates);
     }
     void init_log(float *min_norm, long ID) {
         if (log_level >= 1) {
@@ -1540,6 +1652,7 @@ int Pool_epi8_t<nb>::__lift_buffer(lsh_mblock_t mb, long target_index, uint32_t 
     const long FD8 = _CEIL8(FD);
     const int lift_profile = lsh_env_profile_enabled();
     const int dup_profile = lsh_lift_dup_profile_enabled();
+    const int detail_profile = lsh_lift_detail_profile_enabled();
 
     for (long thread = 0; thread < 1; thread++) {
         double profile_t0 = lift_profile ? lsh_wall_time() : 0.0;
@@ -1547,6 +1660,17 @@ int Pool_epi8_t<nb>::__lift_buffer(lsh_mblock_t mb, long target_index, uint32_t 
         double profile_core = 0.0;
         double profile_update = 0.0;
         double profile_merge = 0.0;
+        uint64_t detail_candidates = 0;
+        uint64_t detail_vec_batches = 0;
+        uint64_t detail_vec_row_iters = 0;
+        uint64_t detail_scalar_candidates = 0;
+        uint64_t detail_scalar_row_iters = 0;
+        uint64_t detail_s255_breaks = 0;
+        uint64_t detail_min0_breaks = 0;
+        uint64_t detail_has_one_checks = 0;
+        uint64_t detail_has_one_hits = 0;
+        uint64_t detail_min_updates = 0;
+        uint64_t detail_verify_steps = 0;
         // local min data initialization
         __attribute__ ((aligned (32))) float _min_norm[vec_length];
         float **_min_vec = (float **) NEW_MAT(ID, FD, sizeof(float));
@@ -1575,6 +1699,11 @@ int Pool_epi8_t<nb>::__lift_buffer(lsh_mblock_t mb, long target_index, uint32_t 
             __attribute__ ((aligned (32))) float curr_norm[8];
             long ind = 0;
             while (ind + 8 <= ptr_buffer_num[thread]) {
+                uint64_t detail_rows_this_batch = 0;
+                if (__builtin_expect(detail_profile, 0)) {
+                    detail_candidates += 8;
+                    detail_vec_batches++;
+                }
                 for (long i = 0; i < 8; i++) {
                     if (ptr_buffer[thread][(ind+i) * 3]) {
                         sub_avx2(ftmp + FD8 * i, mb.fvec + ptr_buffer[thread][(ind+i)*3+1]*FD8, mb.fvec + ptr_buffer[thread][(ind+i)*3+2]*FD8, FD8);
@@ -1586,6 +1715,7 @@ int Pool_epi8_t<nb>::__lift_buffer(lsh_mblock_t mb, long target_index, uint32_t 
                     curr_norm[i] = dot_aux2(ftmp + FD8 * i + LD, ftmp + FD8 * i + LD, CSD);
                 }
                 for (long i = LD - 1; i >= 0; i--) {
+                    if (__builtin_expect(detail_profile, 0)) detail_rows_this_batch++;
                     red_avx2(ftmp + 0 * FD8, b_full_fp[i], round(ftmp[0 * FD8 + i] * idiag[i]), i+1);
                     red_avx2(ftmp + 1 * FD8, b_full_fp[i], round(ftmp[1 * FD8 + i] * idiag[i]), i+1);
                     red_avx2(ftmp + 2 * FD8, b_full_fp[i], round(ftmp[2 * FD8 + i] * idiag[i]), i+1);
@@ -1605,7 +1735,9 @@ int Pool_epi8_t<nb>::__lift_buffer(lsh_mblock_t mb, long target_index, uint32_t 
                             int has_one = 0;
                             __attribute__ ((aligned (32))) float ftmpp[256];
                             copy_avx2(ftmpp, ftmp + rr * FD8, FD);
+                            uint64_t detail_verify_this = 0;
                             for (long j = FD - 1; j >= FD - CSD; j--) {
+                                if (__builtin_expect(detail_profile, 0)) detail_verify_this++;
                                 float qq = round(ftmpp[j] * idiag[j]);
                                 if (fabs(qq)  == 1.0f) {
                                     has_one = 1;
@@ -1613,18 +1745,35 @@ int Pool_epi8_t<nb>::__lift_buffer(lsh_mblock_t mb, long target_index, uint32_t 
                                 }
                                 red_avx2(ftmpp, b_full_fp[j], qq, j+1);
                             }
+                            if (__builtin_expect(detail_profile, 0)) {
+                                detail_has_one_checks++;
+                                detail_verify_steps += detail_verify_this;
+                                if (has_one) detail_has_one_hits++;
+                            }
                             if (has_one) {
                                 _min_norm[i] = curr_norm[rr];
                                 copy_avx2(_min_vec[i], ftmp + rr * FD8, FD);
+                                if (__builtin_expect(detail_profile, 0)) detail_min_updates++;
                             }
                         }
                     }
-                    if (s == 255) break;
+                    if (s == 255) {
+                        if (__builtin_expect(detail_profile, 0)) detail_s255_breaks++;
+                        break;
+                    }
+                }
+                if (__builtin_expect(detail_profile, 0)) {
+                    detail_vec_row_iters += detail_rows_this_batch;
                 }
 
                 ind += 8;
             }
             while (ind < ptr_buffer_num[thread]) {
+                uint64_t detail_rows_this_candidate = 0;
+                if (__builtin_expect(detail_profile, 0)) {
+                    detail_candidates++;
+                    detail_scalar_candidates++;
+                }
                 if (ptr_buffer[thread][ind * 3]) {
                     sub_avx2(ftmp, mb.fvec + ptr_buffer[thread][ind*3+1]*FD8, mb.fvec + ptr_buffer[thread][ind*3+2]*FD8, FD8);
                 } else {
@@ -1632,6 +1781,7 @@ int Pool_epi8_t<nb>::__lift_buffer(lsh_mblock_t mb, long target_index, uint32_t 
                 }
                 curr_norm[0] = dot_aux2(ftmp + LD, ftmp + LD, CSD);
                 for (long i = LD - 1; i >= 0; i--) {
+                    if (__builtin_expect(detail_profile, 0)) detail_rows_this_candidate++;
                     float q = round(ftmp[i] * idiag[i]);
                     red_avx2(ftmp, b_full_fp[i], q, i+1);
                     curr_norm[0] += ftmp[i] * ftmp[i];
@@ -1641,7 +1791,9 @@ int Pool_epi8_t<nb>::__lift_buffer(lsh_mblock_t mb, long target_index, uint32_t 
                         int has_one = 0;
                         __attribute__ ((aligned (32))) float ftmpp[256];
                         copy_avx2(ftmpp, ftmp, FD);
+                        uint64_t detail_verify_this = 0;
                         for (long j = FD - 1; j >= FD - CSD; j--) {
+                            if (__builtin_expect(detail_profile, 0)) detail_verify_this++;
                             float qq = round(ftmpp[j] * idiag[j]);
                             if (fabs(qq)  == 1.0f) {
                                 has_one = 1;
@@ -1649,12 +1801,24 @@ int Pool_epi8_t<nb>::__lift_buffer(lsh_mblock_t mb, long target_index, uint32_t 
                             }
                             red_avx2(ftmpp, b_full_fp[j], qq, j+1);
                         }
+                        if (__builtin_expect(detail_profile, 0)) {
+                            detail_has_one_checks++;
+                            detail_verify_steps += detail_verify_this;
+                            if (has_one) detail_has_one_hits++;
+                        }
                         if (has_one) {
                             _min_norm[i] = curr_norm[0];
                             copy_avx2(_min_vec[i], ftmp, FD);
+                            if (__builtin_expect(detail_profile, 0)) detail_min_updates++;
                         }
                     }
-                    if (curr_norm[0] > _min_norm[0]) break;
+                    if (curr_norm[0] > _min_norm[0]) {
+                        if (__builtin_expect(detail_profile, 0)) detail_min0_breaks++;
+                        break;
+                    }
+                }
+                if (__builtin_expect(detail_profile, 0)) {
+                    detail_scalar_row_iters += detail_rows_this_candidate;
                 }
                 ind++;
             }
@@ -1684,6 +1848,14 @@ int Pool_epi8_t<nb>::__lift_buffer(lsh_mblock_t mb, long target_index, uint32_t 
             profile_merge = lsh_wall_time() - profile_t0;
             profile_data->observe_lift_breakdown(profile_snapshot, profile_core,
                                                  profile_update, profile_merge);
+        }
+        if (detail_profile) {
+            profile_data->observe_lift_detail(1, detail_candidates, detail_vec_batches,
+                                              detail_vec_row_iters, detail_scalar_candidates,
+                                              detail_scalar_row_iters, detail_s255_breaks,
+                                              detail_min0_breaks, detail_has_one_checks,
+                                              detail_has_one_hits, detail_min_updates,
+                                              detail_verify_steps);
         }
         FREE_MAT(_min_vec);
     }
@@ -1741,6 +1913,7 @@ int Pool_epi8_t<nb>::_lsfsh_insert(long target_index, double eta, long log_level
     const int env_profile = lsh_env_profile_enabled();
     const int env_trace = lsh_env_trace_mblock_enabled();
     const int endpoint_profile = lsh_endpoint_profile_enabled();
+    const int detail_profile = lsh_lift_detail_profile_enabled();
     long profile_batch_id = 0;
     if (env_profile || env_trace) {
         fprintf(stderr,
@@ -1807,6 +1980,9 @@ int Pool_epi8_t<nb>::_lsfsh_insert(long target_index, double eta, long log_level
                 const uint64_t buffer_after_lift = ptr_buffer_num[thread];
                 _lift_time += lift_elapsed;
                 profile_data.observe_mblock(mb[ind].Mbound, search_elapsed, lift_elapsed, buffer_after_search);
+                if (detail_profile) {
+                    profile_data.observe_lift_mblock_detail(lift_elapsed, buffer_after_search);
+                }
                 if (env_trace) {
                     double min0_snapshot = 0.0;
                     pthread_spin_lock(&min_lock);
@@ -1914,6 +2090,9 @@ int Pool_epi8_t<nb>::_lsfsh_insert(long target_index, double eta, long log_level
         if (lsh_lift_dup_profile_enabled()) {
             profile_data.lift_dup_log("insert", target_index, CSD, FD, ID);
         }
+        if (lsh_lift_detail_profile_enabled()) {
+            profile_data.lift_detail_log("insert", target_index, CSD, FD, ID);
+        }
         FREE_MAT(min_vec);
         FREE_MAT(b_full_fp);
         shrink_left();
@@ -1952,6 +2131,9 @@ int Pool_epi8_t<nb>::_lsfsh_insert(long target_index, double eta, long log_level
     }
     if (lsh_lift_dup_profile_enabled()) {
         profile_data.lift_dup_log("insert", target_index, CSD, FD, ID);
+    }
+    if (lsh_lift_detail_profile_enabled()) {
+        profile_data.lift_detail_log("insert", target_index, CSD, FD, ID);
     }
     FREE_MAT(b_full_fp);
 
@@ -2155,6 +2337,7 @@ int Pool_epi8_t<nb>::_show_lsfsh_insert(long target_index, double eta, long log_
     const long LSH_RBATCH = ((LSH_MBLOCK_BATCH / num_threads) * num_threads) > 0 ? ((LSH_MBLOCK_BATCH / num_threads) * num_threads) : LSH_MBLOCK_BATCH;
     const int env_profile = lsh_env_profile_enabled();
     const int endpoint_profile = lsh_endpoint_profile_enabled();
+    const int detail_profile = lsh_lift_detail_profile_enabled();
     while (mblock_provider.batch_pop(mb, LSH_RBATCH, &profile_data)) {
         int wild_mb = 0;
         long num_mb = 0;
@@ -2201,10 +2384,14 @@ int Pool_epi8_t<nb>::_show_lsfsh_insert(long target_index, double eta, long log_
                 }
                 TIMER_START;
                 __lift_buffer(mb[ind], target_index, dh_dim, b_full_fp,
-                        ptr_buffer+thread, ptr_buffer_size+thread, ptr_buffer_num+thread, 
+                        ptr_buffer+thread, ptr_buffer_size+thread, ptr_buffer_num+thread,
                         min_norm, min_vec, min_lock, &profile_data);
                 TIMER_END;
-                _lift_time += CURRENT_TIME;
+                const double lift_elapsed = CURRENT_TIME;
+                _lift_time += lift_elapsed;
+                if (detail_profile) {
+                    profile_data.observe_lift_mblock_detail(lift_elapsed, buffer_after_search);
+                }
             }
             pthread_spin_lock(&min_lock);
             if (_lift_time > lift_time) lift_time = _lift_time;
@@ -2256,6 +2443,9 @@ int Pool_epi8_t<nb>::_show_lsfsh_insert(long target_index, double eta, long log_
         }
         if (lsh_lift_dup_profile_enabled()) {
             profile_data.lift_dup_log("show", target_index, CSD, FD, ID);
+        }
+        if (lsh_lift_detail_profile_enabled()) {
+            profile_data.lift_detail_log("show", target_index, CSD, FD, ID);
         }
         FREE_MAT(min_vec);
         FREE_MAT(b_full_fp);
@@ -2326,6 +2516,9 @@ int Pool_epi8_t<nb>::_show_lsfsh_insert(long target_index, double eta, long log_
     }
     if (lsh_lift_dup_profile_enabled()) {
         profile_data.lift_dup_log("show", target_index, CSD, FD, ID);
+    }
+    if (lsh_lift_detail_profile_enabled()) {
+        profile_data.lift_detail_log("show", target_index, CSD, FD, ID);
     }
     FREE_MAT(b_full_fp);
 
