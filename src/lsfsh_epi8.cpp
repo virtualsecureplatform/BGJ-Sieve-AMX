@@ -3,6 +3,7 @@
 
 #include "../include/lsfsh_tables.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <sys/time.h>
 #include <vector>
@@ -139,6 +140,12 @@ static inline int lsh_endpoint_profile_enabled()
     return env != NULL && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
 }
 
+static inline int lsh_lift_dup_profile_enabled()
+{
+    const char *env = getenv("BGJ_LIFT_DUP_PROFILE");
+    return env != NULL && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
+}
+
 static uint64_t lsh_count_unique_endpoints(const uint32_t *ptr_buffer,
                                            uint64_t begin,
                                            uint64_t end,
@@ -161,6 +168,53 @@ static uint64_t lsh_count_unique_endpoints(const uint32_t *ptr_buffer,
         }
     }
     return unique;
+}
+
+static inline uint64_t lsh_lift_exact_key(const uint32_t *entry)
+{
+    return ((uint64_t)entry[0] << 63) | ((uint64_t)entry[1] << 32) | (uint64_t)entry[2];
+}
+
+static inline uint64_t lsh_lift_canonical_key(const uint32_t *entry)
+{
+    uint32_t x = entry[1];
+    uint32_t y = entry[2];
+    if (x > y) {
+        const uint32_t tmp = x;
+        x = y;
+        y = tmp;
+    }
+    return ((uint64_t)entry[0] << 63) | ((uint64_t)x << 32) | (uint64_t)y;
+}
+
+static uint64_t lsh_count_unique_sorted(std::vector<uint64_t> &keys)
+{
+    if (keys.empty()) return 0;
+    std::sort(keys.begin(), keys.end());
+    return (uint64_t)(std::unique(keys.begin(), keys.end()) - keys.begin());
+}
+
+static void lsh_count_lift_duplicates(const uint32_t *ptr_buffer,
+                                      uint64_t entries,
+                                      uint64_t *exact_unique,
+                                      uint64_t *canonical_unique)
+{
+    exact_unique[0] = entries;
+    canonical_unique[0] = entries;
+    if (ptr_buffer == NULL || entries <= 1) return;
+
+    std::vector<uint64_t> keys;
+    keys.reserve((size_t)entries);
+    for (uint64_t i = 0; i < entries; i++) {
+        keys.push_back(lsh_lift_exact_key(ptr_buffer + i * 3));
+    }
+    exact_unique[0] = lsh_count_unique_sorted(keys);
+
+    keys.clear();
+    for (uint64_t i = 0; i < entries; i++) {
+        keys.push_back(lsh_lift_canonical_key(ptr_buffer + i * 3));
+    }
+    canonical_unique[0] = lsh_count_unique_sorted(keys);
 }
 
 static inline uint64_t lsh_pair_count(long mbound)
@@ -368,6 +422,8 @@ struct lsh_profile_data_t {
     uint64_t worst_mbound, worst_candidates;
     double cuda_time, inline_lift_time, worst_search_time, worst_lift_time;
     double lift_snapshot_time, lift_core_time, lift_profile_time, lift_merge_time;
+    uint64_t lift_dup_buffers, lift_dup_candidates, lift_dup_exact_unique, lift_dup_canonical_unique;
+    double lift_dup_time;
     double final_select_time, final_insert_time;
     pthread_spinlock_t profile_lock;
 
@@ -412,6 +468,11 @@ struct lsh_profile_data_t {
         lift_core_time = 0.0;
         lift_profile_time = 0.0;
         lift_merge_time = 0.0;
+        lift_dup_buffers = 0;
+        lift_dup_candidates = 0;
+        lift_dup_exact_unique = 0;
+        lift_dup_canonical_unique = 0;
+        lift_dup_time = 0.0;
         final_select_time = 0.0;
         final_insert_time = 0.0;
         pthread_spin_init(&profile_lock, PTHREAD_PROCESS_SHARED);
@@ -450,6 +511,36 @@ struct lsh_profile_data_t {
         lift_profile_time += profile;
         lift_merge_time += merge;
         pthread_spin_unlock(&profile_lock);
+    }
+    void observe_lift_duplicates(uint64_t candidates, uint64_t exact_unique,
+                                 uint64_t canonical_unique, double elapsed) {
+        pthread_spin_lock(&profile_lock);
+        lift_dup_buffers++;
+        lift_dup_candidates += candidates;
+        lift_dup_exact_unique += exact_unique;
+        lift_dup_canonical_unique += canonical_unique;
+        lift_dup_time += elapsed;
+        pthread_spin_unlock(&profile_lock);
+    }
+    void lift_dup_log(const char *mode, long target, long csd, long fd, long id) {
+        if (lift_dup_buffers == 0) return;
+        const uint64_t exact_dup = lift_dup_candidates - lift_dup_exact_unique;
+        const uint64_t canonical_dup = lift_dup_candidates - lift_dup_canonical_unique;
+        fprintf(stderr,
+                "lsh_lift_dup_profile: mode=%s target=%ld csd=%ld fd=%ld id=%ld "
+                "buffers=%llu candidates=%llu exact_unique=%llu exact_dup=%llu "
+                "exact_dup_ratio=%.6f canonical_unique=%llu canonical_dup=%llu "
+                "canonical_dup_ratio=%.6f time=%.6fs\n",
+                mode, target, csd, fd, id,
+                (unsigned long long)lift_dup_buffers,
+                (unsigned long long)lift_dup_candidates,
+                (unsigned long long)lift_dup_exact_unique,
+                (unsigned long long)exact_dup,
+                lift_dup_candidates ? (double)exact_dup / (double)lift_dup_candidates : 0.0,
+                (unsigned long long)lift_dup_canonical_unique,
+                (unsigned long long)canonical_dup,
+                lift_dup_candidates ? (double)canonical_dup / (double)lift_dup_candidates : 0.0,
+                lift_dup_time);
     }
     void init_log(float *min_norm, long ID) {
         if (log_level >= 1) {
@@ -1448,6 +1539,7 @@ int Pool_epi8_t<nb>::__lift_buffer(lsh_mblock_t mb, long target_index, uint32_t 
     const long ID = index_l - dh_dim - target_index;
     const long FD8 = _CEIL8(FD);
     const int lift_profile = lsh_env_profile_enabled();
+    const int dup_profile = lsh_lift_dup_profile_enabled();
 
     for (long thread = 0; thread < 1; thread++) {
         double profile_t0 = lift_profile ? lsh_wall_time() : 0.0;
@@ -1462,6 +1554,16 @@ int Pool_epi8_t<nb>::__lift_buffer(lsh_mblock_t mb, long target_index, uint32_t 
         copy_avx2(_min_norm, min_norm, ID);
         pthread_spin_unlock(&min_lock);
         if (lift_profile) profile_snapshot = lsh_wall_time() - profile_t0;
+        if (dup_profile) {
+            uint64_t exact_unique = 0;
+            uint64_t canonical_unique = 0;
+            const double dup_t0 = lsh_wall_time();
+            lsh_count_lift_duplicates(ptr_buffer[thread], ptr_buffer_num[thread],
+                                      &exact_unique, &canonical_unique);
+            profile_data->observe_lift_duplicates(ptr_buffer_num[thread],
+                                                  exact_unique, canonical_unique,
+                                                  lsh_wall_time() - dup_t0);
+        }
 
         // main lifting
         profile_t0 = lift_profile ? lsh_wall_time() : 0.0;
@@ -1809,6 +1911,9 @@ int Pool_epi8_t<nb>::_lsfsh_insert(long target_index, double eta, long log_level
                     profile_data.final_select_time, profile_data.final_insert_time,
                     (unsigned long long)profile_data.lift_ops);
         }
+        if (lsh_lift_dup_profile_enabled()) {
+            profile_data.lift_dup_log("insert", target_index, CSD, FD, ID);
+        }
         FREE_MAT(min_vec);
         FREE_MAT(b_full_fp);
         shrink_left();
@@ -1844,6 +1949,9 @@ int Pool_epi8_t<nb>::_lsfsh_insert(long target_index, double eta, long log_level
                 profile_data.lift_profile_time, profile_data.lift_merge_time,
                 profile_data.final_select_time, profile_data.final_insert_time,
                 (unsigned long long)profile_data.lift_ops, min_place);
+    }
+    if (lsh_lift_dup_profile_enabled()) {
+        profile_data.lift_dup_log("insert", target_index, CSD, FD, ID);
     }
     FREE_MAT(b_full_fp);
 
@@ -2146,6 +2254,9 @@ int Pool_epi8_t<nb>::_show_lsfsh_insert(long target_index, double eta, long log_
                     profile_data.final_select_time, profile_data.final_insert_time,
                     (unsigned long long)profile_data.lift_ops);
         }
+        if (lsh_lift_dup_profile_enabled()) {
+            profile_data.lift_dup_log("show", target_index, CSD, FD, ID);
+        }
         FREE_MAT(min_vec);
         FREE_MAT(b_full_fp);
         return 0;
@@ -2212,6 +2323,9 @@ int Pool_epi8_t<nb>::_show_lsfsh_insert(long target_index, double eta, long log_
                 profile_data.lift_profile_time, profile_data.lift_merge_time,
                 profile_data.final_select_time, profile_data.final_insert_time,
                 (unsigned long long)profile_data.lift_ops, min_place);
+    }
+    if (lsh_lift_dup_profile_enabled()) {
+        profile_data.lift_dup_log("show", target_index, CSD, FD, ID);
     }
     FREE_MAT(b_full_fp);
 
