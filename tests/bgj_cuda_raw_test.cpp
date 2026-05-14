@@ -11,6 +11,7 @@
 #include <vector>
 
 extern "C" int bgj_cuda_raw_device_count();
+extern "C" int bgj_cuda_raw_execution_device_count();
 extern "C" const char *bgj_cuda_raw_last_error();
 extern "C" int bgj_cuda_search_bucket_raw(const int8_t *p_vecs,
                                            const int8_t *n_vecs,
@@ -75,6 +76,35 @@ extern "C" int bgj_cuda_search_bucket_pool_batch_raw(const int8_t *pool_vecs,
                                                       const uint32_t *result_capacity,
                                                       uint32_t *result_count,
                                                       int *overflow);
+extern "C" int bgj_cuda_search_bucket_pool_raw_submit_async(const int8_t *pool_vecs,
+                                                            uint64_t pool_epoch,
+                                                            uint32_t pool_size,
+                                                            const uint32_t *p_ids,
+                                                            const uint32_t *n_ids,
+                                                            const int32_t *p_norm,
+                                                            const int32_t *n_norm,
+                                                            const int32_t *p_dot,
+                                                            const int32_t *n_dot,
+                                                            uint32_t num_p,
+                                                            uint32_t num_n,
+                                                            uint32_t vec_length,
+                                                            int32_t goal_norm,
+                                                            uint32_t center_id,
+                                                            int32_t center_norm,
+                                                            int record_dp,
+                                                            int transform_dp,
+                                                            int device_transform_dp,
+                                                            int raw_center_dp,
+                                                            int record_dot_copy_event,
+                                                            uint32_t result_capacity,
+                                                            uint32_t *submitted_result_count,
+                                                            int *submitted_overflow);
+extern "C" int bgj_cuda_search_bucket_raw_finish_async(bgj_cuda_result_t *results,
+                                                       uint32_t result_capacity,
+                                                       uint32_t *submitted_result_count,
+                                                       int *submitted_overflow,
+                                                       uint32_t *result_count,
+                                                       int *overflow);
 
 namespace {
 
@@ -87,6 +117,33 @@ struct Bucket {
     std::vector<int32_t> n_norm;
     std::vector<int32_t> p_dot;
     std::vector<int32_t> n_dot;
+};
+
+class EnvGuard {
+public:
+    explicit EnvGuard(const char *name)
+        : name_(name), had_value_(false)
+    {
+        const char *value = getenv(name_);
+        if (value) {
+            had_value_ = true;
+            value_ = value;
+        }
+    }
+
+    ~EnvGuard()
+    {
+        if (had_value_) {
+            setenv(name_, value_.c_str(), 1);
+        } else {
+            unsetenv(name_);
+        }
+    }
+
+private:
+    const char *name_;
+    bool had_value_;
+    std::string value_;
 };
 
 struct Scores {
@@ -585,6 +642,194 @@ bool run_pool_case()
     return matched;
 }
 
+bool search_pool_bucket(const char *name,
+                        const std::vector<int8_t> &pool,
+                        const Bucket &bucket,
+                        uint32_t vec_length,
+                        int32_t goal_norm,
+                        int32_t center_norm,
+                        std::vector<bgj_cuda_result_t> &out)
+{
+    uint32_t result_count = 0;
+    int overflow = 0;
+    const uint32_t num_p = (uint32_t)bucket.p_ids.size();
+    const uint32_t num_n = (uint32_t)bucket.n_ids.size();
+    const int ok = bgj_cuda_search_bucket_pool_raw(pool.data(),
+                                                   77,
+                                                   (uint32_t)(pool.size() / vec_length),
+                                                   bucket.p_ids.data(),
+                                                   bucket.n_ids.data(),
+                                                   bucket.p_norm.data(),
+                                                   bucket.n_norm.data(),
+                                                   bucket.p_dot.data(),
+                                                   bucket.n_dot.data(),
+                                                   num_p,
+                                                   num_n,
+                                                   vec_length,
+                                                   goal_norm,
+                                                   0,
+                                                   center_norm,
+                                                   1,
+                                                   0,
+                                                   out.data(),
+                                                   (uint32_t)out.size(),
+                                                   &result_count,
+                                                   &overflow);
+    if (!ok) {
+        std::cerr << name << ": CUDA call failed: " << bgj_cuda_raw_last_error() << "\n";
+        return false;
+    }
+    if (overflow) {
+        std::cerr << name << ": unexpected overflow\n";
+        return false;
+    }
+    out.resize(result_count);
+    return true;
+}
+
+bool search_pool_bucket_async(const char *name,
+                              const std::vector<int8_t> &pool,
+                              const Bucket &bucket,
+                              uint32_t vec_length,
+                              int32_t goal_norm,
+                              int32_t center_norm,
+                              std::vector<bgj_cuda_result_t> &out)
+{
+    uint32_t submitted_count = 0;
+    uint32_t result_count = 0;
+    int submitted_overflow = 0;
+    int overflow = 0;
+    const uint32_t num_p = (uint32_t)bucket.p_ids.size();
+    const uint32_t num_n = (uint32_t)bucket.n_ids.size();
+    const uint32_t capacity = (uint32_t)out.size();
+    const int submitted = bgj_cuda_search_bucket_pool_raw_submit_async(pool.data(),
+                                                                       78,
+                                                                       (uint32_t)(pool.size() / vec_length),
+                                                                       bucket.p_ids.data(),
+                                                                       bucket.n_ids.data(),
+                                                                       bucket.p_norm.data(),
+                                                                       bucket.n_norm.data(),
+                                                                       bucket.p_dot.data(),
+                                                                       bucket.n_dot.data(),
+                                                                       num_p,
+                                                                       num_n,
+                                                                       vec_length,
+                                                                       goal_norm,
+                                                                       0,
+                                                                       center_norm,
+                                                                       1,
+                                                                       0,
+                                                                       0,
+                                                                       0,
+                                                                       0,
+                                                                       capacity,
+                                                                       &submitted_count,
+                                                                       &submitted_overflow);
+    if (!submitted) {
+        std::cerr << name << ": CUDA async submit failed: " << bgj_cuda_raw_last_error() << "\n";
+        return false;
+    }
+    const int finished = bgj_cuda_search_bucket_raw_finish_async(out.data(),
+                                                                 capacity,
+                                                                 &submitted_count,
+                                                                 &submitted_overflow,
+                                                                 &result_count,
+                                                                 &overflow);
+    if (!finished) {
+        std::cerr << name << ": CUDA async finish failed: " << bgj_cuda_raw_last_error() << "\n";
+        return false;
+    }
+    if (submitted_overflow || overflow) {
+        std::cerr << name << ": unexpected overflow, submitted=" << submitted_overflow
+                  << " finish=" << overflow << "\n";
+        return false;
+    }
+    out.resize(result_count);
+    return true;
+}
+
+bool run_pool_split_equivalence_case()
+{
+    if (bgj_cuda_raw_execution_device_count() < 2) {
+        std::cout << "pool-split-equivalence: skipped, execution devices < 2\n";
+        return true;
+    }
+
+    const uint32_t num_p = 80;
+    const uint32_t num_n = 96;
+    const uint32_t vec_length = 64;
+    Bucket bucket = make_compact_bucket(num_p, num_n, vec_length, 333);
+    Scores scores;
+    collect_scores(bucket, vec_length, scores);
+    const int32_t goal_norm = threshold_for(scores.two_red, ThresholdMode::Selective);
+    const int32_t three_red_goal = threshold_for(scores.three_red, ThresholdMode::Selective);
+    const int32_t center_norm = goal_norm - three_red_goal;
+    const std::vector<bgj_cuda_result_t> oracle =
+        cpu_oracle(bucket, vec_length, goal_norm, center_norm, true);
+
+    std::vector<int8_t> pool;
+    append_bucket_to_pool(bucket, vec_length, pool);
+
+    const uint32_t capacity = std::max<uint32_t>(16u, (uint32_t)oracle.size() + 1024u);
+    std::vector<bgj_cuda_result_t> single(capacity);
+
+    {
+        EnvGuard split_guard("BGJ_CUDA_SINGLE_BUCKET_SPLIT");
+        setenv("BGJ_CUDA_SINGLE_BUCKET_SPLIT", "0", 1);
+        if (!search_pool_bucket("pool-split-single",
+                                pool,
+                                bucket,
+                                vec_length,
+                                goal_norm,
+                                center_norm,
+                                single)) {
+            return false;
+        }
+        if (!compare_results("pool-split-single", single, oracle)) return false;
+    }
+
+    for (int tensor = 0; tensor <= 1; tensor++) {
+        EnvGuard split_guard("BGJ_CUDA_SINGLE_BUCKET_SPLIT");
+        EnvGuard min_guard("BGJ_CUDA_SINGLE_BUCKET_SPLIT_MIN_DOTS");
+        EnvGuard tensor_guard("BGJ_CUDA_SINGLE_BUCKET_TENSOR_SPLIT");
+        EnvGuard verify_guard("BGJ_CUDA_SINGLE_BUCKET_SPLIT_VERIFY");
+        setenv("BGJ_CUDA_SINGLE_BUCKET_SPLIT", "1", 1);
+        setenv("BGJ_CUDA_SINGLE_BUCKET_SPLIT_MIN_DOTS", "1", 1);
+        setenv("BGJ_CUDA_SINGLE_BUCKET_TENSOR_SPLIT", tensor ? "1" : "0", 1);
+        setenv("BGJ_CUDA_SINGLE_BUCKET_SPLIT_VERIFY", "1", 1);
+
+        std::vector<bgj_cuda_result_t> split(capacity);
+        const char *name = tensor ? "pool-split-tensor" : "pool-split-range";
+        if (!search_pool_bucket(name,
+                                pool,
+                                bucket,
+                                vec_length,
+                                goal_norm,
+                                center_norm,
+                                split)) {
+            return false;
+        }
+        if (!compare_results(name, split, single)) return false;
+        std::cout << name << ": ok, results=" << split.size() << "\n";
+
+        std::vector<bgj_cuda_result_t> async_split(capacity);
+        const char *async_name = tensor ? "pool-split-tensor-async" : "pool-split-range-async";
+        if (!search_pool_bucket_async(async_name,
+                                      pool,
+                                      bucket,
+                                      vec_length,
+                                      goal_norm,
+                                      center_norm,
+                                      async_split)) {
+            return false;
+        }
+        if (!compare_results(async_name, async_split, single)) return false;
+        std::cout << async_name << ": ok, results=" << async_split.size() << "\n";
+    }
+
+    return true;
+}
+
 bool run_pool_batch_case()
 {
     const uint32_t batch_size = 4;
@@ -679,6 +924,9 @@ int main()
         return 77;
     }
     std::cout << "CUDA devices=" << devices << "\n";
+    if (devices > 1 && !getenv("BGJ_CUDA_DEVICES") && !getenv("BGJ_CUDA_NUM_DEVICES")) {
+        setenv("BGJ_CUDA_NUM_DEVICES", "2", 1);
+    }
 
     bool ok = true;
     ok = run_case("empty", 0, 0, 32, false, 1, ThresholdMode::Selective) && ok;
@@ -708,6 +956,7 @@ int main()
     unsetenv("BGJ_CUDA_TENSOR_NP_MIN_TILES");
     ok = run_case("tensor-same-32", 512, 0, 32, true, 11, ThresholdMode::Selective) && ok;
     ok = run_pool_case() && ok;
+    ok = run_pool_split_equivalence_case() && ok;
     ok = run_pool_batch_case() && ok;
     ok = run_overflow_case() && ok;
 

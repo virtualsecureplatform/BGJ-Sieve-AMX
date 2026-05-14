@@ -334,6 +334,21 @@ struct bgj_cuda_raw_async_state_t {
     uint64_t full_work;
     uint32_t num_p;
     uint32_t num_n;
+    const int8_t *pool_vecs_host;
+    uint64_t pool_epoch;
+    uint32_t pool_size;
+    const uint32_t *p_ids;
+    const uint32_t *n_ids;
+    const int32_t *p_norm;
+    const int32_t *n_norm;
+    const int32_t *p_dot;
+    const int32_t *n_dot;
+    uint32_t vec_length;
+    int32_t goal_norm;
+    uint32_t center_id;
+    int32_t center_norm;
+    int record_dp;
+    int raw_center_dp;
     double total_t0;
     double submit_sec;
 
@@ -353,6 +368,21 @@ struct bgj_cuda_raw_async_state_t {
           full_work(0),
           num_p(0),
           num_n(0),
+          pool_vecs_host(NULL),
+          pool_epoch(0),
+          pool_size(0),
+          p_ids(NULL),
+          n_ids(NULL),
+          p_norm(NULL),
+          n_norm(NULL),
+          p_dot(NULL),
+          n_dot(NULL),
+          vec_length(0),
+          goal_norm(0),
+          center_id(0),
+          center_norm(0),
+          record_dp(0),
+          raw_center_dp(0),
           total_t0(0.0),
           submit_sec(0.0)
     {
@@ -368,6 +398,21 @@ struct bgj_cuda_raw_async_state_t {
         full_work = 0;
         num_p = 0;
         num_n = 0;
+        pool_vecs_host = NULL;
+        pool_epoch = 0;
+        pool_size = 0;
+        p_ids = NULL;
+        n_ids = NULL;
+        p_norm = NULL;
+        n_norm = NULL;
+        p_dot = NULL;
+        n_dot = NULL;
+        vec_length = 0;
+        goal_norm = 0;
+        center_id = 0;
+        center_norm = 0;
+        record_dp = 0;
+        raw_center_dp = 0;
         total_t0 = 0.0;
         submit_sec = 0.0;
         for (int i = 0; i < BGJ_CUDA_MAX_EXEC_DEVICES; i++) {
@@ -5724,6 +5769,16 @@ static int bgj_cuda_single_bucket_tensor_split_requested()
     return bgj_cuda_env_flag("BGJ_CUDA_SINGLE_BUCKET_TENSOR_SPLIT", 1);
 }
 
+static int bgj_cuda_single_bucket_split_verify_requested()
+{
+    return bgj_cuda_env_flag("BGJ_CUDA_SINGLE_BUCKET_SPLIT_VERIFY", 0);
+}
+
+static int bgj_cuda_single_bucket_split_verify_order_requested()
+{
+    return bgj_cuda_env_flag("BGJ_CUDA_SINGLE_BUCKET_SPLIT_VERIFY_ORDER", 0);
+}
+
 static uint64_t bgj_cuda_single_bucket_split_min_dots()
 {
     const uint64_t default_value = bgj_cuda_stable_multi_gpu_requested() ?
@@ -7635,6 +7690,217 @@ fail:
     return 0;
 }
 
+static int bgj_cuda_result_same_host(const bgj_cuda_result_t &a,
+                                     const bgj_cuda_result_t &b)
+{
+    return a.type == b.type && a.x == b.x && a.y == b.y;
+}
+
+static bool bgj_cuda_result_less_host(const bgj_cuda_result_t &a,
+                                      const bgj_cuda_result_t &b)
+{
+    if (a.type != b.type) return a.type < b.type;
+    if (a.x != b.x) return a.x < b.x;
+    return a.y < b.y;
+}
+
+static int bgj_cuda_verify_split_bucket_results(const char *mode,
+                                                int verify_device,
+                                                const int8_t *pool_vecs_host,
+                                                uint64_t pool_epoch,
+                                                uint32_t pool_size,
+                                                const uint32_t *p_ids,
+                                                const uint32_t *n_ids,
+                                                const int32_t *p_norm,
+                                                const int32_t *n_norm,
+                                                const int32_t *p_dot,
+                                                const int32_t *n_dot,
+                                                uint32_t num_p,
+                                                uint32_t num_n,
+                                                uint32_t vec_length,
+                                                int32_t goal_norm,
+                                                uint32_t center_id,
+                                                int32_t center_norm,
+                                                int record_dp,
+                                                int raw_center_dp,
+                                                const bgj_cuda_result_t *split_results,
+                                                uint32_t split_result_count,
+                                                int split_overflow,
+                                                uint32_t result_capacity)
+{
+    if (!bgj_cuda_single_bucket_split_verify_requested()) return 1;
+    if (split_overflow) return 1;
+    if (!pool_vecs_host || !split_results) return 1;
+
+    int previous_device = -1;
+    bgj_cuda_current_device(&previous_device);
+    if (verify_device >= 0 && !bgj_cuda_set_current_device(verify_device)) {
+        return 0;
+    }
+
+    bgj_cuda_result_t *single_results =
+        (bgj_cuda_result_t *)malloc((size_t)result_capacity * sizeof(bgj_cuda_result_t));
+    bgj_cuda_result_t *split_sorted =
+        (bgj_cuda_result_t *)malloc((size_t)split_result_count * sizeof(bgj_cuda_result_t));
+    bgj_cuda_result_t *single_sorted = NULL;
+    if (!single_results || (!split_sorted && split_result_count)) {
+        free(single_results);
+        free(split_sorted);
+        set_plain_error("CUDA split verifier allocation failed");
+        if (previous_device >= 0) bgj_cuda_set_current_device(previous_device);
+        return 0;
+    }
+
+    bgj_cuda_raw_scratch_t *scratch = &bgj_cuda_raw_scratch;
+    uint32_t single_submitted_count = 0;
+    uint32_t single_result_count = 0;
+    int single_submitted_overflow = 0;
+    int single_overflow = 0;
+    int ok = 0;
+
+    if (!bgj_cuda_search_bucket_raw_submit(scratch,
+                                           NULL,
+                                           NULL,
+                                           pool_vecs_host,
+                                           pool_epoch,
+                                           pool_size,
+                                           p_ids,
+                                           n_ids,
+                                           p_norm,
+                                           n_norm,
+                                           p_dot,
+                                           n_dot,
+                                           num_p,
+                                           num_n,
+                                           vec_length,
+                                           goal_norm,
+                                           center_id,
+                                           center_norm,
+                                           record_dp,
+                                           0,
+                                           0,
+                                           raw_center_dp,
+                                           0,
+                                           0,
+                                           0,
+                                           0,
+                                           0,
+                                           result_capacity,
+                                           &single_submitted_count,
+                                           &single_submitted_overflow)) {
+        goto done;
+    }
+    if (scratch->stream_ready) {
+        cudaError_t err = cudaStreamSynchronize(scratch->stream);
+        if (err != cudaSuccess) {
+            set_cuda_error("cudaStreamSynchronize split verifier counts", err);
+            goto done;
+        }
+    }
+    bgj_cuda_get_submitted_counts(scratch,
+                                  &single_submitted_count,
+                                  &single_submitted_overflow);
+    if (!bgj_cuda_finish_submitted_bucket(scratch,
+                                          single_results,
+                                          result_capacity,
+                                          single_submitted_count,
+                                          single_submitted_overflow,
+                                          &single_result_count,
+                                          &single_overflow)) {
+        goto done;
+    }
+    if (scratch->stream_ready) {
+        cudaError_t err = cudaStreamSynchronize(scratch->stream);
+        if (err != cudaSuccess) {
+            set_cuda_error("cudaStreamSynchronize split verifier results", err);
+            goto done;
+        }
+    }
+
+    if (single_overflow) {
+        ok = 1;
+        goto done;
+    }
+
+    if (single_result_count != split_result_count) {
+        fprintf(stderr,
+                "cuda_split_verify: mode=%s count mismatch split=%u single=%u\n",
+                mode ? mode : "unknown",
+                split_result_count,
+                single_result_count);
+        set_plain_error("CUDA split verifier count mismatch");
+        goto done;
+    }
+
+    for (uint32_t i = 0; i < split_result_count; i++) {
+        if (!bgj_cuda_result_same_host(split_results[i], single_results[i])) {
+            if (bgj_cuda_single_bucket_split_verify_order_requested()) {
+                fprintf(stderr,
+                        "cuda_split_verify: mode=%s order mismatch index=%u "
+                        "split=(%u,%u,%u) single=(%u,%u,%u)\n",
+                        mode ? mode : "unknown",
+                        i,
+                        split_results[i].type,
+                        split_results[i].x,
+                        split_results[i].y,
+                        single_results[i].type,
+                        single_results[i].x,
+                        single_results[i].y);
+                set_plain_error("CUDA split verifier order mismatch");
+                goto done;
+            }
+            break;
+        }
+    }
+
+    if (split_result_count) {
+        memcpy(split_sorted,
+               split_results,
+               (size_t)split_result_count * sizeof(bgj_cuda_result_t));
+        single_sorted =
+            (bgj_cuda_result_t *)malloc((size_t)single_result_count * sizeof(bgj_cuda_result_t));
+        if (!single_sorted) {
+            set_plain_error("CUDA split verifier allocation failed");
+            goto done;
+        }
+        memcpy(single_sorted,
+               single_results,
+               (size_t)single_result_count * sizeof(bgj_cuda_result_t));
+        std::sort(split_sorted,
+                  split_sorted + split_result_count,
+                  bgj_cuda_result_less_host);
+        std::sort(single_sorted,
+                  single_sorted + single_result_count,
+                  bgj_cuda_result_less_host);
+        for (uint32_t i = 0; i < split_result_count; i++) {
+            if (!bgj_cuda_result_same_host(split_sorted[i], single_sorted[i])) {
+                fprintf(stderr,
+                        "cuda_split_verify: mode=%s multiset mismatch index=%u "
+                        "split=(%u,%u,%u) single=(%u,%u,%u)\n",
+                        mode ? mode : "unknown",
+                        i,
+                        split_sorted[i].type,
+                        split_sorted[i].x,
+                        split_sorted[i].y,
+                        single_sorted[i].type,
+                        single_sorted[i].x,
+                        single_sorted[i].y);
+                set_plain_error("CUDA split verifier multiset mismatch");
+                goto done;
+            }
+        }
+    }
+
+    ok = 1;
+
+done:
+    free(single_results);
+    free(split_sorted);
+    free(single_sorted);
+    if (previous_device >= 0) bgj_cuda_set_current_device(previous_device);
+    return ok;
+}
+
 static uint64_t bgj_cuda_full_pair_work(uint32_t num_p, uint32_t num_n)
 {
     return (uint64_t)num_p * (uint64_t)num_n +
@@ -7845,6 +8111,32 @@ static int bgj_cuda_search_bucket_pool_raw_split_impl(const int8_t *pool_vecs_ho
     }
     copy_sec = bgj_cuda_wall_time() - copy_t0;
 
+    if (!bgj_cuda_verify_split_bucket_results(tensor_split ? "tensor" : "range",
+                                              selected_device >= 0 ? selected_device : devices[0],
+                                              pool_vecs_host,
+                                              pool_epoch,
+                                              pool_size,
+                                              p_ids,
+                                              n_ids,
+                                              p_norm,
+                                              n_norm,
+                                              p_dot,
+                                              n_dot,
+                                              num_p,
+                                              num_n,
+                                              vec_length,
+                                              goal_norm,
+                                              center_id,
+                                              center_norm,
+                                              record_dp,
+                                              raw_center_dp,
+                                              results,
+                                              out_count,
+                                              out_overflow,
+                                              result_capacity)) {
+        goto fail_sync;
+    }
+
     *result_count = out_count;
     *overflow = out_overflow;
     set_plain_error("no CUDA error");
@@ -8003,6 +8295,21 @@ static int bgj_cuda_search_bucket_pool_raw_split_submit_async(const int8_t *pool
     state->full_work = full_work;
     state->num_p = num_p;
     state->num_n = num_n;
+    state->pool_vecs_host = pool_vecs_host;
+    state->pool_epoch = pool_epoch;
+    state->pool_size = pool_size;
+    state->p_ids = p_ids;
+    state->n_ids = n_ids;
+    state->p_norm = p_norm;
+    state->n_norm = n_norm;
+    state->p_dot = p_dot;
+    state->n_dot = n_dot;
+    state->vec_length = vec_length;
+    state->goal_norm = goal_norm;
+    state->center_id = center_id;
+    state->center_norm = center_norm;
+    state->record_dp = record_dp;
+    state->raw_center_dp = raw_center_dp;
     state->total_t0 = bgj_cuda_wall_time();
 
     for (int i = 0; i < device_count; i++) {
@@ -8191,6 +8498,32 @@ static int bgj_cuda_search_bucket_pool_raw_split_finish_async(bgj_cuda_result_t 
         }
     }
     copy_sec = bgj_cuda_wall_time() - copy_t0;
+
+    if (!bgj_cuda_verify_split_bucket_results(mode,
+                                              selected_device >= 0 ? selected_device : state->split_devices[0],
+                                              state->pool_vecs_host,
+                                              state->pool_epoch,
+                                              state->pool_size,
+                                              state->p_ids,
+                                              state->n_ids,
+                                              state->p_norm,
+                                              state->n_norm,
+                                              state->p_dot,
+                                              state->n_dot,
+                                              state->num_p,
+                                              state->num_n,
+                                              state->vec_length,
+                                              state->goal_norm,
+                                              state->center_id,
+                                              state->center_norm,
+                                              state->record_dp,
+                                              state->raw_center_dp,
+                                              results,
+                                              out_count,
+                                              out_overflow,
+                                              result_capacity)) {
+        goto fail_sync;
+    }
 
     if (result_count) *result_count = out_count;
     if (overflow) *overflow = out_overflow;
