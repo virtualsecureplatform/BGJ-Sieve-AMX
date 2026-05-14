@@ -4078,10 +4078,289 @@ static int bgj_cuda_prepare_bucket_stream(bgj_cuda_bucket_scratch_t *scratch)
         if (!ensure_cuda_capacity((void **)&(ptr), &(capacity), requested)) goto fail; \
     } while (0)
 
+static int bgj_cuda_finish_submitted_bucket(bgj_cuda_raw_scratch_t *scratch,
+                                            bgj_cuda_result_t *results,
+                                            uint32_t result_capacity,
+                                            uint32_t submitted_result_count,
+                                            int submitted_overflow,
+                                            uint32_t *result_count,
+                                            int *overflow);
+
 extern "C" uint64_t bgj_cuda_lsh_total_tile_slots(uint32_t mbound)
 {
     const uint32_t num_tiles = (mbound + BGJ_CUDA_LSH_TILE - 1u) / BGJ_CUDA_LSH_TILE;
     return (uint64_t)num_tiles * (uint64_t)(num_tiles + 1u) / 2u;
+}
+
+static int bgj_cuda_lsh_multi_gpu_requested()
+{
+    return bgj_cuda_env_flag("BGJ_CUDA_LSH_MULTI_GPU",
+                             bgj_cuda_stable_multi_gpu_requested());
+}
+
+static uint64_t bgj_cuda_lsh_multi_gpu_min_slots()
+{
+    return bgj_cuda_env_u64("BGJ_CUDA_LSH_MULTI_GPU_MIN_SLOTS",
+                            1024ULL * 1024ULL);
+}
+
+static int bgj_cuda_lsh_search_range_submit(bgj_cuda_raw_scratch_t *scratch,
+                                            const uint8_t *sh,
+                                            uint32_t mbound,
+                                            uint32_t shsize,
+                                            int32_t threshold,
+                                            uint64_t tile_slot_begin,
+                                            uint64_t tile_slot_count,
+                                            uint32_t result_capacity)
+{
+    if (!scratch) return 0;
+    if (!bgj_cuda_prepare_stream(scratch)) return 0;
+
+    cudaStream_t stream = scratch->stream;
+    const size_t sh_bytes = (size_t)mbound * (size_t)shsize;
+    CUDA_ENSURE(scratch->p_vecs, scratch->p_vec_capacity, sh_bytes);
+    CUDA_ENSURE(scratch->results, scratch->result_capacity, (size_t)result_capacity * sizeof(bgj_cuda_result_t));
+    CUDA_ENSURE(scratch->result_count, scratch->result_count_capacity, sizeof(uint32_t));
+    CUDA_ENSURE(scratch->overflow, scratch->overflow_capacity, sizeof(int));
+    if (!ensure_cuda_host_capacity((void **)&scratch->host_result_count,
+                                   &scratch->host_result_count_capacity,
+                                   sizeof(uint32_t)) ||
+        !ensure_cuda_host_capacity((void **)&scratch->host_overflow,
+                                   &scratch->host_overflow_capacity,
+                                   sizeof(int))) {
+        goto fail;
+    }
+    *scratch->host_result_count = 0;
+    *scratch->host_overflow = 0;
+
+    CUDA_TRY(cudaMemcpyAsync(scratch->p_vecs, sh, sh_bytes, cudaMemcpyHostToDevice, stream));
+    CUDA_TRY(cudaMemsetAsync(scratch->result_count, 0, sizeof(uint32_t), stream));
+    CUDA_TRY(cudaMemsetAsync(scratch->overflow, 0, sizeof(int), stream));
+
+    {
+        uint32_t grid = tile_slot_count > 65535ull ? 65535u : (uint32_t)tile_slot_count;
+        if (grid == 0) grid = 1;
+        bgj_cuda_lsh_search_kernel<<<grid,
+                                      BGJ_CUDA_LSH_THREADS,
+                                      0,
+                                      stream>>>((const uint64_t *)scratch->p_vecs,
+                                                mbound,
+                                                threshold,
+                                                tile_slot_begin,
+                                                tile_slot_count,
+                                                scratch->results,
+                                                result_capacity,
+                                                scratch->result_count,
+                                                scratch->overflow);
+        CUDA_TRY(cudaGetLastError());
+    }
+
+    CUDA_TRY(cudaMemcpyAsync(scratch->host_result_count,
+                             scratch->result_count,
+                             sizeof(uint32_t),
+                             cudaMemcpyDeviceToHost,
+                             stream));
+    CUDA_TRY(cudaMemcpyAsync(scratch->host_overflow,
+                             scratch->overflow,
+                             sizeof(int),
+                             cudaMemcpyDeviceToHost,
+                             stream));
+
+    set_plain_error("no CUDA error");
+    return 1;
+
+fail:
+    return 0;
+}
+
+static int bgj_cuda_lsh_search_split_raw(const uint8_t *sh,
+                                         uint32_t mbound,
+                                         uint32_t shsize,
+                                         int32_t threshold,
+                                         bgj_cuda_result_t *results,
+                                         uint32_t result_capacity,
+                                         uint32_t *result_count,
+                                         int *overflow,
+                                         uint64_t total_tile_slots)
+{
+    if (!bgj_cuda_select_thread_device()) return 0;
+
+    int selected_device = -1;
+    bgj_cuda_current_device(&selected_device);
+
+    int devices[BGJ_CUDA_MAX_EXEC_DEVICES];
+    int device_count =
+        bgj_cuda_copy_execution_devices(devices, BGJ_CUDA_MAX_EXEC_DEVICES);
+    if (device_count <= 1) return 0;
+    if ((uint64_t)device_count > total_tile_slots) {
+        device_count = (int)total_tile_slots;
+    }
+    if (device_count <= 1) return 0;
+
+    uint64_t tile_begin[BGJ_CUDA_MAX_EXEC_DEVICES] = {};
+    uint64_t tile_count[BGJ_CUDA_MAX_EXEC_DEVICES] = {};
+    uint32_t submitted_counts[BGJ_CUDA_MAX_EXEC_DEVICES] = {};
+    uint32_t copied_counts[BGJ_CUDA_MAX_EXEC_DEVICES] = {};
+    int submitted_overflows[BGJ_CUDA_MAX_EXEC_DEVICES] = {};
+    int copied_overflows[BGJ_CUDA_MAX_EXEC_DEVICES] = {};
+    uint32_t out_count = 0;
+    int out_overflow = 0;
+    uint64_t submitted_total = 0;
+    int submitted_any_overflow = 0;
+    uint32_t submitted = 0;
+    const int split_profile = bgj_cuda_split_profile_requested();
+    const double total_t0 = bgj_cuda_wall_time();
+    double submit_sec = 0.0;
+    double wait_sec = 0.0;
+    double copy_sec = 0.0;
+    double submit_t0 = 0.0;
+    double wait_t0 = 0.0;
+    double copy_t0 = 0.0;
+
+    for (int i = 0; i < device_count; i++) {
+        const uint64_t begin =
+            ((uint64_t)i * total_tile_slots) / (uint64_t)device_count;
+        const uint64_t end =
+            ((uint64_t)(i + 1) * total_tile_slots) / (uint64_t)device_count;
+        tile_begin[i] = begin;
+        tile_count[i] = end > begin ? end - begin : 0ull;
+    }
+
+    submit_t0 = bgj_cuda_wall_time();
+    for (int i = 0; i < device_count; i++) {
+        if (!tile_count[i]) continue;
+        if (!bgj_cuda_set_current_device(devices[i])) goto fail_sync;
+        bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get((uint32_t)i);
+        if (!scratch) {
+            set_plain_error("out of host memory");
+            goto fail_sync;
+        }
+        if (!bgj_cuda_lsh_search_range_submit(scratch,
+                                              sh,
+                                              mbound,
+                                              shsize,
+                                              threshold,
+                                              tile_begin[i],
+                                              tile_count[i],
+                                              result_capacity)) {
+            goto fail_sync;
+        }
+        submitted++;
+    }
+    if (!submitted) return 0;
+    submit_sec = bgj_cuda_wall_time() - submit_t0;
+
+    wait_t0 = bgj_cuda_wall_time();
+    for (int i = 0; i < device_count; i++) {
+        if (!tile_count[i]) continue;
+        bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get((uint32_t)i);
+        if (!scratch || !scratch->stream_ready) goto fail_sync;
+        if (scratch->device >= 0 && !bgj_cuda_set_current_device(scratch->device)) {
+            goto fail_sync;
+        }
+        cudaError_t err = cudaStreamSynchronize(scratch->stream);
+        if (err != cudaSuccess) {
+            set_cuda_error("cudaStreamSynchronize LSH split counts", err);
+            goto fail_sync;
+        }
+        bgj_cuda_get_submitted_counts(scratch,
+                                      &submitted_counts[i],
+                                      &submitted_overflows[i]);
+        submitted_total += submitted_counts[i];
+        if (submitted_overflows[i]) submitted_any_overflow = 1;
+    }
+    wait_sec = bgj_cuda_wall_time() - wait_t0;
+
+    copy_t0 = bgj_cuda_wall_time();
+    for (int i = 0; i < device_count; i++) {
+        if (!tile_count[i]) continue;
+        bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get((uint32_t)i);
+        if (!scratch || !scratch->stream_ready) goto fail_sync;
+        if (scratch->device >= 0 && !bgj_cuda_set_current_device(scratch->device)) {
+            goto fail_sync;
+        }
+        const uint32_t remaining =
+            out_count < result_capacity ? result_capacity - out_count : 0u;
+        if (!bgj_cuda_finish_submitted_bucket(scratch,
+                                              results + out_count,
+                                              remaining,
+                                              submitted_counts[i],
+                                              submitted_overflows[i],
+                                              &copied_counts[i],
+                                              &copied_overflows[i])) {
+            goto fail_sync;
+        }
+        out_count += copied_counts[i];
+        if (copied_overflows[i]) out_overflow = 1;
+    }
+
+    for (int i = 0; i < device_count; i++) {
+        if (!tile_count[i]) continue;
+        bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get((uint32_t)i);
+        if (!scratch || !scratch->stream_ready) goto fail_sync;
+        if (scratch->device >= 0 && !bgj_cuda_set_current_device(scratch->device)) {
+            goto fail_sync;
+        }
+        cudaError_t err = cudaStreamSynchronize(scratch->stream);
+        if (err != cudaSuccess) {
+            set_cuda_error("cudaStreamSynchronize LSH split results", err);
+            goto fail_sync;
+        }
+    }
+    copy_sec = bgj_cuda_wall_time() - copy_t0;
+
+    *result_count = out_count;
+    *overflow =
+        out_overflow || submitted_any_overflow ||
+        submitted_total > (uint64_t)result_capacity;
+    set_plain_error("no CUDA error");
+    if (split_profile) {
+        fprintf(stderr,
+                "cuda_lsh_split_profile: devices=%d mbound=%u threshold=%d "
+                "slots=%lu results=%u overflow=%d submit=%.6fs wait=%.6fs "
+                "copy=%.6fs total=%.6fs\n",
+                device_count,
+                mbound,
+                threshold,
+                (unsigned long)total_tile_slots,
+                out_count,
+                *overflow,
+                submit_sec,
+                wait_sec,
+                copy_sec,
+                bgj_cuda_wall_time() - total_t0);
+        for (int i = 0; i < device_count; i++) {
+            if (!tile_count[i]) continue;
+            fprintf(stderr,
+                    "cuda_lsh_split_device_profile: slot=%d/%d device=%d "
+                    "tile_begin=%lu tile_count=%lu submitted=%u copied=%u "
+                    "submitted_overflow=%d copied_overflow=%d\n",
+                    i,
+                    device_count,
+                    devices[i],
+                    (unsigned long)tile_begin[i],
+                    (unsigned long)tile_count[i],
+                    submitted_counts[i],
+                    copied_counts[i],
+                    submitted_overflows[i],
+                    copied_overflows[i]);
+        }
+        fflush(stderr);
+    }
+    if (selected_device >= 0) bgj_cuda_set_current_device(selected_device);
+    return 1;
+
+fail_sync:
+    for (int i = 0; i < device_count; i++) {
+        if (!tile_count[i]) continue;
+        bgj_cuda_raw_scratch_t *scratch = bgj_cuda_raw_batch_scratch.get((uint32_t)i);
+        if (scratch && scratch->stream_ready) {
+            if (scratch->device >= 0) cudaSetDevice(scratch->device);
+            cudaStreamSynchronize(scratch->stream);
+        }
+    }
+    if (selected_device >= 0) bgj_cuda_set_current_device(selected_device);
+    return 0;
 }
 
 extern "C" int bgj_cuda_lsh_search_range_raw(const uint8_t *sh,
@@ -4121,52 +4400,33 @@ extern "C" int bgj_cuda_lsh_search_range_raw(const uint8_t *sh,
     if (tile_slot_count > total_tile_slots - tile_slot_begin) {
         tile_slot_count = total_tile_slots - tile_slot_begin;
     }
-    if (!bgj_cuda_prepare_stream(scratch)) return 0;
-
-    cudaStream_t stream = scratch->stream;
-    const size_t sh_bytes = (size_t)mbound * (size_t)shsize;
-    CUDA_ENSURE(scratch->p_vecs, scratch->p_vec_capacity, sh_bytes);
-    CUDA_ENSURE(scratch->results, scratch->result_capacity, (size_t)result_capacity * sizeof(bgj_cuda_result_t));
-    CUDA_ENSURE(scratch->result_count, scratch->result_count_capacity, sizeof(uint32_t));
-    CUDA_ENSURE(scratch->overflow, scratch->overflow_capacity, sizeof(int));
-
-    CUDA_TRY(cudaMemcpyAsync(scratch->p_vecs, sh, sh_bytes, cudaMemcpyHostToDevice, stream));
-    CUDA_TRY(cudaMemsetAsync(scratch->result_count, 0, sizeof(uint32_t), stream));
-    CUDA_TRY(cudaMemsetAsync(scratch->overflow, 0, sizeof(int), stream));
-
-    {
-        uint32_t grid = tile_slot_count > 65535ull ? 65535u : (uint32_t)tile_slot_count;
-        if (grid == 0) grid = 1;
-        bgj_cuda_lsh_search_kernel<<<grid,
-                                      BGJ_CUDA_LSH_THREADS,
-                                      0,
-                                      stream>>>((const uint64_t *)scratch->p_vecs,
-                                                mbound,
-                                                threshold,
-                                                tile_slot_begin,
-                                                tile_slot_count,
-                                                scratch->results,
-                                                result_capacity,
-                                                scratch->result_count,
-                                                scratch->overflow);
-        CUDA_TRY(cudaGetLastError());
+    if (!bgj_cuda_lsh_search_range_submit(scratch,
+                                          sh,
+                                          mbound,
+                                          shsize,
+                                          threshold,
+                                          tile_slot_begin,
+                                          tile_slot_count,
+                                          result_capacity)) {
+        return 0;
     }
-
-    CUDA_TRY(cudaMemcpyAsync(result_count, scratch->result_count, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
-    CUDA_TRY(cudaMemcpyAsync(overflow, scratch->overflow, sizeof(int), cudaMemcpyDeviceToHost, stream));
+    cudaStream_t stream = scratch->stream;
     CUDA_TRY(cudaStreamSynchronize(stream));
+    bgj_cuda_get_submitted_counts(scratch, result_count, overflow);
     if (*result_count > result_capacity) {
         *result_count = result_capacity;
         *overflow = 1;
     }
-    if (*result_count) {
-        CUDA_TRY(cudaMemcpyAsync(results,
-                                 scratch->results,
-                                 (size_t)(*result_count) * sizeof(bgj_cuda_result_t),
-                                 cudaMemcpyDeviceToHost,
-                                 stream));
-        CUDA_TRY(cudaStreamSynchronize(stream));
+    if (!bgj_cuda_finish_submitted_bucket(scratch,
+                                          results,
+                                          result_capacity,
+                                          *result_count,
+                                          *overflow,
+                                          result_count,
+                                          overflow)) {
+        return 0;
     }
+    CUDA_TRY(cudaStreamSynchronize(stream));
 
     set_plain_error("no CUDA error");
     return 1;
@@ -4184,12 +4444,30 @@ extern "C" int bgj_cuda_lsh_search_raw(const uint8_t *sh,
                                         uint32_t *result_count,
                                         int *overflow)
 {
+    const uint64_t total_tile_slots = bgj_cuda_lsh_total_tile_slots(mbound);
+    if (shsize == 64u &&
+        result_capacity > 0 &&
+        mbound >= 2u &&
+        bgj_cuda_lsh_multi_gpu_requested() &&
+        total_tile_slots >= bgj_cuda_lsh_multi_gpu_min_slots()) {
+        if (bgj_cuda_lsh_search_split_raw(sh,
+                                          mbound,
+                                          shsize,
+                                          threshold,
+                                          results,
+                                          result_capacity,
+                                          result_count,
+                                          overflow,
+                                          total_tile_slots)) {
+            return 1;
+        }
+    }
     return bgj_cuda_lsh_search_range_raw(sh,
                                          mbound,
                                          shsize,
                                          threshold,
                                          0u,
-                                         bgj_cuda_lsh_total_tile_slots(mbound),
+                                         total_tile_slots,
                                          results,
                                          result_capacity,
                                          result_count,
