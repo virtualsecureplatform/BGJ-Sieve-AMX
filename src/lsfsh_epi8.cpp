@@ -367,6 +367,8 @@ struct lsh_profile_data_t {
     uint64_t endpoint_max_mbound, endpoint_max_results, endpoint_max_unique;
     uint64_t worst_mbound, worst_candidates;
     double cuda_time, inline_lift_time, worst_search_time, worst_lift_time;
+    double lift_snapshot_time, lift_core_time, lift_profile_time, lift_merge_time;
+    double final_select_time, final_insert_time;
     pthread_spinlock_t profile_lock;
 
     void init(long _log_level) {
@@ -406,6 +408,12 @@ struct lsh_profile_data_t {
         inline_lift_time = 0.0;
         worst_search_time = 0.0;
         worst_lift_time = 0.0;
+        lift_snapshot_time = 0.0;
+        lift_core_time = 0.0;
+        lift_profile_time = 0.0;
+        lift_merge_time = 0.0;
+        final_select_time = 0.0;
+        final_insert_time = 0.0;
         pthread_spin_init(&profile_lock, PTHREAD_PROCESS_SHARED);
     }
     void observe_buffer(uint64_t entries) {
@@ -433,6 +441,14 @@ struct lsh_profile_data_t {
             worst_lift_time = lift_time;
         }
         if (candidates > max_buffer_entries) max_buffer_entries = candidates;
+        pthread_spin_unlock(&profile_lock);
+    }
+    void observe_lift_breakdown(double snapshot, double core, double profile, double merge) {
+        pthread_spin_lock(&profile_lock);
+        lift_snapshot_time += snapshot;
+        lift_core_time += core;
+        lift_profile_time += profile;
+        lift_merge_time += merge;
         pthread_spin_unlock(&profile_lock);
     }
     void init_log(float *min_norm, long ID) {
@@ -1425,22 +1441,30 @@ int Pool_epi8_t<nb>::__mblock_sh_search(lsh_mblock_t mb, int32_t threshold, uint
 }
 
 template <uint32_t nb>
-int Pool_epi8_t<nb>::__lift_buffer(lsh_mblock_t mb, long target_index, uint32_t dh_dim, float **b_full_fp, 
-                                    uint32_t **ptr_buffer, uint64_t *ptr_buffer_size, uint64_t *ptr_buffer_num, 
+int Pool_epi8_t<nb>::__lift_buffer(lsh_mblock_t mb, long target_index, uint32_t dh_dim, float **b_full_fp,
+                                    uint32_t **ptr_buffer, uint64_t *ptr_buffer_size, uint64_t *ptr_buffer_num,
                                     float *min_norm, float **min_vec, pthread_spinlock_t &min_lock, lsh_profile_data_t *profile_data) {
     const long FD = index_r - target_index;
     const long ID = index_l - dh_dim - target_index;
     const long FD8 = _CEIL8(FD);
+    const int lift_profile = lsh_env_profile_enabled();
 
     for (long thread = 0; thread < 1; thread++) {
+        double profile_t0 = lift_profile ? lsh_wall_time() : 0.0;
+        double profile_snapshot = 0.0;
+        double profile_core = 0.0;
+        double profile_update = 0.0;
+        double profile_merge = 0.0;
         // local min data initialization
         __attribute__ ((aligned (32))) float _min_norm[vec_length];
         float **_min_vec = (float **) NEW_MAT(ID, FD, sizeof(float));
         pthread_spin_lock(&min_lock);
         copy_avx2(_min_norm, min_norm, ID);
         pthread_spin_unlock(&min_lock);
+        if (lift_profile) profile_snapshot = lsh_wall_time() - profile_t0;
 
         // main lifting
+        profile_t0 = lift_profile ? lsh_wall_time() : 0.0;
         do {
             const long LD = FD - CSD;
             float *ftmp = (float *) NEW_VEC(FD8 * 8, sizeof(float));
@@ -1534,14 +1558,18 @@ int Pool_epi8_t<nb>::__lift_buffer(lsh_mblock_t mb, long target_index, uint32_t 
             }
             FREE_VEC(ftmp);
         } while (0);
-        
+        if (lift_profile) profile_core = lsh_wall_time() - profile_t0;
+
 
         // update profile data
+        profile_t0 = lift_profile ? lsh_wall_time() : 0.0;
         pthread_spin_lock(&profile_data->profile_lock);
         profile_data->lift_ops += ptr_buffer_num[thread];
         ptr_buffer_num[thread] = 0;
         pthread_spin_unlock(&profile_data->profile_lock);
+        if (lift_profile) profile_update = lsh_wall_time() - profile_t0;
         // update min data
+        profile_t0 = lift_profile ? lsh_wall_time() : 0.0;
         pthread_spin_lock(&min_lock);
         for (long i = 0; i < ID; i++) {
             if (_min_norm[i] < min_norm[i]) {
@@ -1550,6 +1578,11 @@ int Pool_epi8_t<nb>::__lift_buffer(lsh_mblock_t mb, long target_index, uint32_t 
             }
         }
         pthread_spin_unlock(&min_lock);
+        if (lift_profile) {
+            profile_merge = lsh_wall_time() - profile_t0;
+            profile_data->observe_lift_breakdown(profile_snapshot, profile_core,
+                                                 profile_update, profile_merge);
+        }
         FREE_MAT(_min_vec);
     }
     return 0;
@@ -1749,6 +1782,7 @@ int Pool_epi8_t<nb>::_lsfsh_insert(long target_index, double eta, long log_level
 
     long min_place = -1;
     do {
+        const double profile_t0 = env_profile ? lsh_wall_time() : 0.0;
         double min_score = 1e100;
         for (long i = 0; i < ID; i++) {
             float old_norm = (float) (0.995 * basis->get_B().hi[i + target_index]);
@@ -1760,9 +1794,21 @@ int Pool_epi8_t<nb>::_lsfsh_insert(long target_index, double eta, long log_level
                 }
             }
         }
+        if (env_profile) profile_data.final_select_time += lsh_wall_time() - profile_t0;
     } while (0);
 
     if (min_place == -1) {
+        if (env_profile || env_trace) {
+            fprintf(stderr,
+                    "lsh_lift_profile: mode=insert target=%ld csd=%ld fd=%ld id=%ld "
+                    "snapshot=%.6fs core=%.6fs profile=%.6fs merge=%.6fs "
+                    "final_select=%.6fs final_insert=%.6fs lift_ops=%llu min_place=none\n",
+                    target_index, CSD, FD, ID,
+                    profile_data.lift_snapshot_time, profile_data.lift_core_time,
+                    profile_data.lift_profile_time, profile_data.lift_merge_time,
+                    profile_data.final_select_time, profile_data.final_insert_time,
+                    (unsigned long long)profile_data.lift_ops);
+        }
         FREE_MAT(min_vec);
         FREE_MAT(b_full_fp);
         shrink_left();
@@ -1772,6 +1818,7 @@ int Pool_epi8_t<nb>::_lsfsh_insert(long target_index, double eta, long log_level
     __attribute__ ((aligned (32))) float v_fp[256];
     copy_avx2(v_fp, min_vec[min_place - target_index], FD);
     FREE_MAT(min_vec);
+    double profile_insert_t0 = env_profile ? lsh_wall_time() : 0.0;
     int ret = __basis_insert(min_place, v_fp, FD, b_full_fp);
     if (ret > 0 && min_place >= 0 && min_place < basis->NumRows()) {
         const double exact_length = sqrt(dot_avx2(basis->get_b().hi[min_place],
@@ -1785,6 +1832,18 @@ int Pool_epi8_t<nb>::_lsfsh_insert(long target_index, double eta, long log_level
                     "lsh_best_solution: source=insert dim=%ld target=%ld row=%ld length=%.9g\n",
                     basis->NumCols(), target_index, min_place, exact_length);
         }
+    }
+    if (env_profile) {
+        profile_data.final_insert_time += lsh_wall_time() - profile_insert_t0;
+        fprintf(stderr,
+                "lsh_lift_profile: mode=insert target=%ld csd=%ld fd=%ld id=%ld "
+                "snapshot=%.6fs core=%.6fs profile=%.6fs merge=%.6fs "
+                "final_select=%.6fs final_insert=%.6fs lift_ops=%llu min_place=%ld\n",
+                target_index, CSD, FD, ID,
+                profile_data.lift_snapshot_time, profile_data.lift_core_time,
+                profile_data.lift_profile_time, profile_data.lift_merge_time,
+                profile_data.final_select_time, profile_data.final_insert_time,
+                (unsigned long long)profile_data.lift_ops, min_place);
     }
     FREE_MAT(b_full_fp);
 
@@ -1986,6 +2045,7 @@ int Pool_epi8_t<nb>::_show_lsfsh_insert(long target_index, double eta, long log_
     mblock_provider.init(this, target_index, dual_vec, compress_pos, num_hbits, b_full_fp, min_norm, min_vec, target_ratio, qratio, &profile_data);
     lsh_mblock_t mb[LSH_MBLOCK_BATCH];
     const long LSH_RBATCH = ((LSH_MBLOCK_BATCH / num_threads) * num_threads) > 0 ? ((LSH_MBLOCK_BATCH / num_threads) * num_threads) : LSH_MBLOCK_BATCH;
+    const int env_profile = lsh_env_profile_enabled();
     const int endpoint_profile = lsh_endpoint_profile_enabled();
     while (mblock_provider.batch_pop(mb, LSH_RBATCH, &profile_data)) {
         int wild_mb = 0;
@@ -2059,6 +2119,7 @@ int Pool_epi8_t<nb>::_show_lsfsh_insert(long target_index, double eta, long log_
 
     long min_place = -1;
     do {
+        const double profile_t0 = env_profile ? lsh_wall_time() : 0.0;
         double min_score = 1e100;
         for (long i = 0; i < ID; i++) {
             float old_norm = (float) (0.99995 * basis->get_B().hi[i + target_index]);
@@ -2070,9 +2131,21 @@ int Pool_epi8_t<nb>::_show_lsfsh_insert(long target_index, double eta, long log_
                 }
             }
         }
+        if (env_profile) profile_data.final_select_time += lsh_wall_time() - profile_t0;
     } while (0);
 
     if (min_place == -1) {
+        if (env_profile) {
+            fprintf(stderr,
+                    "lsh_lift_profile: mode=show target=%ld csd=%ld fd=%ld id=%ld "
+                    "snapshot=%.6fs core=%.6fs profile=%.6fs merge=%.6fs "
+                    "final_select=%.6fs final_insert=%.6fs lift_ops=%llu min_place=none\n",
+                    target_index, CSD, FD, ID,
+                    profile_data.lift_snapshot_time, profile_data.lift_core_time,
+                    profile_data.lift_profile_time, profile_data.lift_merge_time,
+                    profile_data.final_select_time, profile_data.final_insert_time,
+                    (unsigned long long)profile_data.lift_ops);
+        }
         FREE_MAT(min_vec);
         FREE_MAT(b_full_fp);
         return 0;
@@ -2082,6 +2155,7 @@ int Pool_epi8_t<nb>::_show_lsfsh_insert(long target_index, double eta, long log_
     const double lift_norm = sqrt(min_norm[min_place - target_index]);
     copy_avx2(v_fp, min_vec[min_place - target_index], FD);
     FREE_MAT(min_vec);
+    double profile_insert_t0 = env_profile ? lsh_wall_time() : 0.0;
     do {
         const long RD = index_l - min_place;
         VEC_QP v_QP = NEW_VEC_QP(basis->NumCols());
@@ -2127,6 +2201,18 @@ int Pool_epi8_t<nb>::_show_lsfsh_insert(long target_index, double eta, long log_
         }
         FREE_VEC_QP(v_QP);
     } while (0);
+    if (env_profile) {
+        profile_data.final_insert_time += lsh_wall_time() - profile_insert_t0;
+        fprintf(stderr,
+                "lsh_lift_profile: mode=show target=%ld csd=%ld fd=%ld id=%ld "
+                "snapshot=%.6fs core=%.6fs profile=%.6fs merge=%.6fs "
+                "final_select=%.6fs final_insert=%.6fs lift_ops=%llu min_place=%ld\n",
+                target_index, CSD, FD, ID,
+                profile_data.lift_snapshot_time, profile_data.lift_core_time,
+                profile_data.lift_profile_time, profile_data.lift_merge_time,
+                profile_data.final_select_time, profile_data.final_insert_time,
+                (unsigned long long)profile_data.lift_ops, min_place);
+    }
     FREE_MAT(b_full_fp);
 
     return 0;

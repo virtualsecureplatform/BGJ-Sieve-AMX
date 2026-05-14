@@ -7,6 +7,7 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <sys/time.h>
 
 #define POOL_EPI8_RATIO_ADJ ( CSD < 80 ? pow(1.01, CSD - 80) : 1.0)
 
@@ -35,6 +36,20 @@ static long bgj_uid_reserve_total_hint(long pool_size) {
     const long max_hint = bgj_uid_reserve_max();
     if (max_hint > 0 && total_hint > max_hint) total_hint = max_hint;
     return total_hint;
+}
+
+static double pool_epi8_wall_time()
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec + (double)tv.tv_usec / 1000000.0;
+}
+
+static int pool_epi8_lift_profile_enabled()
+{
+    const char *env = getenv("BGJ_LIFT_PROFILE");
+    if (env == NULL) env = getenv("BGJ_PUMP_PROFILE");
+    return env != NULL && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
 }
 
 static int bgj_tail_lll_use_fplll()
@@ -1090,6 +1105,13 @@ int Pool_epi8_t<nb>::show_min_lift(long index) {
     last_lift_lift_norm = 0.0;
     last_lift_gh = 0.0;
     last_lift_approx_factor = 0.0;
+    const int lift_profile = pool_epi8_lift_profile_enabled();
+    const double profile_total_t0 = lift_profile ? pool_epi8_wall_time() : 0.0;
+    double profile_setup = 0.0;
+    double profile_scan = 0.0;
+    double profile_reconstruct = 0.0;
+    double profile_qp_build = 0.0;
+    double profile_norm_record = 0.0;
 
     if (index > index_l) {
         fprintf(stderr, "[Warning] Pool_epi8_t<%u>::show_min_lift: index(%ld) > index_l(%ld), nothing done.\n", nb, index, index_l);
@@ -1104,6 +1126,7 @@ int Pool_epi8_t<nb>::show_min_lift(long index) {
     const long ID = index_l - index;
     const long FD = index_r - index;
     const long FD8 = ((FD + 7) / 8) * 8;
+    double profile_t0 = lift_profile ? pool_epi8_wall_time() : 0.0;
     float **b_ext = _compute_b_local(index, index_r);
     float Bi[256];
     float Bis[256];
@@ -1117,9 +1140,11 @@ int Pool_epi8_t<nb>::show_min_lift(long index) {
     float min_norm = b_ext[0][0] * b_ext[0][0] * 0.995;
     pthread_spinlock_t min_lock;
     pthread_spin_init(&min_lock, PTHREAD_PROCESS_SHARED);
+    if (lift_profile) profile_setup = pool_epi8_wall_time() - profile_t0;
 
     // search for minimal insertion
-    #pragma omp parallel for 
+    profile_t0 = lift_profile ? pool_epi8_wall_time() : 0.0;
+    #pragma omp parallel for
     for (long thread = 0; thread < num_threads; thread++) {
         long begin_ind = (thread * num_vec) / num_threads;
         long end_ind = ((thread+1) * num_vec) / num_threads;
@@ -1206,10 +1231,18 @@ int Pool_epi8_t<nb>::show_min_lift(long index) {
             ind++;
         }
     }
+    if (lift_profile) profile_scan = pool_epi8_wall_time() - profile_t0;
 
     if (min_ind == (uint32_t) -1) {
         // insertion failed
         FREE_MAT(b_ext);
+        if (lift_profile) {
+            fprintf(stderr,
+                    "show_min_lift_profile: nb=%u index=%ld csd=%ld nvec=%ld min_ind=none "
+                    "setup=%.6fs scan=%.6fs total=%.6fs\n",
+                    nb, index, CSD, num_vec, profile_setup, profile_scan,
+                    pool_epi8_wall_time() - profile_total_t0);
+        }
         return 0;
     }
 
@@ -1222,6 +1255,7 @@ int Pool_epi8_t<nb>::show_min_lift(long index) {
         int32_t v_coeff[256];
 
         // compute coeff and v_fp
+        profile_t0 = lift_profile ? pool_epi8_wall_time() : 0.0;
         for (long i = 0; i < CSD; i++) {
             v_coeff[i+ID] = (vdp(_b_dual+i*vec_length, vec+min_ind*vec_length) + _dhalf - vsum[min_ind]) >> _dshift;
         }
@@ -1235,8 +1269,10 @@ int Pool_epi8_t<nb>::show_min_lift(long index) {
         for (long i = 0; i < CSD+ID; i++) v_fp[i] = v_fp[i];
         for (long i = CSD+ID; i < FD; i++) v_fp[i] = 0.0f;
         FREE_MAT((void **)b_ext);
+        if (lift_profile) profile_reconstruct = pool_epi8_wall_time() - profile_t0;
 
         // compute v_QP from v_fp
+        profile_t0 = lift_profile ? pool_epi8_wall_time() : 0.0;
         float **tmp1 = (float **) NEW_MAT(CSD+ID, FD8, sizeof(float));
         for (long j = 0; j < CSD+ID; j++){
             double x = sqrt((basis->get_B()).hi[j+index]) * _ratio;
@@ -1250,13 +1286,15 @@ int Pool_epi8_t<nb>::show_min_lift(long index) {
             red(v_QP.hi, v_QP.lo, b_QP.hi[index_r-i-1], b_QP.lo[index_r-i-1], q, basis->NumCols());
         }
         FREE_MAT(tmp1);
-        
+
         for (long i = index - 1; i >= 0; i--) {
             int32_t c = round(dot_avx2(v_QP.hi, basis->get_b_star().hi[i], basis->NumCols()) / basis->get_B().hi[i]);
             red(v_QP.hi, v_QP.lo, b_QP.hi[i], b_QP.lo[i], NTL::quad_float(c), basis->NumCols());
         }
+        if (lift_profile) profile_qp_build = pool_epi8_wall_time() - profile_t0;
     } while (0);
 
+    profile_t0 = lift_profile ? pool_epi8_wall_time() : 0.0;
     const double euclidean_norm = sqrt(dot_avx2(v_QP.hi, v_QP.hi, basis->NumCols()));
     const double lift_norm = sqrt(min_norm);
     const double gh = basis->gh(index, index_r);
@@ -1273,6 +1311,16 @@ int Pool_epi8_t<nb>::show_min_lift(long index) {
            euclidean_norm, lift_norm, gh, approx);
     PRINT_VEC(v_QP.hi, basis->NumCols());
     fflush(stdout);
+    if (lift_profile) {
+        profile_norm_record = pool_epi8_wall_time() - profile_t0;
+        fprintf(stderr,
+                "show_min_lift_profile: nb=%u index=%ld csd=%ld fd=%ld id=%ld nvec=%ld "
+                "min_ind=%u length=%.9g setup=%.6fs scan=%.6fs reconstruct=%.6fs "
+                "qp_build=%.6fs norm_record=%.6fs total=%.6fs\n",
+                nb, index, CSD, FD, ID, num_vec, min_ind, euclidean_norm,
+                profile_setup, profile_scan, profile_reconstruct, profile_qp_build,
+                profile_norm_record, pool_epi8_wall_time() - profile_total_t0);
+    }
     FREE_VEC_QP(v_QP);
     return 1;
 }
