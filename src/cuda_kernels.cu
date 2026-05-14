@@ -6560,6 +6560,8 @@ static int bgj_cuda_search_bucket_raw_submit(bgj_cuda_raw_scratch_t *scratch,
             *submitted_overflow =
                 device_overflow || total_results > (uint64_t)result_capacity ||
                 total_results > 0xffffffffull;
+            *scratch->host_result_count = *submitted_result_count;
+            *scratch->host_overflow = *submitted_overflow;
         }
 
         free(h_det_counts);

@@ -24,8 +24,10 @@ extern "C" int bgj_cuda_search_bucket_raw(const int8_t *p_vecs,
                                            uint32_t num_n,
                                            uint32_t vec_length,
                                            int32_t goal_norm,
+                                           uint32_t center_id,
                                            int32_t center_norm,
                                            int record_dp,
+                                           int transform_dp,
                                            bgj_cuda_result_t *results,
                                            uint32_t result_capacity,
                                            uint32_t *result_count,
@@ -43,8 +45,10 @@ extern "C" int bgj_cuda_search_bucket_pool_raw(const int8_t *pool_vecs,
                                                 uint32_t num_n,
                                                 uint32_t vec_length,
                                                 int32_t goal_norm,
+                                                uint32_t center_id,
                                                 int32_t center_norm,
                                                 int record_dp,
+                                                int transform_dp,
                                                 bgj_cuda_result_t *results,
                                                 uint32_t result_capacity,
                                                 uint32_t *result_count,
@@ -63,8 +67,10 @@ extern "C" int bgj_cuda_search_bucket_pool_batch_raw(const int8_t *pool_vecs,
                                                       uint32_t batch_size,
                                                       uint32_t vec_length,
                                                       const int32_t *goal_norm,
+                                                      const uint32_t *center_id,
                                                       const int32_t *center_norm,
                                                       int record_dp,
+                                                      int transform_dp,
                                                       bgj_cuda_result_t *const *results,
                                                       const uint32_t *result_capacity,
                                                       uint32_t *result_count,
@@ -407,8 +413,8 @@ bool run_case(const std::string &name,
                                               bucket.p_ids.data(), bucket.n_ids.data(),
                                               bucket.p_norm.data(), bucket.n_norm.data(),
                                               bucket.p_dot.data(), bucket.n_dot.data(),
-                                              num_p, num_n, vec_length, goal_norm, center_norm,
-                                              record_dp ? 1 : 0, gpu.data(), capacity,
+                                              num_p, num_n, vec_length, goal_norm, 0, center_norm,
+                                              record_dp ? 1 : 0, 0, gpu.data(), capacity,
                                               &result_count, &overflow);
     if (!ok) {
         std::cerr << name << ": CUDA call failed: " << bgj_cuda_raw_last_error() << "\n";
@@ -448,8 +454,8 @@ bool run_deterministic_case()
                                               bucket.p_ids.data(), bucket.n_ids.data(),
                                               bucket.p_norm.data(), bucket.n_norm.data(),
                                               bucket.p_dot.data(), bucket.n_dot.data(),
-                                              num_p, num_n, vec_length, goal_norm, center_norm,
-                                              1, gpu.data(), (uint32_t)gpu.size(),
+                                              num_p, num_n, vec_length, goal_norm, 0, center_norm,
+                                              1, 0, gpu.data(), (uint32_t)gpu.size(),
                                               &result_count, &overflow);
     unsetenv("BGJ_CUDA_DETERMINISTIC_RESULTS");
     if (!ok) {
@@ -479,8 +485,8 @@ bool run_deterministic_case()
                                                        bucket.p_ids.data(), bucket.n_ids.data(),
                                                        bucket.p_norm.data(), bucket.n_norm.data(),
                                                        bucket.p_dot.data(), bucket.n_dot.data(),
-                                                       num_p, num_n, vec_length, goal_norm, center_norm,
-                                                       1, &retained, 1, &result_count, &overflow);
+                                                       num_p, num_n, vec_length, goal_norm, 0, center_norm,
+                                                       1, 0, &retained, 1, &result_count, &overflow);
     unsetenv("BGJ_CUDA_DETERMINISTIC_RESULTS");
     if (!overflow_ok || !overflow || result_count != 1) {
         std::cerr << "deterministic-order: overflow check failed, ok=" << overflow_ok
@@ -510,8 +516,8 @@ bool run_overflow_case()
                                               bucket.p_ids.data(), bucket.n_ids.data(),
                                               bucket.p_norm.data(), bucket.n_norm.data(),
                                               bucket.p_dot.data(), bucket.n_dot.data(),
-                                              num_p, num_n, vec_length, goal_norm, center_norm,
-                                              1, &result, 1, &result_count, &overflow);
+                                              num_p, num_n, vec_length, goal_norm, 0, center_norm,
+                                              1, 0, &result, 1, &result_count, &overflow);
     if (!ok) {
         std::cerr << "overflow: CUDA call failed: " << bgj_cuda_raw_last_error() << "\n";
         return false;
@@ -560,8 +566,8 @@ bool run_pool_case()
                                                    bucket.p_ids.data(), bucket.n_ids.data(),
                                                    bucket.p_norm.data(), bucket.n_norm.data(),
                                                    bucket.p_dot.data(), bucket.n_dot.data(),
-                                                   num_p, num_n, vec_length, goal_norm, center_norm,
-                                                   1, gpu.data(), capacity,
+                                                   num_p, num_n, vec_length, goal_norm, 0, center_norm,
+                                                   1, 0, gpu.data(), capacity,
                                                    &result_count, &overflow);
     if (!ok) {
         std::cerr << "pool-cache: CUDA call failed: " << bgj_cuda_raw_last_error() << "\n";
@@ -616,6 +622,7 @@ bool run_pool_batch_case()
     std::vector<const int32_t *> n_dot(batch_size);
     std::vector<uint32_t> num_p(batch_size);
     std::vector<uint32_t> num_n(batch_size);
+    std::vector<uint32_t> center_id(batch_size, 0);
     std::vector<bgj_cuda_result_t *> result_ptrs(batch_size);
     std::vector<uint32_t> result_capacity(batch_size);
     std::vector<uint32_t> result_count(batch_size);
@@ -640,8 +647,8 @@ bool run_pool_batch_case()
                                                          p_dot.data(), n_dot.data(),
                                                          num_p.data(), num_n.data(),
                                                          batch_size, vec_length,
-                                                         goal_norm.data(), center_norm.data(),
-                                                         1, result_ptrs.data(), result_capacity.data(),
+                                                         goal_norm.data(), center_id.data(), center_norm.data(),
+                                                         1, 0, result_ptrs.data(), result_capacity.data(),
                                                          result_count.data(), overflow.data());
     if (!ok) {
         std::cerr << "pool-batch: CUDA call failed: " << bgj_cuda_raw_last_error() << "\n";

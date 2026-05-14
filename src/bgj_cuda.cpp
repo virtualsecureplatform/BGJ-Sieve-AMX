@@ -952,6 +952,16 @@ static uint32_t bgj_cuda_radix_sort_min_results()
     return min_results;
 }
 
+static int bgj_cuda_radix_sort_verify_requested()
+{
+    static const int requested = []() {
+        const char *env = getenv("BGJ_CUDA_RADIX_SORT_VERIFY");
+        if (env && env[0]) return env[0] != '0' ? 1 : 0;
+        return 0;
+    }();
+    return requested;
+}
+
 static uint32_t bgj_cuda_linear_rank_max_results()
 {
     static const uint32_t max_results = []() {
@@ -1162,6 +1172,40 @@ struct bgj_cuda_result_sort_item_t {
     bgj_cuda_result_t result;
 };
 
+static void bgj_cuda_stdsort_items(std::vector<bgj_cuda_result_sort_item_t> &items,
+                                   std::vector<bgj_cuda_result_sort_item_t> &scratch,
+                                   uint32_t count,
+                                   const uint32_t *phase_count)
+{
+    uint32_t phase_begin[9];
+    phase_begin[0] = 0;
+    for (uint32_t phase = 0; phase < 8; phase++) {
+        phase_begin[phase + 1] = phase_begin[phase] + phase_count[phase];
+    }
+    uint32_t phase_cursor[8];
+    for (uint32_t phase = 0; phase < 8; phase++) {
+        phase_cursor[phase] = phase_begin[phase];
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        const uint32_t phase = (uint32_t)items[i].phase;
+        scratch[phase_cursor[phase]++] = items[i];
+    }
+    for (uint32_t phase = 0; phase < 8; phase++) {
+        bgj_cuda_result_sort_item_t *begin = scratch.data() + phase_begin[phase];
+        bgj_cuda_result_sort_item_t *end = scratch.data() + phase_begin[phase + 1];
+        if (end - begin <= 1) continue;
+        std::sort(begin, end, [](const bgj_cuda_result_sort_item_t &a,
+                                 const bgj_cuda_result_sort_item_t &b) {
+            if (a.rank0 != b.rank0) return a.rank0 < b.rank0;
+            if (a.rank1 != b.rank1) return a.rank1 < b.rank1;
+            if (a.result.type != b.result.type) return a.result.type < b.result.type;
+            if (a.result.x != b.result.x) return a.result.x < b.result.x;
+            return a.result.y < b.result.y;
+        });
+    }
+    items.swap(scratch);
+}
+
 enum bgj_cuda_radix_sort_field_t {
     BGJ_CUDA_SORT_FIELD_Y = 0,
     BGJ_CUDA_SORT_FIELD_X = 1,
@@ -1273,6 +1317,17 @@ static void bgj_cuda_radix_sort_items(std::vector<bgj_cuda_result_sort_item_t> &
     }
 }
 
+static int bgj_cuda_sort_items_equal(const bgj_cuda_result_sort_item_t &a,
+                                     const bgj_cuda_result_sort_item_t &b)
+{
+    return a.phase == b.phase &&
+           a.rank0 == b.rank0 &&
+           a.rank1 == b.rank1 &&
+           a.result.type == b.result.type &&
+           a.result.x == b.result.x &&
+           a.result.y == b.result.y;
+}
+
 template <uint32_t nb, bool record_dp, bool profiling>
 static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
                                          bucket_epi8_t<record_dp> *bkt,
@@ -1314,6 +1369,7 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
         static thread_local std::vector<uint32_t> target_slot;
         static thread_local std::vector<int32_t> target_p_rank;
         static thread_local std::vector<int32_t> target_n_rank;
+        static thread_local std::vector<bgj_cuda_result_sort_item_t> sort_verify_items;
         static thread_local uint32_t rank_epoch = 1;
         static thread_local uint32_t target_epoch = 1;
 
@@ -1482,6 +1538,14 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
                                    result_count >= bgj_cuda_radix_sort_min_results();
         if (use_radix_sort) {
             consume_used_radix = 1;
+            if (bgj_cuda_radix_sort_verify_requested()) {
+                try {
+                    sort_verify_items.assign(sort_items.begin(),
+                                             sort_items.begin() + result_count);
+                } catch (...) {
+                    sort_verify_items.clear();
+                }
+            }
             const double radix_t0 = consume_profile ? bgj_cuda_host_wall_time() : 0.0;
             bgj_cuda_radix_sort_items(sort_items,
                                       sort_phase_items,
@@ -1495,36 +1559,59 @@ static int bgj_cuda_consume_bgj1_results(Pool_epi8_t<nb> *pool,
             if (consume_profile) {
                 consume_radix_sec += bgj_cuda_host_wall_time() - radix_t0;
             }
+            if (!sort_verify_items.empty()) {
+                std::vector<bgj_cuda_result_sort_item_t> verify_scratch;
+                try {
+                    verify_scratch.resize((size_t)result_count);
+                    bgj_cuda_stdsort_items(sort_verify_items,
+                                           verify_scratch,
+                                           result_count,
+                                           phase_count);
+                } catch (...) {
+                    sort_verify_items.clear();
+                    verify_scratch.clear();
+                }
+                if (!sort_verify_items.empty()) {
+                    uint32_t mismatch = result_count;
+                    for (uint32_t i = 0; i < result_count; i++) {
+                        if (!bgj_cuda_sort_items_equal(sort_items[i], sort_verify_items[i])) {
+                            mismatch = i;
+                            break;
+                        }
+                    }
+                    static int verify_reported = 0;
+                    if (mismatch != result_count &&
+                        __sync_bool_compare_and_swap(&verify_reported, 0, 1)) {
+                        const bgj_cuda_result_sort_item_t &r = sort_items[mismatch];
+                        const bgj_cuda_result_sort_item_t &s = sort_verify_items[mismatch];
+                        fprintf(stderr,
+                                "BGJ_CUDA_RADIX_SORT_VERIFY mismatch count=%u index=%u "
+                                "radix=(p=%d r0=%d r1=%d t=%u x=%u y=%u) "
+                                "std=(p=%d r0=%d r1=%d t=%u x=%u y=%u)\n",
+                                result_count,
+                                mismatch,
+                                r.phase,
+                                r.rank0,
+                                r.rank1,
+                                r.result.type,
+                                r.result.x,
+                                r.result.y,
+                                s.phase,
+                                s.rank0,
+                                s.rank1,
+                                s.result.type,
+                                s.result.x,
+                                s.result.y);
+                    }
+                    sort_verify_items.clear();
+                }
+            }
         } else {
             const double stdsort_t0 = consume_profile ? bgj_cuda_host_wall_time() : 0.0;
-            uint32_t phase_begin[9];
-            phase_begin[0] = 0;
-            for (uint32_t phase = 0; phase < 8; phase++) {
-                phase_begin[phase + 1] = phase_begin[phase] + phase_count[phase];
-            }
-            uint32_t phase_cursor[8];
-            for (uint32_t phase = 0; phase < 8; phase++) {
-                phase_cursor[phase] = phase_begin[phase];
-            }
-            for (uint32_t i = 0; i < result_count; i++) {
-                const uint32_t phase = (uint32_t)sort_items[i].phase;
-                sort_phase_items[phase_cursor[phase]++] = sort_items[i];
-            }
-            for (uint32_t phase = 0; phase < 8; phase++) {
-                bgj_cuda_result_sort_item_t *begin = sort_phase_items.data() + phase_begin[phase];
-                bgj_cuda_result_sort_item_t *end = sort_phase_items.data() + phase_begin[phase + 1];
-                if (end - begin <= 1) continue;
-                std::sort(begin, end,
-                          [](const bgj_cuda_result_sort_item_t &a,
-                             const bgj_cuda_result_sort_item_t &b) {
-                              if (a.rank0 != b.rank0) return a.rank0 < b.rank0;
-                              if (a.rank1 != b.rank1) return a.rank1 < b.rank1;
-                              if (a.result.type != b.result.type) return a.result.type < b.result.type;
-                              if (a.result.x != b.result.x) return a.result.x < b.result.x;
-                              return a.result.y < b.result.y;
-                          });
-            }
-            sort_items.swap(sort_phase_items);
+            bgj_cuda_stdsort_items(sort_items,
+                                   sort_phase_items,
+                                   result_count,
+                                   phase_count);
             if (consume_profile) {
                 consume_stdsort_sec += bgj_cuda_host_wall_time() - stdsort_t0;
             }
