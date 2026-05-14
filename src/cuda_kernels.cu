@@ -572,9 +572,48 @@ static uint64_t bgj_cuda_env_u64(const char *name, uint64_t default_value)
     return (uint64_t)value;
 }
 
+static int bgj_cuda_env_has_multiple_devices(const char *env)
+{
+    if (!env || !env[0]) return 0;
+    int count = 0;
+    const char *p = env;
+    while (*p) {
+        char *end = NULL;
+        (void)strtol(p, &end, 10);
+        if (end != p) {
+            ++count;
+            if (count > 1) return 1;
+            p = end;
+        } else {
+            ++p;
+        }
+        while (*p == ',' || *p == ';' || *p == ':' ||
+               *p == ' ' || *p == '\t') {
+            ++p;
+        }
+    }
+    return 0;
+}
+
+static int bgj_cuda_explicit_multi_gpu_requested()
+{
+    if (bgj_cuda_env_has_multiple_devices(getenv("BGJ_CUDA_DEVICES"))) {
+        return 1;
+    }
+    const char *num_env = getenv("BGJ_CUDA_NUM_DEVICES");
+    if (num_env && num_env[0]) {
+        char *end = NULL;
+        const long value = strtol(num_env, &end, 10);
+        if (end != num_env && value > 1) return 1;
+    }
+    return 0;
+}
+
 static int bgj_cuda_stable_multi_gpu_requested()
 {
-    return bgj_cuda_env_flag("BGJ_CUDA_STABLE_MULTI_GPU", 0);
+    const char *env = getenv("BGJ_CUDA_STABLE_MULTI_GPU");
+    if (env && env[0]) return env[0] != '0';
+    return bgj_cuda_explicit_multi_gpu_requested();
 }
 
 static int bgj_cuda_primary_thread_device_requested(int device_count)
@@ -5676,7 +5715,8 @@ static int bgj_cuda_multi_gpu_batch_tensor_split_requested()
 
 static int bgj_cuda_single_bucket_split_requested()
 {
-    return bgj_cuda_env_flag("BGJ_CUDA_SINGLE_BUCKET_SPLIT", 0);
+    return bgj_cuda_env_flag("BGJ_CUDA_SINGLE_BUCKET_SPLIT",
+                             bgj_cuda_stable_multi_gpu_requested());
 }
 
 static int bgj_cuda_single_bucket_tensor_split_requested()
@@ -5686,8 +5726,11 @@ static int bgj_cuda_single_bucket_tensor_split_requested()
 
 static uint64_t bgj_cuda_single_bucket_split_min_dots()
 {
+    const uint64_t default_value = bgj_cuda_stable_multi_gpu_requested() ?
+                                   16000000ULL :
+                                   64ULL * 1024ULL * 1024ULL;
     return bgj_cuda_env_u64("BGJ_CUDA_SINGLE_BUCKET_SPLIT_MIN_DOTS",
-                            64ULL * 1024ULL * 1024ULL);
+                            default_value);
 }
 
 static int bgj_cuda_tensor_same_requested()

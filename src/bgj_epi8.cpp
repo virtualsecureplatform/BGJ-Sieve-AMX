@@ -85,6 +85,45 @@ static int bgj_epi8_cuda_work_sort_requested()
     return 0;
 }
 
+static int bgj_epi8_cuda_env_has_multiple_devices(const char *env)
+{
+    if (!env || !env[0]) return 0;
+    int count = 0;
+    const char *p = env;
+    while (*p) {
+        char *end = NULL;
+        (void)strtol(p, &end, 10);
+        if (end != p) {
+            ++count;
+            if (count > 1) return 1;
+            p = end;
+        } else {
+            ++p;
+        }
+        while (*p == ',' || *p == ';' || *p == ':' ||
+               *p == ' ' || *p == '\t') {
+            ++p;
+        }
+    }
+    return 0;
+}
+
+static int bgj_epi8_cuda_stable_multi_gpu_default()
+{
+    const char *env = getenv("BGJ_CUDA_STABLE_MULTI_GPU");
+    if (env && env[0]) return env[0] != '0';
+    if (bgj_epi8_cuda_env_has_multiple_devices(getenv("BGJ_CUDA_DEVICES"))) {
+        return 1;
+    }
+    const char *num_env = getenv("BGJ_CUDA_NUM_DEVICES");
+    if (num_env && num_env[0]) {
+        char *end = NULL;
+        const long value = strtol(num_env, &end, 10);
+        if (end != num_env && value > 1) return 1;
+    }
+    return 0;
+}
+
 template <bool record_dp>
 static uint64_t bgj_epi8_cuda_bucket_work(const bucket_epi8_t<record_dp> *bucket)
 {
@@ -1568,7 +1607,7 @@ int Pool_epi8_t<nb>::bgj2_Sieve(long log_level, long lps_auto_adj){
                                                        0) : 0;
             const int cuda_bgj2_search0_staged =
                 cuda_bgj2_search0 ? bgj_epi8_env_flag("BGJ_CUDA_BGJ2_SEARCH0_STAGED",
-                                                       0) : 0;
+                                                       bgj_epi8_cuda_stable_multi_gpu_default()) : 0;
             #endif
 
             ///////////////// search0 /////////////////
