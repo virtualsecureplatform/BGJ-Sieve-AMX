@@ -46,6 +46,7 @@ double _solver_time_curr;
 
 long num_threads = 1;
 long profile = 0;
+static Lattice_QP *solver_profile_lattice_current = NULL;
 
 static double solver_now()
 {
@@ -275,10 +276,32 @@ static int solver_svp120_quality_satisfied(Lattice_QP *L, double target, solver_
     return target > 0.0 && candidate.length > 0.0 && candidate.length <= target;
 }
 
+static int solver_profile_best_enabled()
+{
+    return solver_env_flag("BGJ_SOLVER_PROFILE_BEST", 0);
+}
+
+static void solver_profile_best_line(const char *stage)
+{
+    if (!profile || !solver_profile_best_enabled() || solver_profile_lattice_current == NULL) return;
+    solver_best_candidate_t best = solver_find_best_candidate(solver_profile_lattice_current);
+    if (best.has_lsh) {
+        printf("solver_stage_best: stage=\"%s\" basis_best=%.9g lsh_best=%.9g current_best=%.9g source=%s row=%ld\n",
+               stage, best.basis_length, best.lsh_length, best.length,
+               best.source, best.basis_index);
+    } else {
+        printf("solver_stage_best: stage=\"%s\" basis_best=%.9g lsh_best=none current_best=%.9g source=%s row=%ld\n",
+               stage, best.basis_length, best.length, best.source,
+               best.basis_index);
+    }
+    fflush(stdout);
+}
+
 #define SOLVER_PROFILE_DO(label, stmt) do {               \
         double __solver_profile_t0 = solver_now();        \
         stmt;                                             \
         solver_profile_line(label, solver_now() - __solver_profile_t0); \
+        solver_profile_best_line(label);                  \
     } while (0)
 
 int __progressive_LLL(Lattice_QP *L) {
@@ -330,6 +353,7 @@ int __local_dual_pump(Lattice_QP *L, long msd, long d4f, long ind_l, long ind_r)
 }
 
 int _svp_solver_red(Lattice_QP* L, long algo) {
+    solver_profile_lattice_current = L;
     if (algo == SVPALGO_NULL) {
         return 0;
     }

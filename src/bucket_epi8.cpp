@@ -36,6 +36,13 @@ static int bgj_insert_phase_profile_enabled()
     return env[0] != '0';
 }
 
+static int bgj_insert_global_best_enabled()
+{
+    const char *env = getenv("BGJ_INSERT_GLOBAL_BEST");
+    if (!env || !env[0]) return 0;
+    return env[0] != '0';
+}
+
 #if defined(HAVE_CUDA)
 static uint32_t bgj_cuda_bucket_entry_capacity(long batchsize,
                                                long expect_bucket_size,
@@ -3987,6 +3994,138 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
         }
         return vec_to_insert + (uint64_t)ind * vec_length;
     };
+
+    if (bgj_insert_global_best_enabled() && materialized && !staged_materialized && vec_to_insert) {
+        struct global_insert_candidate_t {
+            uint32_t index;
+            int32_t norm;
+            uint64_t uid;
+        };
+
+        const double insert_scan_start = bgj_bucket_wall_time();
+        const int32_t linfty_fail_bound = 1.2 * goal_norm;
+        std::vector<global_insert_candidate_t> candidates;
+        candidates.reserve((size_t)num_total_sol);
+        for (long ind = 0; ind < num_total_sol; ++ind) {
+            if (vnorm_to_insert[ind] > linfty_fail_bound) {
+                num_linfty_failed++;
+                if (!uid->erase_uid(vu_to_insert[ind])) insert_uid_erase_fail++;
+                continue;
+            }
+            int r = round(sqrt((10000.0 * vnorm_to_insert[ind]) / goal_norm));
+            if (r > 255) r = 255;
+            if (r < 0) r = 0;
+            length_stat[r]++;
+            candidates.push_back({(uint32_t)ind, vnorm_to_insert[ind], vu_to_insert[ind]});
+        }
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const global_insert_candidate_t &a,
+                     const global_insert_candidate_t &b) {
+                      if (a.norm != b.norm) return a.norm < b.norm;
+                      if (a.uid != b.uid) return a.uid < b.uid;
+                      return a.index < b.index;
+                  });
+
+        long empty_ind = num_vec;
+        const long empty_end_global = num_vec + num_total_empty;
+        long nonempty_ind = sorted_index - 1;
+        const long nonempty_begin_global = sorted_index - num_total_nonempty;
+        auto erase_existing_uid = [&](uint64_t erase_uid) {
+            insert_uid_erase_count++;
+            if (!uid->erase_uid(erase_uid)) insert_uid_erase_fail++;
+        };
+        auto copy_global_insert_vec = [&](int8_t *dst, long src_ind) {
+            insert_copy_count++;
+            copy_avx2(dst, vec_to_insert + (uint64_t)src_ind * vec_length, vec_length);
+        };
+
+        for (size_t order = 0; order < candidates.size(); ++order) {
+            const long ind = candidates[order].index;
+            int accepted = 0;
+            if (nonempty_ind >= nonempty_begin_global) {
+                const uint32_t dst = *((uint32_t *)(cvec + 3LL * nonempty_ind));
+                if (vnorm_to_insert[ind] < vnorm[dst]) {
+                    erase_existing_uid(vu[dst]);
+                    copy_global_insert_vec(vec + dst * vec_length, ind);
+                    vnorm[dst] = vnorm_to_insert[ind];
+                    vu[dst] = vu_to_insert[ind];
+                    vsum[dst] = vsum_to_insert[ind];
+                    int32_t cnorm = ((vnorm[dst] >> 1) > 65535) ? 65535 : (vnorm[dst] >> 1);
+                    cvec[nonempty_ind * 3LL + 2LL] = cnorm;
+                    nonempty_ind--;
+                    num_total_insert++;
+                    accepted = 1;
+                }
+            }
+            if (!accepted && empty_ind < empty_end_global) {
+                copy_global_insert_vec(vec + empty_ind * vec_length, ind);
+                vnorm[empty_ind] = vnorm_to_insert[ind];
+                vsum[empty_ind] = vsum_to_insert[ind];
+                vu[empty_ind] = vu_to_insert[ind];
+                int32_t cnorm = ((vnorm[empty_ind] >> 1) > 65535) ? 65535 : (vnorm[empty_ind] >> 1);
+                cvec[empty_ind * 3LL + 2LL] = cnorm;
+                *((uint32_t *) (cvec + empty_ind * 3LL)) = empty_ind;
+                empty_ind++;
+                num_total_insert++;
+                accepted = 1;
+            }
+            if (!accepted) {
+                num_l2_failed++;
+                if (!uid->erase_uid(vu_to_insert[ind])) insert_uid_erase_fail++;
+            }
+        }
+        num_not_try = (uint64_t)candidates.size() - num_total_insert - num_l2_failed;
+        insert_scan_time = bgj_bucket_wall_time() - insert_scan_start;
+        num_empty -= empty_ind - num_vec;
+        num_vec = empty_ind;
+        sorted_index = nonempty_ind + 1;
+        if (prof) {
+            pthread_spin_lock(&prof->profile_lock);
+            prof->materialize_time += materialize_total_time;
+            prof->materialize_call++;
+            prof->materialize_candidate += (uint64_t)num_total_sol;
+            prof->materialize_gpu_time += materialize_gpu_time;
+            prof->materialize_gpu_call += materialize_gpu_call;
+            prof->materialize_gpu_candidate += materialize_gpu_call ? (uint64_t)num_total_sol : 0;
+            prof->materialize_cpu_time += materialize_cpu_time;
+            prof->materialize_cpu_call += materialize_cpu_call;
+            prof->materialize_cpu_candidate += materialize_cpu_call ? (uint64_t)num_total_sol : 0;
+            prof->materialize_scalar_time += materialize_scalar_time;
+            prof->materialize_scalar_call += materialize_scalar_call;
+            prof->materialize_scalar_candidate += materialize_scalar_call ? (uint64_t)num_total_sol : 0;
+            prof->materialize_cuda_failed_time += materialize_cuda_failed_time;
+            prof->materialize_cuda_failed_call += materialize_cuda_failed_call;
+            prof->materialize_cuda_failed_candidate += materialize_cuda_failed_call ? (uint64_t)num_total_sol : 0;
+            prof->materialize_cuda_pool_time += materialize_cuda_pool_time;
+            prof->materialize_cuda_basis_time += materialize_cuda_basis_time;
+            prof->materialize_cuda_desc_time += materialize_cuda_desc_time;
+            prof->materialize_cuda_build_time += materialize_cuda_build_time;
+            prof->materialize_cuda_gemm_time += materialize_cuda_gemm_time;
+            prof->materialize_cuda_coeff_time += materialize_cuda_coeff_time;
+            prof->materialize_cuda_reconstruct_time += materialize_cuda_reconstruct_time;
+            prof->materialize_cuda_copy_time += materialize_cuda_copy_time;
+            prof->materialize_cuda_phase_chunk += materialize_cuda_phase_chunk;
+            prof->insert_scan_time += insert_scan_time;
+            prof->insert_uid_erase_count += insert_uid_erase_count;
+            prof->insert_uid_erase_fail += insert_uid_erase_fail;
+            prof->insert_copy_count += insert_copy_count;
+            pthread_spin_unlock(&prof->profile_lock);
+        }
+        if (profiling && prof) {
+            prof->insert_inner_log(length_stat, num_linfty_failed, num_l2_failed, num_not_try);
+        }
+        if (vec_to_insert) FREE_VEC((void *)vec_to_insert);
+        if (staged_selected_indices) FREE_VEC((void *)staged_selected_indices);
+        if (staged_selected_pos) FREE_VEC((void *)staged_selected_pos);
+        if (staged_selected_vec) FREE_VEC((void *)staged_selected_vec);
+        if (deferred_uid_erase) FREE_VEC((void *)deferred_uid_erase);
+        if (deferred_shard_counts) FREE_VEC((void *)deferred_shard_counts);
+        FREE_VEC((void *)vu_to_insert);
+        FREE_VEC((void *)vnorm_to_insert);
+        FREE_VEC((void *)vsum_to_insert);
+        if (num_total_insert) mark_pool_dirty();
+        return num_total_insert;
+    }
 
     const double insert_scan_start = bgj_bucket_wall_time();
     #pragma omp parallel for
