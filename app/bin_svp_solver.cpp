@@ -806,6 +806,9 @@ int main(int argc, char** argv) {
         return 2;
         #else
         setenv("BGJ_SVP_CUDA", "1", 1);
+        if (!solver_env_is_set("BGJ_INSERT_GLOBAL_BEST")) {
+            setenv("BGJ_INSERT_GLOBAL_BEST", "1", 1);
+        }
         if (!solver_env_is_set("BGJ_CUDA_LSH_SEARCH")) {
             setenv("BGJ_CUDA_LSH_SEARCH", "1", 0);
         }

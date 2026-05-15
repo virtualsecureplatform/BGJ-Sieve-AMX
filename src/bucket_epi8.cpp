@@ -3734,6 +3734,7 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
     uint64_t insert_uid_erase_fail = 0;
     uint64_t insert_copy_count = 0;
     uint64_t insert_compact_move = 0;
+    const int global_best_insert = bgj_insert_global_best_enabled();
     if (batch_uid_erase && num_total_sol > 0) {
         deferred_uid_erase =
             (uint64_t *)NEW_VEC(num_total_sol, sizeof(uint64_t));
@@ -3995,7 +3996,7 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
         return vec_to_insert + (uint64_t)ind * vec_length;
     };
 
-    if (bgj_insert_global_best_enabled() && materialized && !staged_materialized && vec_to_insert) {
+    if (global_best_insert && materialized && !staged_materialized && vec_to_insert) {
         struct global_insert_candidate_t {
             uint32_t index;
             int32_t norm;
