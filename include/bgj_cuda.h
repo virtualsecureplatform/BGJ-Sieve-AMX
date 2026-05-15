@@ -17,6 +17,18 @@ struct bgj_cuda_result_t {
     uint32_t y;
 };
 
+struct bgj_cuda_lsh_lift_result_t {
+    uint32_t candidate;
+    uint32_t place;
+    float norm;
+};
+
+typedef int (*bgj_cuda_lsh_result_callback_t)(void *ctx,
+                                              const bgj_cuda_result_t *results,
+                                              uint32_t result_count,
+                                              uint64_t tile_slot_begin,
+                                              uint64_t tile_slot_count);
+
 struct bgj_cuda_materialize_desc_t {
     uint32_t type;
     uint32_t x;
@@ -89,6 +101,33 @@ extern "C" int bgj_cuda_lsh_search_range_raw(const uint8_t *sh,
                                               uint32_t result_capacity,
                                               uint32_t *result_count,
                                               int *overflow);
+extern "C" int bgj_cuda_lsh_search_stream_raw(const uint8_t *sh,
+                                               uint32_t mbound,
+                                               uint32_t shsize,
+                                               int32_t threshold,
+                                               uint64_t chunk_tile_slots,
+                                               bgj_cuda_result_t *results,
+                                               uint32_t result_capacity,
+                                               uint64_t *total_result_count,
+                                               int *overflow,
+                                               bgj_cuda_lsh_result_callback_t callback,
+                                               void *callback_ctx);
+extern "C" int bgj_cuda_lsh_lift_raw(const float *fvec,
+                                      uint32_t mbound,
+                                      uint32_t fd,
+                                      uint32_t fd8,
+                                      const uint32_t *candidates,
+                                      uint32_t candidate_count,
+                                      const float *b_full,
+                                      const float *idiag,
+                                      const float *min_norm,
+                                      uint32_t id,
+                                      uint32_t csd,
+                                      float threshold_scale,
+                                      bgj_cuda_lsh_lift_result_t *results,
+                                      uint32_t result_capacity,
+                                      uint32_t *result_count,
+                                      int *overflow);
 
 extern "C" int bgj_cuda_materialize_sol_list_raw(const int8_t *pool_vecs,
                                                   uint64_t pool_epoch,

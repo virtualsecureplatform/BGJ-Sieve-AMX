@@ -77,6 +77,15 @@ static int bgj_epi8_bgj2_cuda_profile_requested()
     return requested;
 }
 
+static int bgj_epi8_bgj3_cuda_profile_requested()
+{
+    static const int requested = []() {
+        const char *env = getenv("BGJ_CUDA_BGJ3_PROFILE");
+        return env && env[0] && env[0] != '0';
+    }();
+    return requested;
+}
+
 #if defined(HAVE_CUDA)
 static int bgj_epi8_cuda_work_sort_requested()
 {
@@ -113,6 +122,39 @@ static void bgj_epi8_cuda_sort_buckets_by_work(bucket_epi8_t<record_dp> **bucket
                  const bucket_epi8_t<record_dp> *b) {
                   return bgj_epi8_cuda_bucket_work(a) < bgj_epi8_cuda_bucket_work(b);
               });
+}
+
+static void bgj_epi8_cuda_sort_bucket_pairs_by_work(bucket_epi8_t<0> **reuse_buckets,
+                                                    bucket_epi8_t<0> **main_buckets,
+                                                    long num_bucket)
+{
+    if (num_bucket <= 1 || !bgj_cuda_search_requested() ||
+        !bgj_epi8_cuda_work_sort_requested()) {
+        return;
+    }
+
+    struct bucket_pair_t {
+        bucket_epi8_t<0> *reuse;
+        bucket_epi8_t<0> *main;
+        uint64_t work;
+    };
+
+    bucket_pair_t pairs[BGJ3_EPI8_BUCKET1_BATCHSIZE];
+    for (long i = 0; i < num_bucket; i++) {
+        pairs[i] = {reuse_buckets[i], main_buckets[i],
+                    bgj_epi8_cuda_bucket_work(reuse_buckets[i]) +
+                    bgj_epi8_cuda_bucket_work(main_buckets[i])};
+    }
+
+    std::sort(pairs, pairs + num_bucket,
+              [](const bucket_pair_t &a, const bucket_pair_t &b) {
+                  return a.work > b.work;
+              });
+
+    for (long i = 0; i < num_bucket; i++) {
+        reuse_buckets[i] = pairs[i].reuse;
+        main_buckets[i] = pairs[i].main;
+    }
 }
 
 static uint32_t bgj2_epi8_cuda_batch_size(uint32_t search_threads)
@@ -558,6 +600,61 @@ void bgj_profile_data_t<nb>::final_log(int bgj, long sieving_stucked) {
                 (unsigned long)cuda_fallback_bucket1,
                 (unsigned long)cuda_fallback_ndp1,
                 cuda_fallback_time1,
+                (unsigned long)try_add2,
+                (unsigned long)try_add3,
+                (unsigned long)succ_add2,
+                (unsigned long)succ_add3);
+    }
+    if (bgj == 3 && bgj_epi8_bgj3_cuda_profile_requested() && p->CSD > MIN_LOG_CSD) {
+        fprintf(log_err,
+                "bgj3_cuda_profile: csd=%ld bucket0_wall=%.6fs bucket1_wall=%.6fs "
+                "bucket2_wall=%.6fs search0_wall=%.6fs search1_wall=%.6fs "
+                "search2_wall=%.6fs sort=%.6fs insert=%.6fs "
+                "search0_ndp=%lu search1_ndp=%lu search2_ndp=%lu "
+                "cuda0_single=%lu/%lu/%.6fs cuda0_cred=%.6fs "
+                "cuda0_fallback=%lu/%lu/%.6fs "
+                "cuda1_single=%lu/%lu/%.6fs cuda1_cred=%.6fs "
+                "cuda1_fallback=%lu/%lu/%.6fs "
+                "cuda2_single=%lu/%lu/%.6fs cuda2_batch=%lu/%lu/%lu/%.6fs "
+                "cuda2_cred=%.6fs cuda2_fallback=%lu/%lu/%.6fs "
+                "try_add2=%lu try_add3=%lu succ_add2=%lu succ_add3=%lu\n",
+                p->CSD,
+                bucket0_time,
+                bucket1_time,
+                bucket2_time,
+                search0_time,
+                search1_time,
+                search2_time,
+                sort_time,
+                insert_time,
+                (unsigned long)search0_ndp,
+                (unsigned long)search1_ndp,
+                (unsigned long)search2_ndp,
+                (unsigned long)cuda_single_bucket0,
+                (unsigned long)cuda_single_ndp0,
+                cuda_single_time0,
+                cuda_cred_time0,
+                (unsigned long)cuda_fallback_bucket0,
+                (unsigned long)cuda_fallback_ndp0,
+                cuda_fallback_time0,
+                (unsigned long)cuda_single_bucket1,
+                (unsigned long)cuda_single_ndp1,
+                cuda_single_time1,
+                cuda_cred_time1,
+                (unsigned long)cuda_fallback_bucket1,
+                (unsigned long)cuda_fallback_ndp1,
+                cuda_fallback_time1,
+                (unsigned long)cuda_single_bucket2,
+                (unsigned long)cuda_single_ndp2,
+                cuda_single_time2,
+                (unsigned long)cuda_batch_call2,
+                (unsigned long)cuda_batch_bucket2,
+                (unsigned long)cuda_batch_ndp2,
+                cuda_batch_time2,
+                cuda_cred_time2,
+                (unsigned long)cuda_fallback_bucket2,
+                (unsigned long)cuda_fallback_ndp2,
+                cuda_fallback_time2,
                 (unsigned long)try_add2,
                 (unsigned long)try_add3,
                 (unsigned long)succ_add2,
@@ -2607,6 +2704,9 @@ int Pool_epi8_t<nb>::bgj3_Sieve(long log_level, long lps_auto_adj){
             }
             local_profile.template pool_bucket_check<BGJ3_EPI8_REUSE0_USE_3RED>(rbucket0, BGJ3_EPI8_BUCKET0_BATCHSIZE, alpha_r0);
             local_profile.template pool_bucket_check<0>(bucket0, BGJ3_EPI8_BUCKET0_BATCHSIZE, alpha_b0);
+            #if defined(HAVE_CUDA)
+            bgj_epi8_cuda_sort_buckets_by_work<BGJ3_EPI8_REUSE0_USE_3RED>(rbucket0, BGJ3_EPI8_BUCKET0_BATCHSIZE);
+            #endif
 
             ///////////// bucket1 --> search while bucket2 //////////////
             bucket_epi8_t<0> *rbucket1[BGJ3_EPI8_BUCKET0_BATCHSIZE * BGJ3_EPI8_BUCKET1_BATCHSIZE] = {};
@@ -2815,6 +2915,12 @@ int Pool_epi8_t<nb>::bgj3_Sieve(long log_level, long lps_auto_adj){
                         for (long j = 0; j < BGJ3_EPI8_BUCKET1_BATCHSIZE; j++) {
                             if (bucket1[ind * BGJ3_EPI8_BUCKET1_BATCHSIZE + j]) num_bucket1_done++;
                         }
+                        #if defined(HAVE_CUDA)
+                        bgj_epi8_cuda_sort_bucket_pairs_by_work(
+                            &rbucket1[ind * BGJ3_EPI8_BUCKET1_BATCHSIZE],
+                            &bucket1[ind * BGJ3_EPI8_BUCKET1_BATCHSIZE],
+                            BGJ3_EPI8_BUCKET1_BATCHSIZE);
+                        #endif
                         rbucket1_nrem[ind] = num_bucket1_done;
                     }
                     TIMER_END;

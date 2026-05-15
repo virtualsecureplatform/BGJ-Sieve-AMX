@@ -152,6 +152,102 @@ static inline int lsh_lift_detail_profile_enabled()
     return env != NULL && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
 }
 
+#if defined(HAVE_CUDA)
+static inline int lsh_cuda_lift_enabled()
+{
+    const char *env = getenv("BGJ_CUDA_LSH_LIFT");
+    return env != NULL && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
+}
+
+static inline int lsh_cuda_lift_verify_enabled()
+{
+    const char *env = getenv("BGJ_CUDA_LSH_LIFT_VERIFY");
+    return env != NULL && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
+}
+
+static inline int lsh_cuda_lift_verify_improved_only()
+{
+    const char *env = getenv("BGJ_CUDA_LSH_LIFT_VERIFY_IMPROVED_ONLY");
+    return env != NULL && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
+}
+
+static inline int lsh_cuda_lift_cpu_fallback_enabled()
+{
+    const char *env = getenv("BGJ_CUDA_LSH_LIFT_CPU_FALLBACK");
+    return env == NULL || env[0] == '\0' || !(env[0] == '0' && env[1] == '\0');
+}
+
+static inline long lsh_cuda_lift_env_long(const char *name, long fallback)
+{
+    const char *env = getenv(name);
+    if (env != NULL && env[0] != '\0') return strtol(env, NULL, 10);
+    return fallback;
+}
+
+static inline int lsh_cuda_lift_match_exact(const char *name, long value)
+{
+    const long expected = lsh_cuda_lift_env_long(name, -1);
+    return expected < 0 || expected == value;
+}
+
+static inline int lsh_cuda_lift_match_range(const char *min_name, const char *max_name, long value)
+{
+    const long min_value = lsh_cuda_lift_env_long(min_name, -1);
+    const long max_value = lsh_cuda_lift_env_long(max_name, -1);
+    if (min_value >= 0 && value < min_value) return 0;
+    if (max_value >= 0 && value > max_value) return 0;
+    return 1;
+}
+
+static inline int lsh_cuda_lift_context_allowed(long target_index, long fd, long id, long csd)
+{
+    if (!lsh_cuda_lift_match_exact("BGJ_CUDA_LSH_LIFT_ONLY_TARGET", target_index)) return 0;
+    if (!lsh_cuda_lift_match_exact("BGJ_CUDA_LSH_LIFT_ONLY_FD", fd)) return 0;
+    if (!lsh_cuda_lift_match_exact("BGJ_CUDA_LSH_LIFT_ONLY_ID", id)) return 0;
+    if (!lsh_cuda_lift_match_exact("BGJ_CUDA_LSH_LIFT_ONLY_CSD", csd)) return 0;
+    if (!lsh_cuda_lift_match_range("BGJ_CUDA_LSH_LIFT_MIN_TARGET", "BGJ_CUDA_LSH_LIFT_MAX_TARGET", target_index)) return 0;
+    if (!lsh_cuda_lift_match_range("BGJ_CUDA_LSH_LIFT_MIN_FD", "BGJ_CUDA_LSH_LIFT_MAX_FD", fd)) return 0;
+    if (!lsh_cuda_lift_match_range("BGJ_CUDA_LSH_LIFT_MIN_ID", "BGJ_CUDA_LSH_LIFT_MAX_ID", id)) return 0;
+    if (!lsh_cuda_lift_match_range("BGJ_CUDA_LSH_LIFT_MIN_CSD", "BGJ_CUDA_LSH_LIFT_MAX_CSD", csd)) return 0;
+    return 1;
+}
+
+static inline uint64_t lsh_cuda_lift_min_candidates()
+{
+    const char *env = getenv("BGJ_CUDA_LSH_LIFT_MIN_CANDIDATES");
+    if (env != NULL && env[0] != '\0') {
+        unsigned long long value = strtoull(env, NULL, 10);
+        if (value > 0) return (uint64_t)value;
+    }
+    return 65536u;
+}
+
+static inline uint32_t lsh_cuda_lift_max_results()
+{
+    const char *env = getenv("BGJ_CUDA_LSH_LIFT_MAX_RESULTS");
+    if (env != NULL && env[0] != '\0') {
+        unsigned long value = strtoul(env, NULL, 10);
+        if (value > 0 && value <= 0xffffffffUL) return (uint32_t)value;
+    }
+    return 1u << 20;
+}
+
+static inline long lsh_cuda_lift_verify_sample()
+{
+    return lsh_cuda_lift_env_long("BGJ_CUDA_LSH_LIFT_VERIFY_SAMPLE", 0);
+}
+
+static inline float lsh_cuda_lift_threshold_scale()
+{
+    const char *env = getenv("BGJ_CUDA_LSH_LIFT_THRESHOLD_SCALE");
+    if (env != NULL && env[0] != '\0') {
+        const float value = strtof(env, NULL);
+        if (value > 0.0f) return value;
+    }
+    return 1.0001f;
+}
+#endif
+
 static uint64_t lsh_count_unique_endpoints(const uint32_t *ptr_buffer,
                                            uint64_t begin,
                                            uint64_t end,
@@ -260,6 +356,22 @@ static inline uint64_t lsh_cuda_chunk_tiles()
         if (value > 0) return (uint64_t)value;
     }
     return 65536u;
+}
+
+static inline int lsh_cuda_stream_enabled()
+{
+    const char *env = getenv("BGJ_CUDA_LSH_STREAM");
+    return env != NULL && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
+}
+
+static inline uint64_t lsh_cuda_stream_chunk_tiles()
+{
+    const char *env = getenv("BGJ_CUDA_LSH_STREAM_CHUNK_SLOTS");
+    if (env != NULL && env[0] != '\0') {
+        unsigned long long value = strtoull(env, NULL, 10);
+        if (value > 0) return (uint64_t)value;
+    }
+    return lsh_cuda_chunk_tiles();
 }
 
 static inline int lsh_append_cuda_results(uint32_t **ptr_buffer,
@@ -1376,6 +1488,151 @@ int Pool_epi8_t<nb>::__mblock_sh_search(lsh_mblock_t mb, int32_t threshold, uint
         if (!cuda_results.empty()) {
             uint32_t result_count = 0;
             int overflow = 0;
+            if (lsh_cuda_stream_enabled()) {
+                struct lsh_cuda_stream_context_t {
+                    Pool_epi8_t<nb> *pool;
+                    lsh_mblock_t mb;
+                    long target_index;
+                    uint32_t dh_dim;
+                    float **b_full_fp;
+                    uint32_t **ptr_buffer;
+                    long *ptr_buffer_size;
+                    long *ptr_buffer_num;
+                    float *min_norm;
+                    float **min_vec;
+                    pthread_spinlock_t *min_lock;
+                    lsh_profile_data_t *profile_data;
+                    int detailed_profile;
+                    uint64_t chunk_results_total;
+                    uint64_t chunks;
+                    int failed;
+                } stream_ctx = {
+                    this,
+                    mb,
+                    target_index,
+                    dh_dim,
+                    b_full_fp,
+                    &_ptr_buffer,
+                    &_ptr_buffer_size,
+                    &_ptr_buffer_num,
+                    min_norm,
+                    min_vec,
+                    &min_lock,
+                    profile_data,
+                    detailed_profile,
+                    0,
+                    0,
+                    0
+                };
+                bgj_cuda_lsh_result_callback_t stream_callback =
+                    [](void *opaque,
+                       const bgj_cuda_result_t *results,
+                       uint32_t count,
+                       uint64_t,
+                       uint64_t) -> int {
+                        lsh_cuda_stream_context_t *ctx =
+                            (lsh_cuda_stream_context_t *)opaque;
+                        if (!ctx || ctx->failed) return 0;
+                        if (!lsh_append_cuda_results(ctx->ptr_buffer,
+                                                     ctx->ptr_buffer_size,
+                                                     ctx->ptr_buffer_num,
+                                                     results,
+                                                     count)) {
+                            ctx->failed = 1;
+                            return 0;
+                        }
+                        ctx->chunk_results_total += count;
+                        ctx->chunks++;
+                        ctx->profile_data->observe_buffer(*ctx->ptr_buffer_num);
+                        if (*ctx->ptr_buffer_num > 1048576) {
+                            const uint64_t flushed = (uint64_t)*ctx->ptr_buffer_num;
+                            const double lift_start =
+                                ctx->detailed_profile ? lsh_wall_time() : 0.0;
+                            ctx->pool->__lift_buffer(ctx->mb,
+                                                      ctx->target_index,
+                                                      ctx->dh_dim,
+                                                      ctx->b_full_fp,
+                                                      ctx->ptr_buffer,
+                                                      (uint64_t *)ctx->ptr_buffer_size,
+                                                      (uint64_t *)ctx->ptr_buffer_num,
+                                                      ctx->min_norm,
+                                                      ctx->min_vec,
+                                                      *ctx->min_lock,
+                                                      ctx->profile_data);
+                            const double lift_elapsed =
+                                ctx->detailed_profile ? lsh_wall_time() - lift_start : 0.0;
+                            pthread_spin_lock(&ctx->profile_data->profile_lock);
+                            ctx->profile_data->lift_flushes++;
+                            ctx->profile_data->inline_lift_time += lift_elapsed;
+                            if (flushed > ctx->profile_data->max_buffer_entries) {
+                                ctx->profile_data->max_buffer_entries = flushed;
+                            }
+                            pthread_spin_unlock(&ctx->profile_data->profile_lock);
+                        }
+                        return 1;
+                    };
+                uint64_t stream_result_count = 0;
+                double stream_start = detailed_profile ? lsh_wall_time() : 0.0;
+                int stream_ok = bgj_cuda_lsh_search_stream_raw(mb.sh,
+                                                               (uint32_t)mb.Mbound,
+                                                               shsize,
+                                                               threshold,
+                                                               lsh_cuda_stream_chunk_tiles(),
+                                                               cuda_results.data(),
+                                                               result_capacity,
+                                                               &stream_result_count,
+                                                               &overflow,
+                                                               stream_callback,
+                                                               &stream_ctx);
+                const double stream_elapsed =
+                    detailed_profile ? lsh_wall_time() - stream_start : 0.0;
+                pthread_spin_lock(&profile_data->profile_lock);
+                profile_data->cuda_attempts++;
+                profile_data->cuda_time += stream_elapsed;
+                if (stream_ok && !overflow && !stream_ctx.failed) {
+                    profile_data->cuda_successes++;
+                    profile_data->cuda_pairs += mb_pairs;
+                } else if (stream_ok && overflow) {
+                    profile_data->cuda_overflows++;
+                } else {
+                    profile_data->cuda_errors++;
+                }
+                pthread_spin_unlock(&profile_data->profile_lock);
+                if (stream_ok && !overflow && !stream_ctx.failed) {
+                    profile_data->observe_buffer(_ptr_buffer_num);
+                    pthread_spin_lock(&profile_data->profile_lock);
+                    profile_data->dp_ops += mb_pairs;
+                    profile_data->num_mblock++;
+                    pthread_spin_unlock(&profile_data->profile_lock);
+                    *ptr_buffer = _ptr_buffer;
+                    *ptr_buffer_size = _ptr_buffer_size;
+                    *ptr_buffer_num = _ptr_buffer_num;
+                    if (detailed_profile) {
+                        fprintf(stderr,
+                                "lsh_cuda_stream_search: mbound=%ld threshold=%d results=%llu chunks=%llu elapsed=%.6fs\n",
+                                mb.Mbound,
+                                threshold,
+                                (unsigned long long)stream_result_count,
+                                (unsigned long long)stream_ctx.chunks,
+                                stream_elapsed);
+                    }
+                    return 1;
+                }
+                if (detailed_profile) {
+                    fprintf(stderr,
+                            "lsh_cuda_stream_fallback: mbound=%ld threshold=%d ok=%d overflow=%d results=%llu failed=%d error=%s\n",
+                            mb.Mbound,
+                            threshold,
+                            stream_ok,
+                            overflow,
+                            (unsigned long long)stream_result_count,
+                            stream_ctx.failed,
+                            bgj_cuda_last_error());
+                }
+                if (stream_ctx.chunk_results_total || stream_ctx.failed || overflow) {
+                    return 0;
+                }
+            }
             double cuda_start = detailed_profile ? lsh_wall_time() : 0.0;
             int cuda_ok = bgj_cuda_lsh_search_raw(mb.sh,
                                                   (uint32_t)mb.Mbound,
@@ -1691,7 +1948,186 @@ int Pool_epi8_t<nb>::__lift_buffer(lsh_mblock_t mb, long target_index, uint32_t 
 
         // main lifting
         profile_t0 = lift_profile ? lsh_wall_time() : 0.0;
-        do {
+        int cuda_lift_used = 0;
+#if defined(HAVE_CUDA)
+        uint32_t cuda_lift_result_count = 0;
+        int cuda_lift_overflow = 0;
+        uint32_t cuda_lift_verified = 0;
+        int cuda_lift_ok = 0;
+        int cuda_lift_gpu_used = 0;
+        int cuda_lift_cpu_fallback = 0;
+        uint32_t cuda_lift_min_updates = 0;
+        const int cuda_lift_context_ok = lsh_cuda_lift_enabled() &&
+                                         lsh_cuda_lift_context_allowed(target_index, FD, ID, CSD);
+        const int cuda_lift_verify = cuda_lift_context_ok && lsh_cuda_lift_verify_enabled();
+        int cuda_lift_verify_active = cuda_lift_verify;
+        if (cuda_lift_verify) {
+            const long sample_limit = lsh_cuda_lift_verify_sample();
+            if (sample_limit > 0) {
+                static thread_local long cuda_lift_verify_last_target = -1;
+                static thread_local long cuda_lift_verify_last_fd = -1;
+                static thread_local long cuda_lift_verify_last_id = -1;
+                static thread_local long cuda_lift_verify_last_csd = -1;
+                static thread_local long cuda_lift_verify_samples = 0;
+                if (cuda_lift_verify_last_target != target_index ||
+                    cuda_lift_verify_last_fd != FD ||
+                    cuda_lift_verify_last_id != ID ||
+                    cuda_lift_verify_last_csd != CSD) {
+                    cuda_lift_verify_last_target = target_index;
+                    cuda_lift_verify_last_fd = FD;
+                    cuda_lift_verify_last_id = ID;
+                    cuda_lift_verify_last_csd = CSD;
+                    cuda_lift_verify_samples = 0;
+                }
+                if (cuda_lift_verify_samples >= sample_limit) {
+                    cuda_lift_verify_active = 0;
+                } else {
+                    cuda_lift_verify_samples++;
+                }
+            }
+        }
+        uint32_t cuda_lift_verify_misses = 0;
+        uint32_t cuda_lift_verify_gpu_only = 0;
+        float cuda_lift_verify_best_delta = 0.0f;
+        float cuda_lift_verify_gpu_delta = 0.0f;
+        static thread_local std::vector<float> cuda_lift_verify_start_norm;
+        if (cuda_lift_verify_active) {
+            try {
+                cuda_lift_verify_start_norm.assign(_min_norm, _min_norm + ID);
+            } catch (...) {
+                cuda_lift_verify_start_norm.clear();
+            }
+        } else {
+            cuda_lift_verify_start_norm.clear();
+        }
+        if (cuda_lift_context_ok && !cuda_lift_verify &&
+            ptr_buffer_num[thread] >= lsh_cuda_lift_min_candidates() &&
+            ptr_buffer_num[thread] <= 0xffffffffULL &&
+            mb.Mbound > 0 && mb.Mbound <= 0xffffffffL &&
+            FD > 0 && FD <= 160 && FD8 <= 160 && ID > 0 && CSD > 0 && CSD <= FD) {
+            static thread_local std::vector<float> cuda_lift_basis;
+            static thread_local std::vector<float> cuda_lift_idiag;
+            static thread_local std::vector<bgj_cuda_lsh_lift_result_t> cuda_lift_results;
+            const uint32_t cuda_result_capacity = lsh_cuda_lift_max_results();
+            int cuda_lift_alloc_ok = 1;
+            try {
+                cuda_lift_basis.resize((size_t)FD * (size_t)FD8);
+                cuda_lift_idiag.resize((size_t)FD);
+                cuda_lift_results.resize((size_t)cuda_result_capacity);
+            } catch (...) {
+                cuda_lift_basis.clear();
+                cuda_lift_idiag.clear();
+                cuda_lift_results.clear();
+                cuda_lift_alloc_ok = 0;
+            }
+            if (cuda_lift_alloc_ok && cuda_result_capacity > 0 && !cuda_lift_results.empty()) {
+                for (long i = 0; i < FD; i++) {
+                    cuda_lift_idiag[(size_t)i] = 1.0f / b_full_fp[i][i];
+                    for (long j = 0; j < FD8; j++) {
+                        cuda_lift_basis[(size_t)i * (size_t)FD8 + (size_t)j] = b_full_fp[i][j];
+                    }
+                }
+                cuda_lift_ok = bgj_cuda_lsh_lift_raw(mb.fvec,
+                                                     (uint32_t)mb.Mbound,
+                                                     (uint32_t)FD,
+                                                     (uint32_t)FD8,
+                                                     ptr_buffer[thread],
+                                                     (uint32_t)ptr_buffer_num[thread],
+                                                     cuda_lift_basis.data(),
+                                                     cuda_lift_idiag.data(),
+                                                     _min_norm,
+                                                     (uint32_t)ID,
+                                                     (uint32_t)CSD,
+                                                     lsh_cuda_lift_threshold_scale(),
+                                                     cuda_lift_results.data(),
+                                                     cuda_result_capacity,
+                                                     &cuda_lift_result_count,
+                                                     &cuda_lift_overflow);
+                if (cuda_lift_ok && !cuda_lift_overflow) {
+                    std::sort(cuda_lift_results.begin(),
+                              cuda_lift_results.begin() + cuda_lift_result_count,
+                              [](const bgj_cuda_lsh_lift_result_t &a,
+                                 const bgj_cuda_lsh_lift_result_t &b) {
+                                  if (a.candidate != b.candidate) return a.candidate < b.candidate;
+                                  return a.place < b.place;
+                              });
+
+                    const long LD = FD - CSD;
+                    float *ftmp = (float *) NEW_VEC(FD8, sizeof(float));
+                    float *ftmpp = (float *) NEW_VEC(FD8, sizeof(float));
+                    if (ftmp != NULL && ftmpp != NULL) {
+                        uint32_t last_candidate = 0xffffffffu;
+                        for (uint32_t r = 0; r < cuda_lift_result_count; r++) {
+                            const uint32_t candidate = cuda_lift_results[r].candidate;
+                            if (candidate == last_candidate) continue;
+                            last_candidate = candidate;
+                            if (candidate >= ptr_buffer_num[thread]) continue;
+                            cuda_lift_verified++;
+                            if (ptr_buffer[thread][(uint64_t)candidate * 3u]) {
+                                sub_avx2(ftmp,
+                                         mb.fvec + (uint64_t)ptr_buffer[thread][(uint64_t)candidate * 3u + 1u] * FD8,
+                                         mb.fvec + (uint64_t)ptr_buffer[thread][(uint64_t)candidate * 3u + 2u] * FD8,
+                                         FD8);
+                            } else {
+                                add_avx2(ftmp,
+                                         mb.fvec + (uint64_t)ptr_buffer[thread][(uint64_t)candidate * 3u + 1u] * FD8,
+                                         mb.fvec + (uint64_t)ptr_buffer[thread][(uint64_t)candidate * 3u + 2u] * FD8,
+                                         FD8);
+                            }
+                            float curr_norm0 = dot_aux2(ftmp + LD, ftmp + LD, CSD);
+                            for (long i = LD - 1; i >= 0; i--) {
+                                float q = round(ftmp[i] * cuda_lift_idiag[(size_t)i]);
+                                red_avx2(ftmp, b_full_fp[i], q, i+1);
+                                curr_norm0 += ftmp[i] * ftmp[i];
+                                if (i >= ID) continue;
+                                if (curr_norm0 < _min_norm[i]) {
+                                    int has_one = 0;
+                                    copy_avx2(ftmpp, ftmp, FD);
+                                    for (long j = FD - 1; j >= FD - CSD; j--) {
+                                        float qq = round(ftmpp[j] * cuda_lift_idiag[(size_t)j]);
+                                        if (fabs(qq) == 1.0f) {
+                                            has_one = 1;
+                                            break;
+                                        }
+                                        red_avx2(ftmpp, b_full_fp[j], qq, j+1);
+                                    }
+                                    if (has_one) {
+                                        _min_norm[i] = curr_norm0;
+                                        copy_avx2(_min_vec[i], ftmp, FD);
+                                        cuda_lift_min_updates++;
+                                    }
+                                }
+                                if (curr_norm0 > _min_norm[0]) break;
+                            }
+                        }
+                        if (lsh_cuda_lift_cpu_fallback_enabled() &&
+                            (cuda_lift_result_count == 0 || cuda_lift_min_updates == 0)) {
+                            cuda_lift_cpu_fallback = 1;
+                        } else {
+                            cuda_lift_used = 1;
+                            cuda_lift_gpu_used = 1;
+                        }
+                    }
+                    if (ftmp != NULL) FREE_VEC(ftmp);
+                    if (ftmpp != NULL) FREE_VEC(ftmpp);
+                }
+            }
+            if (lift_profile) {
+                fprintf(stderr,
+                        "lsh_cuda_lift: candidates=%llu ok=%d overflow=%d gpu_results=%u verified=%u updates=%u used=%d fallback=%d error=%s\n",
+                        (unsigned long long)ptr_buffer_num[thread],
+                        cuda_lift_ok,
+                        cuda_lift_overflow,
+                        cuda_lift_result_count,
+                        cuda_lift_verified,
+                        cuda_lift_min_updates,
+                        cuda_lift_gpu_used,
+                        cuda_lift_cpu_fallback,
+                        bgj_cuda_last_error());
+            }
+        }
+#endif
+        if (!cuda_lift_used) do {
             const long LD = FD - CSD;
             float *ftmp = (float *) NEW_VEC(FD8 * 8, sizeof(float));
             float idiag[256];
@@ -1829,9 +2265,9 @@ int Pool_epi8_t<nb>::__lift_buffer(lsh_mblock_t mb, long target_index, uint32_t 
 
         // update profile data
         profile_t0 = lift_profile ? lsh_wall_time() : 0.0;
+        const uint64_t lifted_count = ptr_buffer_num[thread];
         pthread_spin_lock(&profile_data->profile_lock);
-        profile_data->lift_ops += ptr_buffer_num[thread];
-        ptr_buffer_num[thread] = 0;
+        profile_data->lift_ops += lifted_count;
         pthread_spin_unlock(&profile_data->profile_lock);
         if (lift_profile) profile_update = lsh_wall_time() - profile_t0;
         // update min data
@@ -1849,6 +2285,161 @@ int Pool_epi8_t<nb>::__lift_buffer(lsh_mblock_t mb, long target_index, uint32_t 
             profile_data->observe_lift_breakdown(profile_snapshot, profile_core,
                                                  profile_update, profile_merge);
         }
+#if defined(HAVE_CUDA)
+        int cuda_lift_verify_cpu_improved = 0;
+        if (cuda_lift_verify_active && !cuda_lift_verify_start_norm.empty()) {
+            for (long i = 0; i < ID; i++) {
+                if (_min_norm[i] < cuda_lift_verify_start_norm[(size_t)i]) {
+                    cuda_lift_verify_cpu_improved = 1;
+                    break;
+                }
+            }
+        }
+        if (cuda_lift_verify_active && !cuda_lift_verify_start_norm.empty() &&
+            (!lsh_cuda_lift_verify_improved_only() || cuda_lift_verify_cpu_improved) &&
+            lifted_count > 0 && lifted_count <= 0xffffffffULL &&
+            mb.Mbound > 0 && mb.Mbound <= 0xffffffffL &&
+            FD > 0 && FD <= 160 && FD8 <= 160 && ID > 0 && CSD > 0 && CSD <= FD) {
+            static thread_local std::vector<float> cuda_lift_verify_basis;
+            static thread_local std::vector<float> cuda_lift_verify_idiag;
+            static thread_local std::vector<float> cuda_lift_verify_gpu_norm;
+            static thread_local std::vector<bgj_cuda_lsh_lift_result_t> cuda_lift_verify_results;
+            const uint32_t cuda_result_capacity = lsh_cuda_lift_max_results();
+            uint32_t cuda_verify_result_count = 0;
+            uint32_t cuda_verify_verified = 0;
+            int cuda_verify_overflow = 0;
+            int cuda_verify_ok = 0;
+            int cuda_verify_used = 0;
+            int cuda_verify_alloc_ok = 1;
+            try {
+                cuda_lift_verify_basis.resize((size_t)FD * (size_t)FD8);
+                cuda_lift_verify_idiag.resize((size_t)FD);
+                cuda_lift_verify_gpu_norm = cuda_lift_verify_start_norm;
+                cuda_lift_verify_results.resize((size_t)cuda_result_capacity);
+            } catch (...) {
+                cuda_lift_verify_basis.clear();
+                cuda_lift_verify_idiag.clear();
+                cuda_lift_verify_gpu_norm.clear();
+                cuda_lift_verify_results.clear();
+                cuda_verify_alloc_ok = 0;
+            }
+            if (cuda_verify_alloc_ok && cuda_result_capacity > 0 &&
+                !cuda_lift_verify_results.empty() && !cuda_lift_verify_gpu_norm.empty()) {
+                for (long i = 0; i < FD; i++) {
+                    cuda_lift_verify_idiag[(size_t)i] = 1.0f / b_full_fp[i][i];
+                    for (long j = 0; j < FD8; j++) {
+                        cuda_lift_verify_basis[(size_t)i * (size_t)FD8 + (size_t)j] = b_full_fp[i][j];
+                    }
+                }
+                cuda_verify_ok = bgj_cuda_lsh_lift_raw(mb.fvec,
+                                                       (uint32_t)mb.Mbound,
+                                                       (uint32_t)FD,
+                                                       (uint32_t)FD8,
+                                                       ptr_buffer[thread],
+                                                       (uint32_t)lifted_count,
+                                                       cuda_lift_verify_basis.data(),
+                                                       cuda_lift_verify_idiag.data(),
+                                                       cuda_lift_verify_start_norm.data(),
+                                                       (uint32_t)ID,
+                                                       (uint32_t)CSD,
+                                                       lsh_cuda_lift_threshold_scale(),
+                                                       cuda_lift_verify_results.data(),
+                                                       cuda_result_capacity,
+                                                       &cuda_verify_result_count,
+                                                       &cuda_verify_overflow);
+                if (cuda_verify_ok && !cuda_verify_overflow) {
+                    std::sort(cuda_lift_verify_results.begin(),
+                              cuda_lift_verify_results.begin() + cuda_verify_result_count,
+                              [](const bgj_cuda_lsh_lift_result_t &a,
+                                 const bgj_cuda_lsh_lift_result_t &b) {
+                                  if (a.candidate != b.candidate) return a.candidate < b.candidate;
+                                  return a.place < b.place;
+                              });
+                    const long LD = FD - CSD;
+                    float *ftmp = (float *) NEW_VEC(FD8, sizeof(float));
+                    float *ftmpp = (float *) NEW_VEC(FD8, sizeof(float));
+                    if (ftmp != NULL && ftmpp != NULL) {
+                        uint32_t last_candidate = 0xffffffffu;
+                        for (uint32_t r = 0; r < cuda_verify_result_count; r++) {
+                            const uint32_t candidate = cuda_lift_verify_results[r].candidate;
+                            if (candidate == last_candidate) continue;
+                            last_candidate = candidate;
+                            if ((uint64_t)candidate >= lifted_count) continue;
+                            cuda_verify_verified++;
+                            if (ptr_buffer[thread][(uint64_t)candidate * 3u]) {
+                                sub_avx2(ftmp,
+                                         mb.fvec + (uint64_t)ptr_buffer[thread][(uint64_t)candidate * 3u + 1u] * FD8,
+                                         mb.fvec + (uint64_t)ptr_buffer[thread][(uint64_t)candidate * 3u + 2u] * FD8,
+                                         FD8);
+                            } else {
+                                add_avx2(ftmp,
+                                         mb.fvec + (uint64_t)ptr_buffer[thread][(uint64_t)candidate * 3u + 1u] * FD8,
+                                         mb.fvec + (uint64_t)ptr_buffer[thread][(uint64_t)candidate * 3u + 2u] * FD8,
+                                         FD8);
+                            }
+                            float curr_norm0 = dot_aux2(ftmp + LD, ftmp + LD, CSD);
+                            for (long i = LD - 1; i >= 0; i--) {
+                                float q = round(ftmp[i] * cuda_lift_verify_idiag[(size_t)i]);
+                                red_avx2(ftmp, b_full_fp[i], q, i+1);
+                                curr_norm0 += ftmp[i] * ftmp[i];
+                                if (i >= ID) continue;
+                                if (curr_norm0 < cuda_lift_verify_gpu_norm[(size_t)i]) {
+                                    int has_one = 0;
+                                    copy_avx2(ftmpp, ftmp, FD);
+                                    for (long j = FD - 1; j >= FD - CSD; j--) {
+                                        float qq = round(ftmpp[j] * cuda_lift_verify_idiag[(size_t)j]);
+                                        if (fabs(qq) == 1.0f) {
+                                            has_one = 1;
+                                            break;
+                                        }
+                                        red_avx2(ftmpp, b_full_fp[j], qq, j+1);
+                                    }
+                                    if (has_one) cuda_lift_verify_gpu_norm[(size_t)i] = curr_norm0;
+                                }
+                                if (curr_norm0 > cuda_lift_verify_gpu_norm[0]) break;
+                            }
+                        }
+                        cuda_verify_used = 1;
+                    }
+                    if (ftmp != NULL) FREE_VEC(ftmp);
+                    if (ftmpp != NULL) FREE_VEC(ftmpp);
+                }
+            }
+            if (cuda_verify_used) {
+                for (long i = 0; i < ID; i++) {
+                    if (_min_norm[i] < cuda_lift_verify_gpu_norm[(size_t)i]) {
+                        const float delta = cuda_lift_verify_gpu_norm[(size_t)i] - _min_norm[i];
+                        cuda_lift_verify_misses++;
+                        if (delta > cuda_lift_verify_best_delta) cuda_lift_verify_best_delta = delta;
+                    } else if (cuda_lift_verify_gpu_norm[(size_t)i] < _min_norm[i]) {
+                        const float delta = _min_norm[i] - cuda_lift_verify_gpu_norm[(size_t)i];
+                        cuda_lift_verify_gpu_only++;
+                        if (delta > cuda_lift_verify_gpu_delta) cuda_lift_verify_gpu_delta = delta;
+                    }
+                }
+            }
+            if (lift_profile) {
+                fprintf(stderr,
+                        "lsh_cuda_lift_verify: candidates=%llu improved=%d ok=%d overflow=%d gpu_results=%u verified=%u used=%d cpu_misses=%u best_delta=%g gpu_only=%u gpu_delta=%g\n",
+                        (unsigned long long)lifted_count,
+                        cuda_lift_verify_cpu_improved,
+                        cuda_verify_ok,
+                        cuda_verify_overflow,
+                        cuda_verify_result_count,
+                        cuda_verify_verified,
+                        cuda_verify_used,
+                        cuda_lift_verify_misses,
+                        cuda_lift_verify_best_delta,
+                        cuda_lift_verify_gpu_only,
+                        cuda_lift_verify_gpu_delta);
+            }
+            cuda_lift_verify_start_norm.clear();
+            cuda_lift_verify_gpu_norm.clear();
+        } else if (cuda_lift_verify_active) {
+            cuda_lift_verify_start_norm.clear();
+        }
+#endif
+        ptr_buffer_num[thread] = 0;
         if (detail_profile) {
             profile_data->observe_lift_detail(1, detail_candidates, detail_vec_batches,
                                               detail_vec_row_iters, detail_scalar_candidates,

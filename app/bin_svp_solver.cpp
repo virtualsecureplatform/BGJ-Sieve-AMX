@@ -200,6 +200,16 @@ static int solver_svp120_final_lsh_single_gpu()
     return solver_env_flag_value(getenv("BGJ_120T95_FINAL_LSH_SINGLE_GPU"), 0);
 }
 
+static long solver_svp120_final_lsh_threads()
+{
+    if (solver_env_is_set("BGJ_120T95_FINAL_LSH_THREADS")) {
+        long value = solver_env_long("BGJ_120T95_FINAL_LSH_THREADS", num_threads);
+        if (value > 0) return value;
+    }
+    if (num_threads > 8) return 8;
+    return num_threads;
+}
+
 static int solver_svp120_final_lsh_mode()
 {
     const char *env = getenv("BGJ_SVP_FINAL_LSH");
@@ -415,7 +425,7 @@ int _svp_solver_red(Lattice_QP* L, long algo) {
         SOLVER_PROFILE_DO("120t95 local_pump_85_15_120", __local_pump(L, 85, 20, 15, 120));
         double final_lsh_target = solver_svp120_final_lsh_target(L);
         const int final_lsh_mode = solver_svp120_final_lsh_mode();
-        const double lsh_pump_stop_length = (final_lsh_mode == 2) ?
+        const double lsh_pump_stop_length = (final_lsh_mode != 0) ?
             solver_env_double("BGJ_120T95_LSH_PUMP_STOP_LENGTH", final_lsh_target) : 0.0;
         SOLVER_PROFILE_DO("120t95 lsh_pump_92_28_q035",
                           __lsh_pump_red_epi8(L, num_threads, 1.1, 0.35, 92, 28, 24, 0, 24, 0, 0, 45,
@@ -478,6 +488,7 @@ int _svp_solver_red(Lattice_QP* L, long algo) {
             run_final_lsh = solver_svp120_should_run_final_lsh(L, &final_lsh_target);
         }
         if (run_final_lsh) {
+            const long final_threads = solver_svp120_final_lsh_threads();
             const double final_qratio = solver_env_double("BGJ_120T95_FINAL_LSH_QRATIO", 0.6);
             const double final_ext_qratio = solver_env_double("BGJ_120T95_FINAL_LSH_EXT_QRATIO", final_qratio);
             const long final_msd = solver_env_long("BGJ_120T95_FINAL_LSH_MSD", 102);
@@ -496,6 +507,11 @@ int _svp_solver_red(Lattice_QP* L, long algo) {
             snprintf(final_lsh_label, sizeof(final_lsh_label),
                      "120t95 final_lsh_%ld_%ld_q%.3f",
                      final_msd, final_ext_d, final_qratio);
+            if (profile && final_threads != num_threads) {
+                printf("final_lsh_thread_policy: algo=120t95 solver_threads=%ld final_lsh_threads=%ld\n",
+                       num_threads, final_threads);
+                fflush(stdout);
+            }
             if (solver_svp120_final_lsh_single_gpu()) {
                 if (profile) {
                     printf("final_lsh_cuda_policy: algo=120t95 primary_thread_device=1 multi_gpu_batch=0\n");
@@ -505,7 +521,7 @@ int _svp_solver_red(Lattice_QP* L, long algo) {
                 solver_scoped_env_override_t no_multi_batch("BGJ_CUDA_MULTI_GPU_BATCH", "0");
                 solver_scoped_env_override_t no_batch_split("BGJ_CUDA_MULTI_GPU_BATCH_SPLIT", "0");
                 SOLVER_PROFILE_DO(final_lsh_label,
-                                  final_lsh_length = __last_lsh_pump_epi8(L, num_threads,
+                                  final_lsh_length = __last_lsh_pump_epi8(L, final_threads,
                                                                            final_qratio,
                                                                            final_ext_qratio,
                                                                            final_msd,
@@ -521,7 +537,7 @@ int _svp_solver_red(Lattice_QP* L, long algo) {
                     fflush(stdout);
                 }
                 SOLVER_PROFILE_DO(final_lsh_label,
-                                  final_lsh_length = __last_lsh_pump_epi8(L, num_threads,
+                                  final_lsh_length = __last_lsh_pump_epi8(L, final_threads,
                                                                            final_qratio,
                                                                            final_ext_qratio,
                                                                            final_msd,

@@ -23,7 +23,7 @@ CHALLENGE_EXAMPLE_URL = (
     "svpchallengedim{dim}seed0.txt"
 )
 SOLVER_RE = re.compile(
-    r"possible sol: ([^,]+), length = ([0-9.eE+-]+), time = ([0-9.eE+-]+)s"
+    r"possible sol: ([^,]+),(?: [^,]+ = [^,]+,)* length = ([0-9.eE+-]+), time = ([0-9.eE+-]+)s"
 )
 CSV_FIELDS = [
     "timestamp",
