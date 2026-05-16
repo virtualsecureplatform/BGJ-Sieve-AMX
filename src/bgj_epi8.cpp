@@ -205,7 +205,7 @@ static uint32_t bgj3_epi8_cuda_batch_size()
     } else if (batch_env && batch_env[0]) {
         value = 8;
     } else if ((np_fused_env && np_fused_env[0] && np_fused_env[0] != '0') ||
-               (full_fused_env && full_fused_env[0] && full_fused_env[0] != '0')) {
+               (!full_fused_env || !full_fused_env[0] || full_fused_env[0] != '0')) {
         value = BGJ3_EPI8_BUCKET2_BATCHSIZE;
     }
 
@@ -229,7 +229,7 @@ static int bgj3_epi8_cuda_search2_np_fused_requested()
 static int bgj3_epi8_cuda_search2_full_fused_requested()
 {
     const char *env = getenv("BGJ_CUDA_BGJ3_SEARCH2_FULL_FUSED");
-    return env && env[0] && env[0] != '0';
+    return !env || !env[0] || env[0] != '0';
 }
 
 static uint32_t bgj3_epi8_cuda_search2_np_fused_result_capacity()

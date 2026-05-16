@@ -136,13 +136,12 @@ Use `BGJ_CUDA_BGJ3_SEARCH=0` to disable all BGJ3 search offload, or
 `BGJ_CUDA_BGJ3_MIN_DOTS` sets the BGJ3-only threshold; the default follows
 `BGJ_CUDA_BATCH_MIN_DOTS`. Very low thresholds, such as `1`, are useful for
 smoke-testing that BGJ3 calls CUDA, but are not a tuned performance setting.
-BGJ3 `search2` can batch CUDA work, but the default stays on the previously
-validated single-bucket path for solver quality stability. Set
-`BGJ_CUDA_BGJ3_SEARCH2_FULL_FUSED=1` to enable the full fused CUDA batch, or
+BGJ3 `search2` uses the full fused CUDA batch by default when CUDA search is
+enabled. Set `BGJ_CUDA_BGJ3_SEARCH2_FULL_FUSED=0` to disable this default, or
 override the batch size with `BGJ_CUDA_BGJ3_BATCH_SIZE=<n>`.
-`BGJ_CUDA_BGJ3_BATCH=1` enables the older non-fused batch path, and
-`BGJ_CUDA_BGJ3_MIN_BATCH=<n>` controls the minimum eligible buckets needed
-before using that older batch kernel.
+`BGJ_CUDA_BGJ3_BATCH=1` enables the older non-fused batch path when the
+full-fused path is disabled, and `BGJ_CUDA_BGJ3_MIN_BATCH=<n>` controls the
+minimum eligible buckets needed before using that older batch kernel.
 `BGJ_CUDA_BGJ3_SEARCH2_STAGED=1` enables ordered staged result consumption for
 `search2` batches. Its batch-admission gate is controlled separately by
 `BGJ_CUDA_BGJ3_SEARCH2_STAGED_MIN_DOTS`, defaulting to `1048576`, so staged
@@ -152,9 +151,9 @@ single-bucket CUDA threshold.
 batch for BGJ3 `search2`. It collects many bucket2 mixed p/n searches into one
 launch, consumes results in bucket order, then runs the existing CPU pp/nn tail.
 `BGJ_CUDA_BGJ3_SEARCH2_FULL_FUSED` extends that fused batch to include the
-same-sign pp/nn searches as well; bucket order is still preserved, and buckets
-fall back to the ordinary CPU path on CUDA failure, result overflow, or result
-consume failure.
+same-sign pp/nn searches as well and is on by default; bucket order is still
+preserved, and buckets fall back to the ordinary CPU path on CUDA failure,
+result overflow, or result consume failure.
 `BGJ_CUDA_BGJ3_SEARCH2_NP_FUSED_MIN_DOTS` controls the fused batch gate and
 defaults to `1048576`.
 `BGJ_CUDA_BGJ3_SEARCH2_NP_FUSED_MAX_RESULTS` caps the per-bucket result slab
