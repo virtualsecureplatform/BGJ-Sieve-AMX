@@ -3297,6 +3297,134 @@ int Pool_epi8_t<nb>::_search_bgj1_cuda_batch_collect(bucket_epi8_t<record_dp> **
 
 template <uint32_t nb>
 template <bool record_dp, bool profiling>
+int Pool_epi8_t<nb>::_search_bgj1_cuda_np_batch_collect(bucket_epi8_t<record_dp> **buckets,
+                                                        long num_bucket,
+                                                        int32_t goal_norm,
+                                                        int include_same_pairs,
+                                                        bgj_cuda_result_t *result_storage,
+                                                        uint32_t result_capacity,
+                                                        bgj_cuda_result_t **result_ptrs_out,
+                                                        uint32_t *result_counts_out,
+                                                        int *overflows_out)
+{
+    (void)profiling;
+    if (record_dp) return 0;
+    if (num_bucket <= 0) return 1;
+    if (bgj_cuda_device_count() <= 0) return 0;
+    if (!bgj_cuda_pool_cache_requested()) return 0;
+    if (num_vec < 0 || num_vec > 0xffffffffL) return 0;
+    if (num_bucket > 0xffffffffL) return 0;
+    if (!result_storage || !result_capacity || !result_ptrs_out ||
+        !result_counts_out || !overflows_out) return 0;
+
+    const uint32_t batch_size = (uint32_t)num_bucket;
+    static thread_local std::vector<uint32_t> flat_p_ids;
+    static thread_local std::vector<uint32_t> flat_n_ids;
+    static thread_local std::vector<int32_t> flat_p_norm;
+    static thread_local std::vector<int32_t> flat_n_norm;
+    static thread_local std::vector<uint32_t> p_offsets;
+    static thread_local std::vector<uint32_t> n_offsets;
+    static thread_local std::vector<uint32_t> num_p;
+    static thread_local std::vector<uint32_t> num_n;
+    static thread_local std::vector<bgj_cuda_result_t *> result_ptrs;
+    static thread_local std::vector<uint32_t> result_capacities;
+    static thread_local std::vector<uint32_t> result_counts;
+    static thread_local std::vector<int> overflows;
+
+    try {
+        p_offsets.resize(batch_size);
+        n_offsets.resize(batch_size);
+        num_p.resize(batch_size);
+        num_n.resize(batch_size);
+        result_ptrs.resize(batch_size);
+        result_capacities.resize(batch_size);
+        result_counts.resize(batch_size);
+        overflows.resize(batch_size);
+    } catch (...) {
+        return 0;
+    }
+
+    if ((size_t)batch_size >
+        std::numeric_limits<size_t>::max() / (size_t)result_capacity) {
+        return 0;
+    }
+
+    size_t total_p = 0;
+    size_t total_n = 0;
+    for (uint32_t i = 0; i < batch_size; i++) {
+        bucket_epi8_t<record_dp> *bkt = buckets[i];
+        if (!bkt) return 0;
+        if (bkt->num_pvec < 0 || bkt->num_nvec < 0) return 0;
+        if (bkt->num_pvec > 0xffffffffL || bkt->num_nvec > 0xffffffffL) return 0;
+        if (total_p + (size_t)bkt->num_pvec > 0xffffffffull ||
+            total_n + (size_t)bkt->num_nvec > 0xffffffffull) {
+            return 0;
+        }
+        p_offsets[i] = (uint32_t)total_p;
+        n_offsets[i] = (uint32_t)total_n;
+        num_p[i] = (uint32_t)bkt->num_pvec;
+        num_n[i] = (uint32_t)bkt->num_nvec;
+        total_p += (size_t)bkt->num_pvec;
+        total_n += (size_t)bkt->num_nvec;
+    }
+
+    try {
+        flat_p_ids.resize(total_p);
+        flat_p_norm.resize(total_p);
+        flat_n_ids.resize(total_n);
+        flat_n_norm.resize(total_n);
+    } catch (...) {
+        return 0;
+    }
+
+    for (uint32_t i = 0; i < batch_size; i++) {
+        bucket_epi8_t<record_dp> *bkt = buckets[i];
+        if (num_p[i]) {
+            std::copy(bkt->pvec, bkt->pvec + num_p[i], flat_p_ids.data() + p_offsets[i]);
+            std::copy(bkt->pnorm, bkt->pnorm + num_p[i], flat_p_norm.data() + p_offsets[i]);
+        }
+        if (num_n[i]) {
+            std::copy(bkt->nvec, bkt->nvec + num_n[i], flat_n_ids.data() + n_offsets[i]);
+            std::copy(bkt->nnorm, bkt->nnorm + num_n[i], flat_n_norm.data() + n_offsets[i]);
+        }
+        result_ptrs[i] = result_storage + (size_t)i * (size_t)result_capacity;
+        result_capacities[i] = result_capacity;
+        result_counts[i] = 0;
+        overflows[i] = 0;
+    }
+
+    const int ok =
+        bgj_cuda_search_bucket_pool_batch_np_flat_raw(vec,
+                                                      pool_epoch,
+                                                      (uint32_t)num_vec,
+                                                      flat_p_ids.empty() ? NULL : flat_p_ids.data(),
+                                                      flat_n_ids.empty() ? NULL : flat_n_ids.data(),
+                                                      flat_p_norm.empty() ? NULL : flat_p_norm.data(),
+                                                      flat_n_norm.empty() ? NULL : flat_n_norm.data(),
+                                                      p_offsets.data(),
+                                                      n_offsets.data(),
+                                                      num_p.data(),
+                                                      num_n.data(),
+                                                      batch_size,
+                                                      (uint32_t)vec_length,
+                                                      goal_norm,
+                                                      include_same_pairs ? 1 : 0,
+                                                      result_ptrs.data(),
+                                                      result_capacities.data(),
+                                                      result_counts.data(),
+                                                      overflows.data());
+    if (!ok) return 0;
+
+    for (uint32_t i = 0; i < batch_size; i++) {
+        result_ptrs_out[i] = result_ptrs[i];
+        result_counts_out[i] = result_counts[i];
+        overflows_out[i] = overflows[i];
+    }
+    return 1;
+}
+
+template <uint32_t nb>
+template <bool record_dp, bool profiling>
 int Pool_epi8_t<nb>::_consume_bgj1_cuda_results(bucket_epi8_t<record_dp> *bkt,
                                                 sol_list_epi8_t *sol,
                                                 bgj_profile_data_t<nb> *prof,
@@ -3628,6 +3756,7 @@ template int Pool_epi8_t<3>::_search_bgj1_cuda<0, 1>(bucket_epi8_t<0> *bkt, sol_
 template int Pool_epi8_t<3>::_search_bgj1_cuda_overlap<0, 1>(bucket_epi8_t<0> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<3> *prof);
 template int Pool_epi8_t<3>::_search_bgj1_cuda_batch<0, 1>(bucket_epi8_t<0> **buckets, long num_bucket, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<3> *prof);
 template int Pool_epi8_t<3>::_search_bgj1_cuda_batch_collect<0, 1>(bucket_epi8_t<0> **buckets, long num_bucket, int32_t goal_norm, bgj_cuda_result_t *result_storage, uint32_t result_capacity, bgj_cuda_result_t **result_ptrs, uint32_t *result_counts, int *overflows);
+template int Pool_epi8_t<3>::_search_bgj1_cuda_np_batch_collect<0, 1>(bucket_epi8_t<0> **buckets, long num_bucket, int32_t goal_norm, int include_same_pairs, bgj_cuda_result_t *result_storage, uint32_t result_capacity, bgj_cuda_result_t **result_ptrs, uint32_t *result_counts, int *overflows);
 template int Pool_epi8_t<3>::_consume_bgj1_cuda_results<0, 1>(bucket_epi8_t<0> *bkt, sol_list_epi8_t *sol, bgj_profile_data_t<3> *prof, bgj_cuda_result_t *results, uint32_t result_count);
 template int Pool_epi8_t<3>::bgj1_Sieve_cuda(long log_level, long lps_auto_adj);
 template int Pool_epi8_t<3>::bgj2_Sieve_cuda(long log_level, long lps_auto_adj);
@@ -3646,6 +3775,7 @@ template int Pool_epi8_t<4>::_search_bgj1_cuda<0, 1>(bucket_epi8_t<0> *bkt, sol_
 template int Pool_epi8_t<4>::_search_bgj1_cuda_overlap<0, 1>(bucket_epi8_t<0> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<4> *prof);
 template int Pool_epi8_t<4>::_search_bgj1_cuda_batch<0, 1>(bucket_epi8_t<0> **buckets, long num_bucket, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<4> *prof);
 template int Pool_epi8_t<4>::_search_bgj1_cuda_batch_collect<0, 1>(bucket_epi8_t<0> **buckets, long num_bucket, int32_t goal_norm, bgj_cuda_result_t *result_storage, uint32_t result_capacity, bgj_cuda_result_t **result_ptrs, uint32_t *result_counts, int *overflows);
+template int Pool_epi8_t<4>::_search_bgj1_cuda_np_batch_collect<0, 1>(bucket_epi8_t<0> **buckets, long num_bucket, int32_t goal_norm, int include_same_pairs, bgj_cuda_result_t *result_storage, uint32_t result_capacity, bgj_cuda_result_t **result_ptrs, uint32_t *result_counts, int *overflows);
 template int Pool_epi8_t<4>::_consume_bgj1_cuda_results<0, 1>(bucket_epi8_t<0> *bkt, sol_list_epi8_t *sol, bgj_profile_data_t<4> *prof, bgj_cuda_result_t *results, uint32_t result_count);
 template int Pool_epi8_t<4>::bgj1_Sieve_cuda(long log_level, long lps_auto_adj);
 template int Pool_epi8_t<4>::bgj2_Sieve_cuda(long log_level, long lps_auto_adj);
@@ -3664,6 +3794,7 @@ template int Pool_epi8_t<5>::_search_bgj1_cuda<0, 1>(bucket_epi8_t<0> *bkt, sol_
 template int Pool_epi8_t<5>::_search_bgj1_cuda_overlap<0, 1>(bucket_epi8_t<0> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<5> *prof);
 template int Pool_epi8_t<5>::_search_bgj1_cuda_batch<0, 1>(bucket_epi8_t<0> **buckets, long num_bucket, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<5> *prof);
 template int Pool_epi8_t<5>::_search_bgj1_cuda_batch_collect<0, 1>(bucket_epi8_t<0> **buckets, long num_bucket, int32_t goal_norm, bgj_cuda_result_t *result_storage, uint32_t result_capacity, bgj_cuda_result_t **result_ptrs, uint32_t *result_counts, int *overflows);
+template int Pool_epi8_t<5>::_search_bgj1_cuda_np_batch_collect<0, 1>(bucket_epi8_t<0> **buckets, long num_bucket, int32_t goal_norm, int include_same_pairs, bgj_cuda_result_t *result_storage, uint32_t result_capacity, bgj_cuda_result_t **result_ptrs, uint32_t *result_counts, int *overflows);
 template int Pool_epi8_t<5>::_consume_bgj1_cuda_results<0, 1>(bucket_epi8_t<0> *bkt, sol_list_epi8_t *sol, bgj_profile_data_t<5> *prof, bgj_cuda_result_t *results, uint32_t result_count);
 template int Pool_epi8_t<5>::bgj1_Sieve_cuda(long log_level, long lps_auto_adj);
 template int Pool_epi8_t<5>::bgj2_Sieve_cuda(long log_level, long lps_auto_adj);
@@ -3682,6 +3813,7 @@ template int Pool_epi8_t<6>::_search_bgj1_cuda<0, 1>(bucket_epi8_t<0> *bkt, sol_
 template int Pool_epi8_t<6>::_search_bgj1_cuda_overlap<0, 1>(bucket_epi8_t<0> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<6> *prof);
 template int Pool_epi8_t<6>::_search_bgj1_cuda_batch<0, 1>(bucket_epi8_t<0> **buckets, long num_bucket, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<6> *prof);
 template int Pool_epi8_t<6>::_search_bgj1_cuda_batch_collect<0, 1>(bucket_epi8_t<0> **buckets, long num_bucket, int32_t goal_norm, bgj_cuda_result_t *result_storage, uint32_t result_capacity, bgj_cuda_result_t **result_ptrs, uint32_t *result_counts, int *overflows);
+template int Pool_epi8_t<6>::_search_bgj1_cuda_np_batch_collect<0, 1>(bucket_epi8_t<0> **buckets, long num_bucket, int32_t goal_norm, int include_same_pairs, bgj_cuda_result_t *result_storage, uint32_t result_capacity, bgj_cuda_result_t **result_ptrs, uint32_t *result_counts, int *overflows);
 template int Pool_epi8_t<6>::_consume_bgj1_cuda_results<0, 1>(bucket_epi8_t<0> *bkt, sol_list_epi8_t *sol, bgj_profile_data_t<6> *prof, bgj_cuda_result_t *results, uint32_t result_count);
 template int Pool_epi8_t<6>::bgj1_Sieve_cuda(long log_level, long lps_auto_adj);
 template int Pool_epi8_t<6>::bgj2_Sieve_cuda(long log_level, long lps_auto_adj);
@@ -3700,6 +3832,7 @@ template int Pool_epi8_t<7>::_search_bgj1_cuda<0, 1>(bucket_epi8_t<0> *bkt, sol_
 template int Pool_epi8_t<7>::_search_bgj1_cuda_overlap<0, 1>(bucket_epi8_t<0> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<7> *prof);
 template int Pool_epi8_t<7>::_search_bgj1_cuda_batch<0, 1>(bucket_epi8_t<0> **buckets, long num_bucket, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<7> *prof);
 template int Pool_epi8_t<7>::_search_bgj1_cuda_batch_collect<0, 1>(bucket_epi8_t<0> **buckets, long num_bucket, int32_t goal_norm, bgj_cuda_result_t *result_storage, uint32_t result_capacity, bgj_cuda_result_t **result_ptrs, uint32_t *result_counts, int *overflows);
+template int Pool_epi8_t<7>::_search_bgj1_cuda_np_batch_collect<0, 1>(bucket_epi8_t<0> **buckets, long num_bucket, int32_t goal_norm, int include_same_pairs, bgj_cuda_result_t *result_storage, uint32_t result_capacity, bgj_cuda_result_t **result_ptrs, uint32_t *result_counts, int *overflows);
 template int Pool_epi8_t<7>::_consume_bgj1_cuda_results<0, 1>(bucket_epi8_t<0> *bkt, sol_list_epi8_t *sol, bgj_profile_data_t<7> *prof, bgj_cuda_result_t *results, uint32_t result_count);
 template int Pool_epi8_t<7>::bgj1_Sieve_cuda(long log_level, long lps_auto_adj);
 template int Pool_epi8_t<7>::bgj2_Sieve_cuda(long log_level, long lps_auto_adj);

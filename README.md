@@ -136,11 +136,34 @@ Use `BGJ_CUDA_BGJ3_SEARCH=0` to disable all BGJ3 search offload, or
 `BGJ_CUDA_BGJ3_MIN_DOTS` sets the BGJ3-only threshold; the default follows
 `BGJ_CUDA_BATCH_MIN_DOTS`. Very low thresholds, such as `1`, are useful for
 smoke-testing that BGJ3 calls CUDA, but are not a tuned performance setting.
-Experimental BGJ3 `search2` batching is available with `BGJ_CUDA_BGJ3_BATCH=1`
-or `BGJ_CUDA_BGJ3_BATCH_SIZE=<n>`, and `BGJ_CUDA_BGJ3_MIN_BATCH=<n>` controls
-the minimum eligible buckets needed before using the batch kernel. It is off by
-default; May 2026 A100/GPU1 dim-80 checks showed no default-threshold speedup,
-and forcing tiny buckets onto CUDA was slower.
+BGJ3 `search2` can batch CUDA work, but the default stays on the previously
+validated single-bucket path for solver quality stability. Set
+`BGJ_CUDA_BGJ3_SEARCH2_FULL_FUSED=1` to enable the full fused CUDA batch, or
+override the batch size with `BGJ_CUDA_BGJ3_BATCH_SIZE=<n>`.
+`BGJ_CUDA_BGJ3_BATCH=1` enables the older non-fused batch path, and
+`BGJ_CUDA_BGJ3_MIN_BATCH=<n>` controls the minimum eligible buckets needed
+before using that older batch kernel.
+`BGJ_CUDA_BGJ3_SEARCH2_STAGED=1` enables ordered staged result consumption for
+`search2` batches. Its batch-admission gate is controlled separately by
+`BGJ_CUDA_BGJ3_SEARCH2_STAGED_MIN_DOTS`, defaulting to `1048576`, so staged
+experiments can admit small ordered batches without lowering the normal BGJ3
+single-bucket CUDA threshold.
+`BGJ_CUDA_BGJ3_SEARCH2_NP_FUSED=1` enables an experimental fused NP-only CUDA
+batch for BGJ3 `search2`. It collects many bucket2 mixed p/n searches into one
+launch, consumes results in bucket order, then runs the existing CPU pp/nn tail.
+`BGJ_CUDA_BGJ3_SEARCH2_FULL_FUSED` extends that fused batch to include the
+same-sign pp/nn searches as well; bucket order is still preserved, and buckets
+fall back to the ordinary CPU path on CUDA failure, result overflow, or result
+consume failure.
+`BGJ_CUDA_BGJ3_SEARCH2_NP_FUSED_MIN_DOTS` controls the fused batch gate and
+defaults to `1048576`.
+`BGJ_CUDA_BGJ3_SEARCH2_NP_FUSED_MAX_RESULTS` caps the per-bucket result slab
+used by the fused path. By default this path uses at most `262144` results per
+bucket, while ordinary CUDA search still honors `BGJ_CUDA_MAX_RESULTS`.
+For BGJ3 `search2` CPU fallback diagnosis, set
+`BGJ_CUDA_BGJ3_SEARCH2_CPU_PROFILE=1` together with `BGJ_CUDA_BGJ3_PROFILE=1`;
+the `bgj3_cuda_profile` line then reports split fallback time for `cred`,
+`np`, `pp`, and `nn`.
 
 For reproducible CUDA/BGJ profiling, pass a fixed sampler seed as the fifth
 positional argument, with `-s/--seed`, or with `BGJ_SEED`:

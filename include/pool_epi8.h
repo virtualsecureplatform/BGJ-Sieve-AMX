@@ -1086,6 +1086,8 @@ struct Pool_epi8_t {
         template <bool record_dp, bool profiling>
         int _search_bgj1_cuda_batch_collect(bucket_epi8_t<record_dp> **buckets, long num_bucket, int32_t goal_norm, bgj_cuda_result_t *result_storage, uint32_t result_capacity, bgj_cuda_result_t **result_ptrs, uint32_t *result_counts, int *overflows);
         template <bool record_dp, bool profiling>
+        int _search_bgj1_cuda_np_batch_collect(bucket_epi8_t<record_dp> **buckets, long num_bucket, int32_t goal_norm, int include_same_pairs, bgj_cuda_result_t *result_storage, uint32_t result_capacity, bgj_cuda_result_t **result_ptrs, uint32_t *result_counts, int *overflows);
+        template <bool record_dp, bool profiling>
         int _consume_bgj1_cuda_results(bucket_epi8_t<record_dp> *bkt, sol_list_epi8_t *sol, bgj_profile_data_t<nb> *prof, bgj_cuda_result_t *results, uint32_t result_count);
         long _sol_list_to_desc(sol_list_epi8_t **sol_list, long num_sol_list, bgj_cuda_materialize_desc_t *desc, uint64_t *dst_vu);
         int _desc_to_vec_cpu(const bgj_cuda_materialize_desc_t *desc, long num_desc, long cpu_threads, int8_t *dst_vec, int32_t *dst_vnorm, int32_t *dst_vsum);
