@@ -112,6 +112,9 @@ larger margins probe earlier and may shorten later BGJ3 rescue work.
 In auto mode, `BGJ_120T95_FINAL_LSH_ATTEMPTS` defaults to `2`, so a rescue
 pass that still misses the GH-based quality target is followed by one more
 rescue pass. Set it to `1` to restore the old single-shot behavior.
+`BGJ_120T95_FINAL_LSH_FAST_FIRST=1` tries a cheaper first rescue pass
+(`msd=92`) before falling back to the full final LSH pass; it is off by default
+because the cheap pass can perturb the full rescue trajectory.
 `BGJ_120T95_FINAL_LSH_STOP_LENGTH=<length>` overrides the rescue early-stop
 threshold.
 Plain `--cuda` uses one CUDA execution device unless `BGJ_CUDA_DEVICES` or

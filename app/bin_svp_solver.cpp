@@ -530,11 +530,14 @@ int _svp_solver_red(Lattice_QP* L, long algo) {
             const long final_shuffle = solver_env_long("BGJ_120T95_FINAL_LSH_SHUFFLE_FIRST", 0);
             const long final_minsd = solver_env_long("BGJ_120T95_FINAL_LSH_MINSD", 40);
             const long final_lift_margin = solver_env_long("BGJ_120T95_FINAL_LSH_LIFT_MARGIN", 12);
-            const long final_lift_start_default = final_msd - final_lift_margin;
+            const int final_lift_start_is_set = solver_env_is_set("BGJ_120T95_FINAL_LSH_LIFT_START_CSD");
             const long final_lift_start = solver_env_long("BGJ_120T95_FINAL_LSH_LIFT_START_CSD",
-                                                          final_lift_start_default);
+                                                          final_msd - final_lift_margin);
             const double final_stop_length = solver_env_double("BGJ_120T95_FINAL_LSH_STOP_LENGTH",
                                                                final_lsh_target);
+            const int final_fast_first = solver_env_flag("BGJ_120T95_FINAL_LSH_FAST_FIRST", 0);
+            const long final_fast_first_msd = solver_env_long("BGJ_120T95_FINAL_LSH_FAST_FIRST_MSD", 92);
+            const long final_fast_first_ext_d = solver_env_long("BGJ_120T95_FINAL_LSH_FAST_FIRST_EXT_D", 0);
             const long final_attempts_default = (final_lsh_mode == 2) ? 2 : 1;
             long final_attempts = solver_env_long("BGJ_120T95_FINAL_LSH_ATTEMPTS",
                                                   final_attempts_default);
@@ -547,20 +550,25 @@ int _svp_solver_red(Lattice_QP* L, long algo) {
             for (long final_attempt = 0; final_attempt < final_attempts; ++final_attempt) {
                 double final_lsh_length = 0.0;
                 char final_lsh_label[128];
+                const int use_fast_first = final_fast_first && final_attempt == 0 && final_attempts > 1;
+                const long attempt_msd = use_fast_first ? final_fast_first_msd : final_msd;
+                const long attempt_ext_d = use_fast_first ? final_fast_first_ext_d : final_ext_d;
+                const long attempt_lift_start = final_lift_start_is_set ?
+                    final_lift_start : attempt_msd - final_lift_margin;
                 if (final_attempts > 1) {
                     snprintf(final_lsh_label, sizeof(final_lsh_label),
                              "120t95 final_lsh_%ld_%ld_q%.3f_try_%ld",
-                             final_msd, final_ext_d, final_qratio, final_attempt + 1);
+                             attempt_msd, attempt_ext_d, final_qratio, final_attempt + 1);
                 } else {
                     snprintf(final_lsh_label, sizeof(final_lsh_label),
                              "120t95 final_lsh_%ld_%ld_q%.3f",
-                             final_msd, final_ext_d, final_qratio);
+                             attempt_msd, attempt_ext_d, final_qratio);
                 }
                 if (profile && final_attempts > 1) {
                     solver_best_candidate_t attempt_best = solver_find_best_candidate(L);
-                    printf("final_lsh_attempt: algo=120t95 attempt=%ld/%ld current_best=%.9g source=%s target=%.9g\n",
-                           final_attempt + 1, final_attempts, attempt_best.length,
-                           attempt_best.source, final_lsh_target);
+                    printf("final_lsh_attempt: algo=120t95 attempt=%ld/%ld msd=%ld ext_d=%ld current_best=%.9g source=%s target=%.9g\n",
+                           final_attempt + 1, final_attempts, attempt_msd, attempt_ext_d,
+                           attempt_best.length, attempt_best.source, final_lsh_target);
                     fflush(stdout);
                 }
                 if (solver_svp120_final_lsh_single_gpu()) {
@@ -575,13 +583,13 @@ int _svp_solver_red(Lattice_QP* L, long algo) {
                                       final_lsh_length = __last_lsh_pump_epi8(L, final_threads,
                                                                                final_qratio,
                                                                                final_ext_qratio,
-                                                                               final_msd,
-                                                                               final_ext_d,
+                                                                               attempt_msd,
+                                                                               attempt_ext_d,
                                                                                final_log,
                                                                                final_shuffle,
                                                                                final_minsd,
                                                                                final_stop_length,
-                                                                               final_lift_start));
+                                                                               attempt_lift_start));
                 } else {
                     if (profile && final_attempt == 0) {
                         printf("final_lsh_cuda_policy: algo=120t95 inherited\n");
@@ -591,13 +599,13 @@ int _svp_solver_red(Lattice_QP* L, long algo) {
                                       final_lsh_length = __last_lsh_pump_epi8(L, final_threads,
                                                                                final_qratio,
                                                                                final_ext_qratio,
-                                                                               final_msd,
-                                                                               final_ext_d,
+                                                                               attempt_msd,
+                                                                               attempt_ext_d,
                                                                                final_log,
                                                                                final_shuffle,
                                                                                final_minsd,
                                                                                final_stop_length,
-                                                                               final_lift_start));
+                                                                               attempt_lift_start));
                 }
                 if (final_lsh_length > 0.0) {
                     printf("final_lsh_best: algo=120t95 attempt=%ld length=%.9g\n",
