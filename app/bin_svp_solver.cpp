@@ -207,7 +207,6 @@ static long solver_svp120_final_lsh_threads()
         long value = solver_env_long("BGJ_120T95_FINAL_LSH_THREADS", num_threads);
         if (value > 0) return value;
     }
-    if (num_threads > 8) return 8;
     return num_threads;
 }
 
