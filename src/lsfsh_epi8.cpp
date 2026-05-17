@@ -4,8 +4,10 @@
 #include "../include/lsfsh_tables.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <cstdlib>
 #include <sys/time.h>
+#include <string>
 #include <vector>
 
 #define LSH_DEFAULT_DHDIM 24
@@ -55,15 +57,44 @@ struct lsh_best_trace_record_t {
     int had_old;
     double old_length;
     double new_length;
+    double time;
+    int thread;
+    std::string stage;
 };
 
 static std::vector<lsh_best_solution_record_t> lsh_best_solution_records;
 static std::vector<lsh_best_trace_record_t> lsh_best_trace_records;
+static thread_local std::string lsh_best_trace_stage;
 
 static inline int lsh_best_trace_enabled()
 {
     const char *env = getenv("BGJ_LSH_BEST_TRACE");
     return env != NULL && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
+}
+
+int bgj_lsh_best_solution_trace_is_enabled()
+{
+    return lsh_best_trace_enabled();
+}
+
+void bgj_lsh_best_solution_trace_stage_set(const char *stage)
+{
+    if (stage == NULL || stage[0] == '\0') {
+        lsh_best_trace_stage.clear();
+    } else {
+        lsh_best_trace_stage = stage;
+    }
+}
+
+void bgj_lsh_best_solution_trace_stage_copy(char *dst, long capacity)
+{
+    if (dst == NULL || capacity <= 0) return;
+    if (lsh_best_trace_stage.empty()) {
+        dst[0] = '\0';
+        return;
+    }
+    std::strncpy(dst, lsh_best_trace_stage.c_str(), (size_t)capacity - 1);
+    dst[capacity - 1] = '\0';
 }
 
 void bgj_lsh_best_solution_reset()
@@ -137,6 +168,9 @@ static int lsh_record_best_solution(double length, const double *vec, long dimen
         trace_record.had_old = had_old;
         trace_record.old_length = old_length;
         trace_record.new_length = length;
+        trace_record.time = lsh_wall_time();
+        trace_record.thread = omp_get_thread_num();
+        trace_record.stage = lsh_best_trace_stage.empty() ? "unknown" : lsh_best_trace_stage;
         lsh_best_trace_records.push_back(trace_record);
     }
     pthread_mutex_unlock(&lsh_best_solution_lock);
@@ -156,14 +190,16 @@ void bgj_lsh_best_solution_trace_dump()
         const lsh_best_trace_record_t &record = lsh_best_trace_records[i];
         if (record.had_old) {
             fprintf(stderr,
-                    "lsh_best_trace: seq=%lu dim=%ld old=%.9g new=%.9g\n",
+                    "lsh_best_trace: seq=%lu dim=%ld old=%.9g new=%.9g thread=%d time=%.6f stage=\"%s\"\n",
                     (unsigned long)(i + 1), record.dimension,
-                    record.old_length, record.new_length);
+                    record.old_length, record.new_length,
+                    record.thread, record.time, record.stage.c_str());
         } else {
             fprintf(stderr,
-                    "lsh_best_trace: seq=%lu dim=%ld old=none new=%.9g\n",
+                    "lsh_best_trace: seq=%lu dim=%ld old=none new=%.9g thread=%d time=%.6f stage=\"%s\"\n",
                     (unsigned long)(i + 1), record.dimension,
-                    record.new_length);
+                    record.new_length,
+                    record.thread, record.time, record.stage.c_str());
         }
     }
     pthread_mutex_unlock(&lsh_best_solution_lock);

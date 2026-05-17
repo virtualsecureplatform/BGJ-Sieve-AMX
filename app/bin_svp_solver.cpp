@@ -296,11 +296,21 @@ static void solver_profile_best_line(const char *stage)
     fflush(stdout);
 }
 
-#define SOLVER_PROFILE_DO(label, stmt) do {               \
-        double __solver_profile_t0 = solver_now();        \
-        stmt;                                             \
-        solver_profile_line(label, solver_now() - __solver_profile_t0); \
-        solver_profile_best_line(label);                  \
+#define SOLVER_PROFILE_DO(label, stmt) do {                                      \
+        double __solver_profile_t0 = solver_now();                               \
+        const int __solver_lsh_trace_active = bgj_lsh_best_solution_trace_is_enabled(); \
+        char __solver_lsh_trace_prev[256];                                       \
+        if (__solver_lsh_trace_active) {                                         \
+            bgj_lsh_best_solution_trace_stage_copy(__solver_lsh_trace_prev,      \
+                                                   (long)sizeof(__solver_lsh_trace_prev)); \
+            bgj_lsh_best_solution_trace_stage_set(label);                        \
+        }                                                                        \
+        stmt;                                                                    \
+        if (__solver_lsh_trace_active) {                                         \
+            bgj_lsh_best_solution_trace_stage_set(__solver_lsh_trace_prev);      \
+        }                                                                        \
+        solver_profile_line(label, solver_now() - __solver_profile_t0);          \
+        solver_profile_best_line(label);                                         \
     } while (0)
 
 int __progressive_LLL(Lattice_QP *L) {

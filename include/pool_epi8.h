@@ -382,6 +382,9 @@ struct lsh_profile_data_t;
 void bgj_lsh_best_solution_reset();
 int bgj_lsh_best_solution_get(double *length, double *vec, long capacity, long *dimension);
 int bgj_lsh_best_solution_record(double length, const double *vec, long dimension);
+int bgj_lsh_best_solution_trace_is_enabled();
+void bgj_lsh_best_solution_trace_stage_set(const char *stage);
+void bgj_lsh_best_solution_trace_stage_copy(char *dst, long capacity);
 void bgj_lsh_best_solution_trace_dump();
 
 #if defined(__AMX_INT8__) && BOOST_AMX_SIEVE

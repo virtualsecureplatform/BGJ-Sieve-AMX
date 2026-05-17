@@ -6,6 +6,7 @@
 #if defined(HAVE_CUDA)
 #include "../include/bgj_cuda.h"
 #endif
+#include <cstdarg>
 #include <sys/time.h>
 #include <cmath>
 #include <cstdlib>
@@ -71,6 +72,12 @@ static int svp_stage_trace_pool_enabled()
     return env && env[0] && env[0] != '0';
 }
 
+static int svp_lsh_settle_stop_after_tail_enabled()
+{
+    const char *env = std::getenv("BGJ_LSH_SETTLE_STOP_AFTER_TAIL_LLL");
+    return env && env[0] && env[0] != '0';
+}
+
 static double svp_profile_now()
 {
     struct timeval tv;
@@ -113,6 +120,87 @@ static long long svp_pool_best_norm(const Pool_epi8_t<nb> &p)
 static double svp_pool_norm_to_length(long long norm)
 {
     return norm >= 0 ? std::sqrt(2.0 * (double)norm) : 0.0;
+}
+
+static int svp_lsh_trace_stage_pushf(char *old_stage, long old_capacity,
+                                     const char *fmt, ...)
+{
+    if (!bgj_lsh_best_solution_trace_is_enabled()) {
+        if (old_stage != NULL && old_capacity > 0) old_stage[0] = '\0';
+        return 0;
+    }
+
+    char parent[256];
+    char local[256];
+    char combined[512];
+    bgj_lsh_best_solution_trace_stage_copy(parent, (long)sizeof(parent));
+
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(local, sizeof(local), fmt, ap);
+    va_end(ap);
+
+    if (parent[0] != '\0') {
+        snprintf(combined, sizeof(combined), "%s|%s", parent, local);
+    } else {
+        snprintf(combined, sizeof(combined), "%s", local);
+    }
+    if (old_stage != NULL && old_capacity > 0) {
+        snprintf(old_stage, (size_t)old_capacity, "%s", parent);
+    }
+    bgj_lsh_best_solution_trace_stage_set(combined);
+    return 1;
+}
+
+static void svp_lsh_trace_stage_restore(const char *old_stage)
+{
+    bgj_lsh_best_solution_trace_stage_set(old_stage);
+}
+
+template <uint32_t nb>
+static int svp_lsfsh_insert_traced(Pool_epi8_t<nb> &p, long seq, long n,
+                                   long msd, long ind, double eta,
+                                   long log_level, double qratio)
+{
+    char old_stage[256];
+    const int active = svp_lsh_trace_stage_pushf(
+        old_stage, (long)sizeof(old_stage),
+        "insert seq=%ld n=%ld msd=%ld ind=%ld csd=%ld index_l=%ld",
+        seq, n, msd, ind, p.CSD, p.index_l);
+    const int ret = p.lsfsh_insert(ind, eta, log_level, 0.0, 0.0, qratio);
+    if (active) svp_lsh_trace_stage_restore(old_stage);
+    return ret;
+}
+
+template <uint32_t nb>
+static int svp_show_lsfsh_insert_traced(Pool_epi8_t<nb> &p, long n, long msd,
+                                        long ext_d, long minsd,
+                                        long lift_start_csd, long log_level,
+                                        double qratio)
+{
+    char old_stage[256];
+    const int active = svp_lsh_trace_stage_pushf(
+        old_stage, (long)sizeof(old_stage),
+        "show_lsfsh n=%ld msd=%ld ext_d=%ld minsd=%ld lift_start=%ld csd=%ld",
+        n, msd, ext_d, minsd, lift_start_csd, p.CSD);
+    const int ret = p.show_lsfsh_insert(0, 10.0, log_level, 0, 0, qratio);
+    if (active) svp_lsh_trace_stage_restore(old_stage);
+    return ret;
+}
+
+template <uint32_t nb>
+static int svp_show_min_lift_traced(Pool_epi8_t<nb> &p, long n, long msd,
+                                    long ext_d, long minsd,
+                                    long lift_start_csd)
+{
+    char old_stage[256];
+    const int active = svp_lsh_trace_stage_pushf(
+        old_stage, (long)sizeof(old_stage),
+        "show_min_lift n=%ld msd=%ld ext_d=%ld minsd=%ld lift_start=%ld csd=%ld",
+        n, msd, ext_d, minsd, lift_start_csd, p.CSD);
+    const int ret = p.show_min_lift(0);
+    if (active) svp_lsh_trace_stage_restore(old_stage);
+    return ret;
 }
 
 template <uint32_t nb>
@@ -641,6 +729,7 @@ void __lsh_pump_red_epi8(Lattice_QP *L, long num_threads, double eta, double qra
     long profile_tail_lll_count = 0;
     int profile_stop_hit = 0;
     double profile_stop_best_length = 0.0;
+    const int settle_stop_after_tail = svp_lsh_settle_stop_after_tail_enabled();
 
 
     bool GET_STUCKED = shuffle_first;
@@ -718,7 +807,7 @@ void __lsh_pump_red_epi8(Lattice_QP *L, long num_threads, double eta, double qra
                     const double __trace_insert_t0 = stage_trace ? svp_profile_now() : 0.0;                     \
                     int __trace_insert_ret = 0;                                                                  \
                     if (p.CSD >= 80) {                                                                          \
-                        SVP_PROFILE_ASSIGN(profile_insert, __trace_insert_ret, p.lsfsh_insert(ind, eta, log_level - 3, 0.0, 0.0, qratio)); \
+                        SVP_PROFILE_ASSIGN(profile_insert, __trace_insert_ret, svp_lsfsh_insert_traced(p, profile_seq, n, msd, ind, eta, log_level - 3, qratio)); \
                     } else {                                                                                    \
                         SVP_PROFILE_ASSIGN(profile_insert, __trace_insert_ret, p.insert(ind, eta));             \
                     }                                                                                           \
@@ -730,7 +819,8 @@ void __lsh_pump_red_epi8(Lattice_QP *L, long num_threads, double eta, double qra
                                               svp_profile_now() - profile_total_start,                          \
                                               svp_profile_now() - __trace_insert_t0, __trace_insert_ret);        \
                     }                                                                                           \
-                    if (svp_lsh_best_at_or_below(L->NumCols(), stop_length, &profile_stop_best_length)) {        \
+                    const int __stop_after_insert = svp_lsh_best_at_or_below(L->NumCols(), stop_length, &profile_stop_best_length); \
+                    if (__stop_after_insert && !settle_stop_after_tail) {                                        \
                         profile_stop_hit = 1;                                                                   \
                         break;                                                                                  \
                     }                                                                                           \
@@ -752,6 +842,11 @@ void __lsh_pump_red_epi8(Lattice_QP *L, long num_threads, double eta, double qra
                                               __trace_tail_lsh_before, svp_lsh_best_length(L->NumCols()),       \
                                               svp_profile_now() - profile_total_start,                          \
                                               svp_profile_now() - __trace_tail_t0, __trace_tail_ret);            \
+                    }                                                                                           \
+                    if (__stop_after_insert ||                                                                   \
+                        svp_lsh_best_at_or_below(L->NumCols(), stop_length, &profile_stop_best_length)) {        \
+                        profile_stop_hit = 1;                                                                   \
+                        break;                                                                                  \
                     }                                                                                           \
                     if (pump_profile) {                                                                         \
                         fprintf(stderr, "lsh_pump_progress: seq=%ld n=%ld msd=%ld ind=%ld csd=%ld elapsed=%.6fs insert=%.6fs/%ld tail_lll=%.6fs/%ld bgj1=%.6fs/%ld bgj2=%.6fs/%ld bgj3=%.6fs/%ld\n", \
@@ -962,10 +1057,10 @@ double __last_lsh_pump_epi8(Lattice_QP *L, long num_threads, double qratio, doub
                     double __svp_lift_profile_t0 = (pump_profile || stage_trace) ? svp_profile_now() : 0.0; \
                     if (p.CSD < n - 24 && (((p.CSD >= msd) && ext_qratio != 0.0) || ((p.CSD < msd) && qratio != 0.0))) { \
                         __trace_lift_name = "show_lsfsh_insert";                                           \
-                        p.show_lsfsh_insert(0, 10.0, log_level-3, 0, 0, (p.CSD>=msd)?ext_qratio:qratio);    \
+                        svp_show_lsfsh_insert_traced(p, n, msd, ext_d, minsd, lift_start_csd, log_level-3, (p.CSD>=msd)?ext_qratio:qratio); \
                     } else {                                                                                \
                         __trace_lift_name = "show_min_lift";                                               \
-                        p.show_min_lift(0);                                                                 \
+                        svp_show_min_lift_traced(p, n, msd, ext_d, minsd, lift_start_csd);                  \
                     }                                                                                       \
                     __trace_lift_time = (pump_profile || stage_trace) ? svp_profile_now() - __svp_lift_profile_t0 : 0.0; \
                     if (pump_profile) profile_show_lift += __trace_lift_time;                               \
