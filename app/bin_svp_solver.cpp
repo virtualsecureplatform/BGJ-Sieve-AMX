@@ -864,6 +864,7 @@ int main(int argc, char** argv) {
     profile_t0 = solver_now();
     _svp_solver_red(&L, algo);
     solver_profile_line("solver_red_total", solver_now() - profile_t0);
+    bgj_lsh_best_solution_trace_dump();
     TIMER_END;
     
     const solver_best_row_t best_row = solver_find_best_basis_row(&L);

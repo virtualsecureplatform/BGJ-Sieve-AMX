@@ -382,6 +382,7 @@ struct lsh_profile_data_t;
 void bgj_lsh_best_solution_reset();
 int bgj_lsh_best_solution_get(double *length, double *vec, long capacity, long *dimension);
 int bgj_lsh_best_solution_record(double length, const double *vec, long dimension);
+void bgj_lsh_best_solution_trace_dump();
 
 #if defined(__AMX_INT8__) && BOOST_AMX_SIEVE
 struct booster_amx160_t;

@@ -50,12 +50,27 @@ struct lsh_best_solution_record_t {
     std::vector<double> vec;
 };
 
+struct lsh_best_trace_record_t {
+    long dimension;
+    int had_old;
+    double old_length;
+    double new_length;
+};
+
 static std::vector<lsh_best_solution_record_t> lsh_best_solution_records;
+static std::vector<lsh_best_trace_record_t> lsh_best_trace_records;
+
+static inline int lsh_best_trace_enabled()
+{
+    const char *env = getenv("BGJ_LSH_BEST_TRACE");
+    return env != NULL && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
+}
 
 void bgj_lsh_best_solution_reset()
 {
     pthread_mutex_lock(&lsh_best_solution_lock);
     lsh_best_solution_records.clear();
+    lsh_best_trace_records.clear();
     pthread_mutex_unlock(&lsh_best_solution_lock);
 }
 
@@ -93,6 +108,8 @@ static int lsh_record_best_solution(double length, const double *vec, long dimen
 {
     if (length <= 0.0 || vec == NULL || dimension <= 0) return 0;
     int updated = 0;
+    int had_old = 0;
+    double old_length = 0.0;
     pthread_mutex_lock(&lsh_best_solution_lock);
     lsh_best_solution_record_t *record = NULL;
     for (size_t i = 0; i < lsh_best_solution_records.size(); ++i) {
@@ -108,9 +125,19 @@ static int lsh_record_best_solution(double length, const double *vec, long dimen
         lsh_best_solution_records.push_back(new_record);
         updated = 1;
     } else if (length < record->length) {
+        had_old = 1;
+        old_length = record->length;
         record->length = length;
         record->vec.assign(vec, vec + dimension);
         updated = 1;
+    }
+    if (updated && lsh_best_trace_enabled()) {
+        lsh_best_trace_record_t trace_record;
+        trace_record.dimension = dimension;
+        trace_record.had_old = had_old;
+        trace_record.old_length = old_length;
+        trace_record.new_length = length;
+        lsh_best_trace_records.push_back(trace_record);
     }
     pthread_mutex_unlock(&lsh_best_solution_lock);
     return updated;
@@ -119,6 +146,27 @@ static int lsh_record_best_solution(double length, const double *vec, long dimen
 int bgj_lsh_best_solution_record(double length, const double *vec, long dimension)
 {
     return lsh_record_best_solution(length, vec, dimension);
+}
+
+void bgj_lsh_best_solution_trace_dump()
+{
+    if (!lsh_best_trace_enabled()) return;
+    pthread_mutex_lock(&lsh_best_solution_lock);
+    for (size_t i = 0; i < lsh_best_trace_records.size(); ++i) {
+        const lsh_best_trace_record_t &record = lsh_best_trace_records[i];
+        if (record.had_old) {
+            fprintf(stderr,
+                    "lsh_best_trace: seq=%lu dim=%ld old=%.9g new=%.9g\n",
+                    (unsigned long)(i + 1), record.dimension,
+                    record.old_length, record.new_length);
+        } else {
+            fprintf(stderr,
+                    "lsh_best_trace: seq=%lu dim=%ld old=none new=%.9g\n",
+                    (unsigned long)(i + 1), record.dimension,
+                    record.new_length);
+        }
+    }
+    pthread_mutex_unlock(&lsh_best_solution_lock);
 }
 
 static inline int lsh_env_profile_enabled()
