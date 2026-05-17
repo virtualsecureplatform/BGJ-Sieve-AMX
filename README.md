@@ -97,7 +97,7 @@ once it records a candidate at the same target, skipping the trailing local pump
 and rescue; override that with `BGJ_120T95_LSH_PUMP_STOP_LENGTH=<length>`.
 If that pump misses, `BGJ_120T95_LSH_RETRY=<n>` can run one or more
 single-insert late-LSH probes before final rescue; it defaults to `0` because
-the probe is only useful when it avoids the rescue. Tune
+the final rescue is now quality-driven. Tune
 `BGJ_120T95_LSH_RETRY_NI`, `BGJ_120T95_LSH_RETRY_MSD`,
 `BGJ_120T95_LSH_RETRY_F`, and `BGJ_120T95_LSH_RETRY_QRATIO`.
 When auto mode decides the final rescue is needed, the trailing
@@ -109,6 +109,9 @@ below the final MSD, default `12` for the validated SVP-120 rescue trajectory;
 use `BGJ_120T95_FINAL_LSH_LIFT_START_CSD=<dim>` for an absolute start point.
 Smaller margins reduce rescue lift probes but can miss the best lifted vector;
 larger margins probe earlier and may shorten later BGJ3 rescue work.
+In auto mode, `BGJ_120T95_FINAL_LSH_ATTEMPTS` defaults to `2`, so a rescue
+pass that still misses the GH-based quality target is followed by one more
+rescue pass. Set it to `1` to restore the old single-shot behavior.
 `BGJ_120T95_FINAL_LSH_STOP_LENGTH=<length>` overrides the rescue early-stop
 threshold.
 Plain `--cuda` uses one CUDA execution device unless `BGJ_CUDA_DEVICES` or

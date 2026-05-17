@@ -535,54 +535,84 @@ int _svp_solver_red(Lattice_QP* L, long algo) {
                                                           final_lift_start_default);
             const double final_stop_length = solver_env_double("BGJ_120T95_FINAL_LSH_STOP_LENGTH",
                                                                final_lsh_target);
-            double final_lsh_length = 0.0;
-            char final_lsh_label[128];
-            snprintf(final_lsh_label, sizeof(final_lsh_label),
-                     "120t95 final_lsh_%ld_%ld_q%.3f",
-                     final_msd, final_ext_d, final_qratio);
+            const long final_attempts_default = (final_lsh_mode == 2) ? 2 : 1;
+            long final_attempts = solver_env_long("BGJ_120T95_FINAL_LSH_ATTEMPTS",
+                                                  final_attempts_default);
+            if (final_attempts < 1) final_attempts = 1;
             if (profile && final_threads != num_threads) {
                 printf("final_lsh_thread_policy: algo=120t95 solver_threads=%ld final_lsh_threads=%ld\n",
                        num_threads, final_threads);
                 fflush(stdout);
             }
-            if (solver_svp120_final_lsh_single_gpu()) {
-                if (profile) {
-                    printf("final_lsh_cuda_policy: algo=120t95 primary_thread_device=1 multi_gpu_batch=0\n");
+            for (long final_attempt = 0; final_attempt < final_attempts; ++final_attempt) {
+                double final_lsh_length = 0.0;
+                char final_lsh_label[128];
+                if (final_attempts > 1) {
+                    snprintf(final_lsh_label, sizeof(final_lsh_label),
+                             "120t95 final_lsh_%ld_%ld_q%.3f_try_%ld",
+                             final_msd, final_ext_d, final_qratio, final_attempt + 1);
+                } else {
+                    snprintf(final_lsh_label, sizeof(final_lsh_label),
+                             "120t95 final_lsh_%ld_%ld_q%.3f",
+                             final_msd, final_ext_d, final_qratio);
+                }
+                if (profile && final_attempts > 1) {
+                    solver_best_candidate_t attempt_best = solver_find_best_candidate(L);
+                    printf("final_lsh_attempt: algo=120t95 attempt=%ld/%ld current_best=%.9g source=%s target=%.9g\n",
+                           final_attempt + 1, final_attempts, attempt_best.length,
+                           attempt_best.source, final_lsh_target);
                     fflush(stdout);
                 }
-                solver_scoped_env_override_t primary_device("BGJ_CUDA_PRIMARY_THREAD_DEVICE", "1");
-                solver_scoped_env_override_t no_multi_batch("BGJ_CUDA_MULTI_GPU_BATCH", "0");
-                solver_scoped_env_override_t no_batch_split("BGJ_CUDA_MULTI_GPU_BATCH_SPLIT", "0");
-                SOLVER_PROFILE_DO(final_lsh_label,
-                                  final_lsh_length = __last_lsh_pump_epi8(L, final_threads,
-                                                                           final_qratio,
-                                                                           final_ext_qratio,
-                                                                           final_msd,
-                                                                           final_ext_d,
-                                                                           final_log,
-                                                                           final_shuffle,
-                                                                           final_minsd,
-                                                                           final_stop_length,
-                                                                           final_lift_start));
-            } else {
-                if (profile) {
-                    printf("final_lsh_cuda_policy: algo=120t95 inherited\n");
-                    fflush(stdout);
+                if (solver_svp120_final_lsh_single_gpu()) {
+                    if (profile && final_attempt == 0) {
+                        printf("final_lsh_cuda_policy: algo=120t95 primary_thread_device=1 multi_gpu_batch=0\n");
+                        fflush(stdout);
+                    }
+                    solver_scoped_env_override_t primary_device("BGJ_CUDA_PRIMARY_THREAD_DEVICE", "1");
+                    solver_scoped_env_override_t no_multi_batch("BGJ_CUDA_MULTI_GPU_BATCH", "0");
+                    solver_scoped_env_override_t no_batch_split("BGJ_CUDA_MULTI_GPU_BATCH_SPLIT", "0");
+                    SOLVER_PROFILE_DO(final_lsh_label,
+                                      final_lsh_length = __last_lsh_pump_epi8(L, final_threads,
+                                                                               final_qratio,
+                                                                               final_ext_qratio,
+                                                                               final_msd,
+                                                                               final_ext_d,
+                                                                               final_log,
+                                                                               final_shuffle,
+                                                                               final_minsd,
+                                                                               final_stop_length,
+                                                                               final_lift_start));
+                } else {
+                    if (profile && final_attempt == 0) {
+                        printf("final_lsh_cuda_policy: algo=120t95 inherited\n");
+                        fflush(stdout);
+                    }
+                    SOLVER_PROFILE_DO(final_lsh_label,
+                                      final_lsh_length = __last_lsh_pump_epi8(L, final_threads,
+                                                                               final_qratio,
+                                                                               final_ext_qratio,
+                                                                               final_msd,
+                                                                               final_ext_d,
+                                                                               final_log,
+                                                                               final_shuffle,
+                                                                               final_minsd,
+                                                                               final_stop_length,
+                                                                               final_lift_start));
                 }
-                SOLVER_PROFILE_DO(final_lsh_label,
-                                  final_lsh_length = __last_lsh_pump_epi8(L, final_threads,
-                                                                           final_qratio,
-                                                                           final_ext_qratio,
-                                                                           final_msd,
-                                                                           final_ext_d,
-                                                                           final_log,
-                                                                           final_shuffle,
-                                                                           final_minsd,
-                                                                           final_stop_length,
-                                                                           final_lift_start));
-            }
-            if (final_lsh_length > 0.0) {
-                printf("final_lsh_best: algo=120t95 length=%.9g\n", final_lsh_length);
+                if (final_lsh_length > 0.0) {
+                    printf("final_lsh_best: algo=120t95 attempt=%ld length=%.9g\n",
+                           final_attempt + 1, final_lsh_length);
+                }
+                if (final_lsh_mode == 2 &&
+                    solver_svp120_quality_satisfied(L, final_lsh_target, &quality_candidate)) {
+                    if (profile) {
+                        printf("quality_stop: algo=120t95 after=final_lsh_attempt_%ld current_best=%.9g source=%s target=%.9g\n",
+                               final_attempt + 1, quality_candidate.length,
+                               quality_candidate.source, final_lsh_target);
+                        fflush(stdout);
+                    }
+                    break;
+                }
             }
         }
 
