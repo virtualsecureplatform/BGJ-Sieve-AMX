@@ -9,6 +9,7 @@
 #include <string.h>
 #include <sys/time.h>
 #include <algorithm>
+#include <limits>
 #include <thread>
 #include <vector>
 
@@ -39,6 +40,13 @@ static int bgj_insert_phase_profile_enabled()
 static int bgj_insert_global_best_enabled()
 {
     const char *env = getenv("BGJ_INSERT_GLOBAL_BEST");
+    if (!env || !env[0]) return 0;
+    return env[0] != '0';
+}
+
+static int bgj_quality_trace_enabled()
+{
+    const char *env = getenv("BGJ_QUALITY_TRACE");
     if (!env || !env[0]) return 0;
     return env[0] != '0';
 }
@@ -3735,6 +3743,69 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
     uint64_t insert_copy_count = 0;
     uint64_t insert_compact_move = 0;
     const int global_best_insert = bgj_insert_global_best_enabled();
+    const int quality_trace = bgj_quality_trace_enabled();
+    const int32_t trace_no_norm = std::numeric_limits<int32_t>::max();
+    auto trace_observe_norm = [&](int32_t &best, int32_t value) {
+        if (value < best) best = value;
+    };
+    auto trace_pool_best_norm = [&]() -> int32_t {
+        int32_t best = trace_no_norm;
+        for (long i = 0; i < num_vec; i++) {
+            trace_observe_norm(best, vnorm[i]);
+        }
+        return best;
+    };
+    auto trace_norm_value = [&](int32_t value) -> long long {
+        return value == trace_no_norm ? -1LL : (long long)value;
+    };
+    const int32_t trace_pool_best_before =
+        quality_trace ? trace_pool_best_norm() : trace_no_norm;
+    auto trace_print_insert = [&](const char *path,
+                                  uint64_t total_sol,
+                                  uint64_t candidates,
+                                  uint64_t accepted,
+                                  uint64_t linfty_failed,
+                                  uint64_t l2_failed,
+                                  uint64_t not_try,
+                                  int32_t materialized_best,
+                                  int32_t candidate_best,
+                                  int32_t accepted_best,
+                                  int32_t linfty_best,
+                                  int32_t l2_best,
+                                  int32_t replaced_pool_best) {
+        if (!quality_trace) return;
+        const int32_t pool_best_after = trace_pool_best_norm();
+        fprintf(stderr,
+                "bgj_quality_trace_insert: nb=%u csd=%ld index_l=%ld index_r=%ld path=%s "
+                "total=%llu candidates=%llu accepted=%llu linfty=%llu l2=%llu not_try=%llu "
+                "empty_budget=%ld replace_budget=%ld num_vec=%ld sorted_index=%ld "
+                "pool_best_before=%lld pool_best_after=%lld materialized_best=%lld "
+                "candidate_best=%lld accepted_best=%lld linfty_best=%lld l2_best=%lld "
+                "replaced_pool_best=%lld\n",
+                nb,
+                CSD,
+                index_l,
+                index_r,
+                path,
+                (unsigned long long)total_sol,
+                (unsigned long long)candidates,
+                (unsigned long long)accepted,
+                (unsigned long long)linfty_failed,
+                (unsigned long long)l2_failed,
+                (unsigned long long)not_try,
+                num_total_empty,
+                num_total_nonempty,
+                num_vec,
+                sorted_index,
+                trace_norm_value(trace_pool_best_before),
+                trace_norm_value(pool_best_after),
+                trace_norm_value(materialized_best),
+                trace_norm_value(candidate_best),
+                trace_norm_value(accepted_best),
+                trace_norm_value(linfty_best),
+                trace_norm_value(l2_best),
+                trace_norm_value(replaced_pool_best));
+    };
     if (batch_uid_erase && num_total_sol > 0) {
         deferred_uid_erase =
             (uint64_t *)NEW_VEC(num_total_sol, sizeof(uint64_t));
@@ -4026,13 +4097,22 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
         candidates.reserve((size_t)num_total_sol);
         accepted.reserve((size_t)(num_total_empty + num_total_nonempty));
         uid_to_erase.reserve((size_t)num_total_sol);
+        int32_t trace_materialized_best = trace_no_norm;
+        int32_t trace_candidate_best = trace_no_norm;
+        int32_t trace_accepted_best = trace_no_norm;
+        int32_t trace_linfty_best = trace_no_norm;
+        int32_t trace_l2_best = trace_no_norm;
+        int32_t trace_replaced_pool_best = trace_no_norm;
 
         for (long ind = 0; ind < num_total_sol; ++ind) {
+            if (quality_trace) trace_observe_norm(trace_materialized_best, vnorm_to_insert[ind]);
             if (vnorm_to_insert[ind] > linfty_fail_bound) {
+                if (quality_trace) trace_observe_norm(trace_linfty_best, vnorm_to_insert[ind]);
                 staged_num_linfty_failed++;
                 uid_to_erase.push_back(vu_to_insert[ind]);
                 continue;
             }
+            if (quality_trace) trace_observe_norm(trace_candidate_best, vnorm_to_insert[ind]);
             int r = round(sqrt((10000.0 * vnorm_to_insert[ind]) / goal_norm));
             if (r > 255) r = 255;
             if (r < 0) r = 0;
@@ -4058,6 +4138,10 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
             if (nonempty_ind >= nonempty_begin_global) {
                 const uint32_t dst = *((uint32_t *)(cvec + 3LL * nonempty_ind));
                 if (vnorm_to_insert[ind] < vnorm[dst]) {
+                    if (quality_trace) {
+                        trace_observe_norm(trace_accepted_best, vnorm_to_insert[ind]);
+                        trace_observe_norm(trace_replaced_pool_best, vnorm[dst]);
+                    }
                     uid_to_erase.push_back(vu[dst]);
                     accepted.push_back({(uint32_t)ind,
                                         dst,
@@ -4072,6 +4156,7 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
                 }
             }
             if (!accepted_candidate && empty_ind < empty_end_global) {
+                if (quality_trace) trace_observe_norm(trace_accepted_best, vnorm_to_insert[ind]);
                 accepted.push_back({(uint32_t)ind,
                                     (uint32_t)empty_ind,
                                     (uint32_t)empty_ind,
@@ -4084,6 +4169,7 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
                 accepted_candidate = 1;
             }
             if (!accepted_candidate) {
+                if (quality_trace) trace_observe_norm(trace_l2_best, vnorm_to_insert[ind]);
                 staged_num_l2_failed++;
                 uid_to_erase.push_back(vu_to_insert[ind]);
             }
@@ -4170,6 +4256,19 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
             num_empty -= empty_ind - num_vec;
             num_vec = empty_ind;
             sorted_index = nonempty_ind + 1;
+            trace_print_insert("staged_global",
+                               (uint64_t)num_total_sol,
+                               (uint64_t)candidates.size(),
+                               (uint64_t)accepted.size(),
+                               staged_num_linfty_failed,
+                               staged_num_l2_failed,
+                               staged_num_not_try,
+                               trace_materialized_best,
+                               trace_candidate_best,
+                               trace_accepted_best,
+                               trace_linfty_best,
+                               trace_l2_best,
+                               trace_replaced_pool_best);
             if (prof) {
                 pthread_spin_lock(&prof->profile_lock);
                 prof->materialize_time += materialize_total_time;
@@ -4269,12 +4368,21 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
         const int32_t linfty_fail_bound = 1.2 * goal_norm;
         std::vector<global_insert_candidate_t> candidates;
         candidates.reserve((size_t)num_total_sol);
+        int32_t trace_materialized_best = trace_no_norm;
+        int32_t trace_candidate_best = trace_no_norm;
+        int32_t trace_accepted_best = trace_no_norm;
+        int32_t trace_linfty_best = trace_no_norm;
+        int32_t trace_l2_best = trace_no_norm;
+        int32_t trace_replaced_pool_best = trace_no_norm;
         for (long ind = 0; ind < num_total_sol; ++ind) {
+            if (quality_trace) trace_observe_norm(trace_materialized_best, vnorm_to_insert[ind]);
             if (vnorm_to_insert[ind] > linfty_fail_bound) {
+                if (quality_trace) trace_observe_norm(trace_linfty_best, vnorm_to_insert[ind]);
                 num_linfty_failed++;
                 if (!uid->erase_uid(vu_to_insert[ind])) insert_uid_erase_fail++;
                 continue;
             }
+            if (quality_trace) trace_observe_norm(trace_candidate_best, vnorm_to_insert[ind]);
             int r = round(sqrt((10000.0 * vnorm_to_insert[ind]) / goal_norm));
             if (r > 255) r = 255;
             if (r < 0) r = 0;
@@ -4308,6 +4416,10 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
             if (nonempty_ind >= nonempty_begin_global) {
                 const uint32_t dst = *((uint32_t *)(cvec + 3LL * nonempty_ind));
                 if (vnorm_to_insert[ind] < vnorm[dst]) {
+                    if (quality_trace) {
+                        trace_observe_norm(trace_accepted_best, vnorm_to_insert[ind]);
+                        trace_observe_norm(trace_replaced_pool_best, vnorm[dst]);
+                    }
                     erase_existing_uid(vu[dst]);
                     copy_global_insert_vec(vec + dst * vec_length, ind);
                     vnorm[dst] = vnorm_to_insert[ind];
@@ -4321,6 +4433,7 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
                 }
             }
             if (!accepted && empty_ind < empty_end_global) {
+                if (quality_trace) trace_observe_norm(trace_accepted_best, vnorm_to_insert[ind]);
                 copy_global_insert_vec(vec + empty_ind * vec_length, ind);
                 vnorm[empty_ind] = vnorm_to_insert[ind];
                 vsum[empty_ind] = vsum_to_insert[ind];
@@ -4333,6 +4446,7 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
                 accepted = 1;
             }
             if (!accepted) {
+                if (quality_trace) trace_observe_norm(trace_l2_best, vnorm_to_insert[ind]);
                 num_l2_failed++;
                 if (!uid->erase_uid(vu_to_insert[ind])) insert_uid_erase_fail++;
             }
@@ -4342,6 +4456,19 @@ uint64_t Pool_epi8_t<nb>::_pool_insert(sol_list_epi8_t **sol_list, long num_sol_
         num_empty -= empty_ind - num_vec;
         num_vec = empty_ind;
         sorted_index = nonempty_ind + 1;
+        trace_print_insert("global",
+                           (uint64_t)num_total_sol,
+                           (uint64_t)candidates.size(),
+                           num_total_insert,
+                           num_linfty_failed,
+                           num_l2_failed,
+                           num_not_try,
+                           trace_materialized_best,
+                           trace_candidate_best,
+                           trace_accepted_best,
+                           trace_linfty_best,
+                           trace_l2_best,
+                           trace_replaced_pool_best);
         if (prof) {
             pthread_spin_lock(&prof->profile_lock);
             prof->materialize_time += materialize_total_time;

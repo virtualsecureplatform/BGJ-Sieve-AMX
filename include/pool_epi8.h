@@ -1146,8 +1146,8 @@ struct Pool_epi8_t {
         int32_t _opt_ldh_bucket_radius(long total_num, uint32_t ndual, long type);
         void _opt_ldh_threshold(float *dual_vec, uint32_t &ndual, int32_t &threshold, double &tail_alpha_bound,
                         double dual_exp_len, const double *tail_alpha_prob_list, Lattice_QP *L, double ratio, long log_level);
-        void _opt_nsh_threshold(float *dual_vec, uint32_t *compress_pos, int32_t &num_hbits, int32_t &num_tbits, int32_t &threshold, 
-                        Lattice_QP *b_mid, uint32_t shsize, double exp_length, double *tail_alpha_prob_list, long log_level);
+        void _opt_nsh_threshold(float *dual_vec, uint32_t *compress_pos, int32_t &num_hbits, int32_t &num_tbits, int32_t &threshold,
+                        Lattice_QP *b_mid, uint32_t shsize, double exp_length, double *tail_alpha_prob_list, long log_level, long target_index);
         // only called in dh/sh insert
         int __basis_insert(long dst_index, float *v_fp, long FD, float **b_full_fp);
         template <uint32_t shsize, uint32_t l1_block, uint32_t l2_block>

@@ -368,11 +368,17 @@ void Pool_epi8_t<nb>::_process_nshl1_block(uint8_t *shi, uint8_t *shj, long ibia
 
 
 // the implementation is in naivedh_epi8.cpp
-int gen_dual_vec_list(float *dst, Lattice_QP *L, long log_level, long nlist);
+int gen_dual_vec_list(float *dst, Lattice_QP *L, long log_level, long nlist, int rng_seed = -1);
+
+static long lsh_param_seed_offset()
+{
+    const char *env = getenv("BGJ_LSH_PARAM_SEED_OFFSET");
+    return (env && env[0]) ? atol(env) : 0;
+}
 
 template <uint32_t nb>
-void Pool_epi8_t<nb>::_opt_nsh_threshold(float *dual_vec, uint32_t *compress_pos, int32_t &num_hbits, int32_t &num_tbits, int32_t &threshold, 
-                        Lattice_QP *b_mid, uint32_t shsize, double exp_length, double *tail_alpha_prob_list, long log_level) {
+void Pool_epi8_t<nb>::_opt_nsh_threshold(float *dual_vec, uint32_t *compress_pos, int32_t &num_hbits, int32_t &num_tbits, int32_t &threshold,
+                        Lattice_QP *b_mid, uint32_t shsize, double exp_length, double *tail_alpha_prob_list, long log_level, long target_index) {
     // number of samples
     const long N = (CSD >= 120) ? 1048576 : (1L << (CSD/5-4));
     const long dh_dim = b_mid->NumRows();
@@ -382,6 +388,19 @@ void Pool_epi8_t<nb>::_opt_nsh_threshold(float *dual_vec, uint32_t *compress_pos
     // CHANGE_WITH_ARCH
     const double sh_cost = 0.4 / 1073741824.0;
     const double lift_cost = 100.0 / 1073741824.0;
+
+    const int param_seed = (int)(0x5f3759dfu
+                                 + (uint32_t)(CSD * 131)
+                                 + (uint32_t)(index_l * 1009)
+                                 + (uint32_t)(index_r * 9176)
+                                 + (uint32_t)(target_index * 65537)
+                                 + (uint32_t)(shsize * 8191)
+                                 + (uint32_t)lsh_param_seed_offset());
+    DGS1d param_R(param_seed);
+    auto param_uniform_long = [&](long bound) -> long {
+        if (bound <= 0) return 0;
+        return (long)(param_R.Uniform_u64() % (uint64_t)bound);
+    };
 
     // generate compress pos
     for (long i = 0; i < shsize * 8; i++) {
@@ -393,16 +412,16 @@ void Pool_epi8_t<nb>::_opt_nsh_threshold(float *dual_vec, uint32_t *compress_pos
             compress_pos[6 * i + 4] = i;
             compress_pos[6 * i + 5] = i;
         } else {
-            compress_pos[6 * i + 0] = Uniform_long(tail_dim);
-            compress_pos[6 * i + 1] = Uniform_long(tail_dim);
-            compress_pos[6 * i + 2] = Uniform_long(tail_dim);
-            compress_pos[6 * i + 3] = Uniform_long(tail_dim);
-            compress_pos[6 * i + 4] = Uniform_long(tail_dim);
-            compress_pos[6 * i + 5] = Uniform_long(tail_dim);
+            compress_pos[6 * i + 0] = param_uniform_long(tail_dim);
+            compress_pos[6 * i + 1] = param_uniform_long(tail_dim);
+            compress_pos[6 * i + 2] = param_uniform_long(tail_dim);
+            compress_pos[6 * i + 3] = param_uniform_long(tail_dim);
+            compress_pos[6 * i + 4] = param_uniform_long(tail_dim);
+            compress_pos[6 * i + 5] = param_uniform_long(tail_dim);
         }
     }
     // generate dual vector
-    gen_dual_vec_list(dual_vec, b_mid, log_level, shsize * 8);
+    gen_dual_vec_list(dual_vec, b_mid, log_level, shsize * 8, param_seed + 1);
     float **b_local = (float **) NEW_MAT(dh_dim, _CEIL8(dh_dim), sizeof(float));
     float *b_local_idiag = (float *) NEW_VEC(dh_dim, sizeof(float));
     for (long i = 0; i < dh_dim; i++) {
@@ -422,7 +441,7 @@ void Pool_epi8_t<nb>::_opt_nsh_threshold(float *dual_vec, uint32_t *compress_pos
         for (long thread = 0; thread < num_threads; thread++) {
             __attribute__ ((aligned (32))) float ftmp[_CEIL8(NSH_DEFAULT_DHDIM)] = {};
             __attribute__ ((aligned (32))) float ttmp[256] = {};
-            DGS1d R(thread);
+            DGS1d R(param_seed + 4096 + thread);
             const long begin_ind = (thread * (N+1)) / num_threads;
             const long end_ind = ((thread + 1) * (N+1)) / num_threads;
             for (long ind = end_ind - 1; ind >= begin_ind; ind--) {
@@ -487,7 +506,7 @@ void Pool_epi8_t<nb>::_opt_nsh_threshold(float *dual_vec, uint32_t *compress_pos
             __attribute__ ((aligned (32))) float ftmp2[_CEIL8(NSH_DEFAULT_DHDIM)] = {};
             __attribute__ ((aligned (32))) float ttmp1[256] = {};
             __attribute__ ((aligned (32))) float ttmp2[256] = {};
-            DGS1d R(thread);
+            DGS1d R(param_seed + 8192 + thread);
 
             for (long ind = end_ind - 1; ind >= begin_ind; ind--) {
                 float alpha = 0.01 * ai_list[ind];
@@ -496,7 +515,7 @@ void Pool_epi8_t<nb>::_opt_nsh_threshold(float *dual_vec, uint32_t *compress_pos
                 float _head_sum_len = sqrt(exp_length * exp_length - _tail_sum_len * _tail_sum_len);
 
                 // hpart
-                for (long i = 0; i < dh_dim; i++) ftmp1[i] = Uniform_u64() & 0xffff;
+                for (long i = 0; i < dh_dim; i++) ftmp1[i] = R.Uniform_u64() & 0xffff;
                 for (long i = dh_dim - 1; i >= 0; i--) {
                     red_avx2(ftmp1, b_local[i], roundf(b_local_idiag[i] * ftmp1[i]), dh_dim);
                 }
@@ -1663,8 +1682,8 @@ int Pool_epi8_t<nb>::naivesh_insert(long target_index, double eta, long log_leve
     // input values
     Lattice_QP *b_mid = basis->b_loc_QP(index_l - NSH_DEFAULT_DHDIM, index_l);
     TIMER_START;
-    _opt_nsh_threshold(dual_vec, compress_pos, num_hbits, num_tbits, threshold, 
-                        b_mid, NSH_DEFAULT_SHSIZE, exp_length, tail_alpha_prob_list, log_level);
+    _opt_nsh_threshold(dual_vec, compress_pos, num_hbits, num_tbits, threshold,
+                        b_mid, NSH_DEFAULT_SHSIZE, exp_length, tail_alpha_prob_list, log_level, target_index);
     TIMER_END;
     delete b_mid;
     if (log_level >= 0) printf("param_opt_time = %.2fs, num_hbits = %d, num_tbits = %d, threshold = %d\n", CURRENT_TIME, num_hbits, num_tbits, threshold);

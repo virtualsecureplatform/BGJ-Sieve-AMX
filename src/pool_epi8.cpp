@@ -7,6 +7,7 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <limits>
 #include <sys/time.h>
 
 #define POOL_EPI8_RATIO_ADJ ( CSD < 80 ? pow(1.01, CSD - 80) : 1.0)
@@ -50,6 +51,13 @@ static int pool_epi8_lift_profile_enabled()
     const char *env = getenv("BGJ_LIFT_PROFILE");
     if (env == NULL) env = getenv("BGJ_PUMP_PROFILE");
     return env != NULL && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
+}
+
+static int pool_epi8_quality_trace_enabled()
+{
+    const char *env = getenv("BGJ_QUALITY_TRACE");
+    if (!env || !env[0]) return 0;
+    return env[0] != '0';
 }
 
 static int bgj_tail_lll_use_fplll()
@@ -1332,6 +1340,22 @@ int Pool_epi8_t<nb>::tail_LLL(double delta, long n) {
         n = CSD;
     }
 
+    const int quality_trace = pool_epi8_quality_trace_enabled();
+    const int32_t trace_no_norm = std::numeric_limits<int32_t>::max();
+    auto trace_pool_best_norm = [&]() -> int32_t {
+        int32_t best = trace_no_norm;
+        for (long i = 0; i < num_vec; i++) {
+            if (vnorm[i] < best) best = vnorm[i];
+        }
+        return best;
+    };
+    auto trace_norm_value = [&](int32_t value) -> long long {
+        return value == trace_no_norm ? -1LL : (long long)value;
+    };
+    const int32_t trace_pool_best_before =
+        quality_trace ? trace_pool_best_norm() : trace_no_norm;
+    const long trace_num_vec_before = num_vec;
+
     // create a new Lattice_QP and LLL
     uint8_t *_b_dual_old = (uint8_t *) NEW_VEC(CSD * vec_length, sizeof(uint8_t));
     if (!_b_dual_old) return 0;
@@ -1656,7 +1680,27 @@ int Pool_epi8_t<nb>::tail_LLL(double delta, long n) {
         }
     }
 
-    PROCESS_COLLISION_LIST;                                              
+    const uint32_t trace_collision_count = quality_trace ? num_collision : 0;
+    PROCESS_COLLISION_LIST;
+    if (quality_trace) {
+        const int32_t trace_pool_best_after = trace_pool_best_norm();
+        fprintf(stderr,
+                "bgj_quality_trace_tail_lll: nb=%u csd=%ld index_l=%ld index_r=%ld n=%ld "
+                "num_vec_before=%ld num_vec_after=%ld collisions=%u "
+                "pool_best_before=%lld pool_best_after=%lld backend=%s deep=%s\n",
+                nb,
+                CSD,
+                index_l,
+                index_r,
+                n,
+                trace_num_vec_before,
+                num_vec,
+                trace_collision_count,
+                trace_norm_value(trace_pool_best_before),
+                trace_norm_value(trace_pool_best_after),
+                tail_use_fplll ? "fplll" : "custom",
+                tail_use_custom_deep ? "custom" : "off");
+    }
 
     _reconstruct_all_cvec();
     FREE_VEC(_b_dual_old);

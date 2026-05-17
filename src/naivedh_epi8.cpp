@@ -64,7 +64,14 @@ static float _compute_detn(float **D, float **Dt, long nlist, long d) {
     return exp(log_ret);
 }
 
-int gen_dual_vec_list(float *dst, Lattice_QP *L, long log_level, long nlist) {
+int gen_dual_vec_list(float *dst, Lattice_QP *L, long log_level, long nlist, int rng_seed = -1) {
+    DGS1d param_R(rng_seed);
+    auto param_uniform_long = [&](long bound) -> long {
+        if (bound <= 0) return 0;
+        if (rng_seed >= 0) return (long)(param_R.Uniform_u64() % (uint64_t)bound);
+        return Uniform_long(bound);
+    };
+
     // magic numbers
     const long expect_num_short_vec = 1000;
     const long max_iter = 1000;
@@ -240,7 +247,7 @@ int gen_dual_vec_list(float *dst, Lattice_QP *L, long log_level, long nlist) {
         long dst_ind;
         long count = 0;
         do {
-            dst_ind = Uniform_long(nlist);
+            dst_ind = param_uniform_long(nlist);
             count++;
         } while (dp_sum[dst_ind] * nlist < sum_dp && count < 3);
         
@@ -251,7 +258,7 @@ int gen_dual_vec_list(float *dst, Lattice_QP *L, long log_level, long nlist) {
         float new_norm;
         while (nrem --> 0) {
             long pass = 1;
-            src += Uniform_long(163) + 1;
+            src += param_uniform_long(163) + 1;
             if (src >= num_short_vec) src -= num_short_vec;
             
             for (long i = 0; i < nlist; i++) if (select_ind[i] == src) pass = 0;

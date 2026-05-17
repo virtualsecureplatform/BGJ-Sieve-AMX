@@ -66,7 +66,7 @@ double _ldh_time_curr[MAX_NTHREADS];
 #endif
 
 // the implementation is in naivedh_epi8.cpp
-int gen_dual_vec_list(float *dst, Lattice_QP *L, long log_level, long nlist);
+int gen_dual_vec_list(float *dst, Lattice_QP *L, long log_level, long nlist, int rng_seed = -1);
 
 // change with LDH_MAX_NDUAL
 #include "../include/lsfdh_tables.hpp"

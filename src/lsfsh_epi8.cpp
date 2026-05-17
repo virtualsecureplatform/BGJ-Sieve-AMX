@@ -2849,7 +2849,7 @@ int Pool_epi8_t<nb>::lsfsh_insert(long target_index, double eta, long log_level,
     TIMER_START;
     if (log_level >= 2) printf("param: ");
     _opt_nsh_threshold(dual_vec, compress_pos, num_hbits, num_tbits, threshold,
-                        b_mid, LSH_DEFAULT_SHSIZE, exp_length, tail_alpha_prob_list, log_level);
+                        b_mid, LSH_DEFAULT_SHSIZE, exp_length, tail_alpha_prob_list, log_level, target_index);
     TIMER_END;
     if (lsh_env_profile_enabled()) {
         fprintf(stderr,
@@ -3233,8 +3233,8 @@ int Pool_epi8_t<nb>::show_lsfsh_insert(long target_index, double eta, long log_l
     Lattice_QP *b_mid = basis->b_loc_QP(index_l - LSH_DEFAULT_DHDIM, index_l);
     TIMER_START;
     if (log_level >= 2) printf("param: ");
-    _opt_nsh_threshold(dual_vec, compress_pos, num_hbits, num_tbits, threshold, 
-                        b_mid, LSH_DEFAULT_SHSIZE, exp_length, tail_alpha_prob_list, log_level);
+    _opt_nsh_threshold(dual_vec, compress_pos, num_hbits, num_tbits, threshold,
+                        b_mid, LSH_DEFAULT_SHSIZE, exp_length, tail_alpha_prob_list, log_level, target_index);
     TIMER_END;
     delete b_mid;
     if (log_level >= 0) {
