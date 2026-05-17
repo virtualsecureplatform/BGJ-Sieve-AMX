@@ -149,6 +149,50 @@ static void svp_print_stage_trace(const char *event, long seq, long n, long msd,
             ret);
 }
 
+template <uint32_t nb>
+static void svp_print_last_lsh_stage_trace(const char *sieve_name, const char *lift_name,
+                                           long n, long msd, long ext_d, long minsd,
+                                           long lift_start_csd, const Pool_epi8_t<nb> &p,
+                                           double stop_length, double best_before,
+                                           double best_after, double lsh_before,
+                                           double lsh_after, double elapsed,
+                                           double extend_time, double sieve_time,
+                                           double lift_time, int ret, int stop_hit)
+{
+    fprintf(stderr,
+            "last_lsh_stage_trace: n=%ld msd=%ld ext_d=%ld minsd=%ld "
+            "lift_start=%ld csd=%ld index_l=%ld index_r=%ld "
+            "num_vec=%ld num_empty=%ld sieve=%s lift=%s "
+            "best_before=%.9g best_after=%.9g lsh_before=%.9g lsh_after=%.9g "
+            "last_lift_valid=%d last_lift=%.9g stop_length=%.9g stop_hit=%d "
+            "elapsed=%.6fs extend=%.6fs sieve_time=%.6fs lift_time=%.6fs ret=%d\n",
+            n,
+            msd,
+            ext_d,
+            minsd,
+            lift_start_csd,
+            p.CSD,
+            p.index_l,
+            p.index_r,
+            p.num_vec,
+            p.num_empty,
+            sieve_name,
+            lift_name,
+            best_before,
+            best_after,
+            lsh_before,
+            lsh_after,
+            p.last_lift_valid,
+            p.last_lift_euclidean_norm,
+            stop_length,
+            stop_hit,
+            elapsed,
+            extend_time,
+            sieve_time,
+            lift_time,
+            ret);
+}
+
 #define SVP_PROFILE_DO(acc, stmt) do {                             \
         if (pump_profile) {                                        \
             double __svp_profile_t0 = svp_profile_now();           \
@@ -831,7 +875,8 @@ double __last_lsh_pump_epi8(Lattice_QP *L, long num_threads, double qratio, doub
     double best_lift_length = 0.0;
 
     const int pump_profile = svp_pump_profile_enabled();
-    const double profile_total_start = pump_profile ? svp_profile_now() : 0.0;
+    const int stage_trace = svp_stage_trace_enabled();
+    const double profile_total_start = (pump_profile || stage_trace) ? svp_profile_now() : 0.0;
     double profile_pool_setup = 0.0;
     double profile_sampling = 0.0;
     double profile_extend = 0.0;
@@ -887,28 +932,43 @@ double __last_lsh_pump_epi8(Lattice_QP *L, long num_threads, double qratio, doub
             profile_bgj1_count++;                                                                           \
             num_stuck = ret;                                                                                \
             while (p.CSD < msd + ext_d) {                                                                   \
+                const double __trace_lsh_before = stage_trace ? svp_lsh_best_length(L->NumCols()) : 0.0;   \
+                const double __trace_best_before = stage_trace ? best_lift_length : 0.0;                   \
+                const double __trace_extend_t0 = stage_trace ? svp_profile_now() : 0.0;                    \
                 SVP_PROFILE_DO(profile_extend, p.extend_left());                                             \
+                const double __trace_extend_time = stage_trace ? svp_profile_now() - __trace_extend_t0 : 0.0; \
                 long target_num_vec = (long) (pow(4./3., min(p.CSD, msd) * 0.5) * pool_size_ratio);         \
                 if (target_num_vec > p.num_vec + p.num_empty) p.num_empty = target_num_vec - p.num_vec;     \
 	                                                                                                            \
+                const char *__trace_sieve_name = "bgj1";                                                   \
+                const double __trace_sieve_t0 = stage_trace ? svp_profile_now() : 0.0;                     \
                 if (p.CSD > 92) {                                                                           \
+                    __trace_sieve_name = "bgj3";                                                           \
                     SVP_PROFILE_ASSIGN(profile_sieve_bgj3, ret, svp_bgj3_sieve(p, log_level-3, 1));         \
                     profile_bgj3_count++;                                                                   \
                 } else if (p.CSD > 80) {                                                                    \
+                    __trace_sieve_name = "bgj2";                                                           \
                     SVP_PROFILE_ASSIGN(profile_sieve_bgj2, ret, svp_bgj2_sieve(p, log_level-3, 1));         \
                     profile_bgj2_count++;                                                                   \
                 } else {                                                                                    \
                     SVP_PROFILE_ASSIGN(profile_sieve_bgj1, ret, svp_bgj1_sieve(p, log_level-3, 1));         \
                     profile_bgj1_count++;                                                                   \
                 }                                                                                           \
+                const double __trace_sieve_time = stage_trace ? svp_profile_now() - __trace_sieve_t0 : 0.0; \
+                const char *__trace_lift_name = "none";                                                     \
+                double __trace_lift_time = 0.0;                                                             \
+                int __trace_stop_hit = 0;                                                                   \
                 if (p.CSD >= lift_start_csd) {                                                               \
-                    double __svp_lift_profile_t0 = pump_profile ? svp_profile_now() : 0.0;                  \
+                    double __svp_lift_profile_t0 = (pump_profile || stage_trace) ? svp_profile_now() : 0.0; \
                     if (p.CSD < n - 24 && (((p.CSD >= msd) && ext_qratio != 0.0) || ((p.CSD < msd) && qratio != 0.0))) { \
+                        __trace_lift_name = "show_lsfsh_insert";                                           \
                         p.show_lsfsh_insert(0, 10.0, log_level-3, 0, 0, (p.CSD>=msd)?ext_qratio:qratio);    \
                     } else {                                                                                \
+                        __trace_lift_name = "show_min_lift";                                               \
                         p.show_min_lift(0);                                                                 \
                     }                                                                                       \
-                    if (pump_profile) profile_show_lift += svp_profile_now() - __svp_lift_profile_t0;       \
+                    __trace_lift_time = (pump_profile || stage_trace) ? svp_profile_now() - __svp_lift_profile_t0 : 0.0; \
+                    if (pump_profile) profile_show_lift += __trace_lift_time;                               \
                     profile_show_lift_count++;                                                              \
                     if (p.last_lift_valid &&                                                                \
                         (best_lift_length == 0.0 || p.last_lift_euclidean_norm < best_lift_length)) {       \
@@ -916,8 +976,20 @@ double __last_lsh_pump_epi8(Lattice_QP *L, long num_threads, double qratio, doub
                     }                                                                                       \
                     if (stop_length > 0.0 && best_lift_length > 0.0 && best_lift_length <= stop_length) {    \
                         profile_stop_hit = 1;                                                               \
-                        break;                                                                              \
+                        __trace_stop_hit = 1;                                                               \
                     }                                                                                       \
+                }                                                                                           \
+                if (stage_trace) {                                                                          \
+                    svp_print_last_lsh_stage_trace(__trace_sieve_name, __trace_lift_name,                   \
+                                                   n, msd, ext_d, minsd, lift_start_csd, p,                 \
+                                                   stop_length, __trace_best_before, best_lift_length,      \
+                                                   __trace_lsh_before, svp_lsh_best_length(L->NumCols()),  \
+                                                   svp_profile_now() - profile_total_start,                 \
+                                                   __trace_extend_time, __trace_sieve_time,                 \
+                                                   __trace_lift_time, ret, __trace_stop_hit);               \
+                }                                                                                           \
+                if (__trace_stop_hit) {                                                                     \
+                    break;                                                                                  \
                 }                                                                                           \
                 if (ret) {                                                                                  \
                     num_stuck++;                                                                            \
