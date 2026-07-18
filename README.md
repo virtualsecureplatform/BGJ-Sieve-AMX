@@ -170,6 +170,26 @@ For BGJ3 `search2` CPU fallback diagnosis, set
 the `bgj3_cuda_profile` line then reports split fallback time for `cred`,
 `np`, `pp`, and `nn`.
 
+Batched CUDA bucket-pair search runs on an INT8 Tensor Core tile kernel by
+default: 64x64 output tiles are gathered from the device pool cache into
+shared memory and reduced with WMMA, covering the np rectangle plus the pp/nn
+triangles in one launch. Set `BGJ_CUDA_BATCH_TENSOR=0` to restore the scalar
+`dp4a` batch kernel. Single-bucket CUDA search likewise uses one fused tile
+kernel with full 3-reduction (recorded center dot) support, replacing the
+fragment-pack round trip, the per-shape tensor kernels, and the scalar tail
+kernels; set `BGJ_CUDA_SINGLE_TENSOR=0` to restore the legacy kernel chain.
+Deterministic-results mode, ranged bucket splits, and tensor bucket splits
+always use the legacy kernels. The batched path has an oracle test:
+
+```bash
+$ clang++ -O2 -g -std=c++17 -DHAVE_CUDA tests/bgj_cuda_np_flat_test.cpp src/libllib.a \
+    -Iinclude -Idep/ntl/include -Ldep/ntl/lib -lntl -Ldep/gmp/lib -lgmp -lm \
+    -L/usr/local/cuda/lib64 -Wl,-rpath=/usr/local/cuda/lib64 -lcudart -lcublas \
+    -fopenmp=libomp -stdlib=libc++ -pthread -o /tmp/bgj_cuda_np_flat_test
+$ /tmp/bgj_cuda_np_flat_test
+$ BGJ_CUDA_BATCH_TENSOR=0 /tmp/bgj_cuda_np_flat_test
+```
+
 For reproducible CUDA/BGJ profiling, pass a fixed sampler seed as the fifth
 positional argument, with `-s/--seed`, or with `BGJ_SEED`:
 
