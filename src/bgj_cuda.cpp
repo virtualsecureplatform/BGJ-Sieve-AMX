@@ -3809,13 +3809,15 @@ int Pool_epi8_t<nb>::_sub_bucketing_cuda(bucket_epi8_t<0> *main_bucket,
 template <uint32_t nb>
 int Pool_epi8_t<nb>::bgj1_Sieve_cuda(long log_level, long lps_auto_adj)
 {
+    long min_csd = 65;
     const char *min_csd_env = getenv("BGJ_CUDA_MIN_CSD");
     if (min_csd_env && min_csd_env[0]) {
         char *end = NULL;
-        const long min_csd = strtol(min_csd_env, &end, 10);
-        if (end != min_csd_env && min_csd > 0 && CSD < min_csd) {
-            return bgj1_Sieve(log_level, lps_auto_adj);
-        }
+        const long parsed = strtol(min_csd_env, &end, 10);
+        if (end != min_csd_env && parsed >= 0) min_csd = parsed;
+    }
+    if (min_csd > 0 && CSD < min_csd) {
+        return bgj1_Sieve(log_level, lps_auto_adj);
     }
 
     if (bgj_cuda_device_count() <= 0) {

@@ -220,6 +220,11 @@ $ BGJ_SEED=42 ./bgj_epi8 L_100 cuda 1 2
 The seed controls the library sampler and the internal randomized choices used
 by sieving. `svp_tool -s` and `svp_solver -s` use the same sampler seed path.
 
+CUDA bgj1 sieves fall back to the CPU implementation below sieving dimension
+65 by default: at small dimensions the GPU round trips lose to the AVX-512
+path, and the switch is worth about 11% on a dim-100 solver run. Override
+with `BGJ_CUDA_MIN_CSD=<dim>` (`0` restores CUDA at every dimension).
+
 You can also force CUDA-assisted bucket search for a compiled-in `bgj1` run
 with `BGJ_CUDA_SEARCH=1`. If CUDA is unavailable, the code falls back to the
 existing CPU search. The default result buffer holds `16777216` candidates per
