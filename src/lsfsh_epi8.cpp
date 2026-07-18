@@ -212,6 +212,16 @@ static inline int lsh_env_profile_enabled()
     return env != NULL && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
 }
 
+static inline int lsh_cuda_collect_enabled()
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("BGJ_CUDA_LSH_COLLECT");
+        cached = (env != NULL && env[0] != '\0') ? (env[0] != '0') : 0;
+    }
+    return cached;
+}
+
 static inline int lsh_env_trace_mblock_enabled()
 {
     const char *env = getenv("BGJ_LSH_TRACE_MBLOCK");
@@ -1206,6 +1216,85 @@ struct lsh_mblock_provider_t {
         const long ID = p->index_l - dh_dim - target_index;
         const long FD8 = _CEIL8(FD);
         uint64_t **local_Mbound_list = (uint64_t **) NEW_MAT(num_pop, p->num_threads, sizeof(uint64_t));
+        long profile_sum_mbound = 0;
+        long profile_max_mbound = 0;
+        long profile_min_mbound = max_bucket_size;
+        int cuda_collect_done = 0;
+        #if defined(HAVE_CUDA)
+        if (lsh_cuda_collect_enabled()) do {
+            static thread_local std::vector<float> flat_bext;
+            static thread_local std::vector<float> flat_bhead;
+            static thread_local std::vector<float> flat_centers;
+            static thread_local std::vector<float *> fvec_ptrs;
+            static thread_local std::vector<uint32_t> mbounds;
+            try {
+                flat_bext.assign((size_t)p->CSD * FD8, 0.0f);
+                flat_bhead.assign((size_t)dh_dim * shsize, 0.0f);
+                flat_centers.resize((size_t)num_pop * dh_dim);
+                fvec_ptrs.resize(num_pop);
+                mbounds.assign(num_pop, 0);
+            } catch (...) { break; }
+            for (long i = 0; i < p->CSD; i++) {
+                memcpy(flat_bext.data() + (size_t)i * FD8, b_ext_fp[i], FD * sizeof(float));
+            }
+            for (long i = 0; i < (long)dh_dim; i++) {
+                memcpy(flat_bhead.data() + (size_t)i * shsize, b_head_fp[i], shsize * sizeof(float));
+            }
+            for (long i = 0; i < num_pop; i++) {
+                memcpy(flat_centers.data() + (size_t)i * dh_dim, center[i], dh_dim * sizeof(float));
+                fvec_ptrs[i] = _fvec_list[i];
+            }
+            const long threads_guess = p->num_threads > 0 ? p->num_threads : 1;
+            uint32_t adj_sample = (uint32_t)(p->num_vec / (10 * threads_guess));
+            if (adj_sample < 1024) adj_sample = 1024;
+            const double adj_expect = (double)max_bucket_size * 0.8 /
+                                      (double)p->num_vec * (double)num_pop;
+            float radius_out = bucket_radius2;
+            if (!bgj_cuda_lsh_collect_raw(p->vec,
+                                          p->pool_epoch,
+                                          (uint32_t)p->num_vec,
+                                          p->vsum,
+                                          (uint32_t)p->num_vec,
+                                          (uint32_t)p->vec_length,
+                                          (uint32_t)p->CSD,
+                                          p->_b_dual,
+                                          p->_dhalf,
+                                          p->_dshift,
+                                          flat_bext.data(),
+                                          (uint32_t)FD,
+                                          (uint32_t)FD8,
+                                          flat_bhead.data(),
+                                          idiag,
+                                          dh_dim,
+                                          shsize,
+                                          (uint32_t)ID,
+                                          flat_centers.data(),
+                                          (uint32_t)num_pop,
+                                          bucket_radius2,
+                                          adj_sample,
+                                          adj_expect,
+                                          &radius_out,
+                                          (uint32_t)max_bucket_size,
+                                          fvec_ptrs.data(),
+                                          mbounds.data())) {
+                break;
+            }
+            bucket_radius2 = radius_out;
+            for (long i = 0; i < num_pop; i++) {
+                mb[i].Mbound = mbounds[i];
+                mb[i].fvec = _fvec_list[i];
+                mb[i].sh = _sh_list[i];
+            }
+            for (long i = 0; i < num_pop; i++) {
+                profile_sum_mbound += mb[i].Mbound;
+                if (mb[i].Mbound > profile_max_mbound) profile_max_mbound = mb[i].Mbound;
+                if (mb[i].Mbound < profile_min_mbound) profile_min_mbound = mb[i].Mbound;
+            }
+            if (env_profile) profile_collect_done = lsh_wall_time();
+            cuda_collect_done = 1;
+        } while (0);
+        #endif
+        if (!cuda_collect_done) {
         #pragma omp parallel for
         for (long thread = 0; thread < p->num_threads; thread++) {
             float *local_fvec_dst[LSH_MBLOCK_BATCH];
@@ -1298,9 +1387,9 @@ struct lsh_mblock_provider_t {
         if (env_profile) profile_collect_done = lsh_wall_time();
 
         // move fvec to the correct place
-        long profile_sum_mbound = 0;
-        long profile_max_mbound = 0;
-        long profile_min_mbound = max_bucket_size;
+        profile_sum_mbound = 0;
+        profile_max_mbound = 0;
+        profile_min_mbound = max_bucket_size;
         #pragma omp parallel for
         for (long i = 0; i < num_pop; i++) {
             long right_ind = local_Mbound_list[i][0];
@@ -1320,6 +1409,7 @@ struct lsh_mblock_provider_t {
                     if (right_ind < profile_min_mbound) profile_min_mbound = right_ind;
                 }
             }
+        }
         }
         if (env_profile) profile_compact_done = lsh_wall_time();
 

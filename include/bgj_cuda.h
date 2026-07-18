@@ -159,6 +159,39 @@ extern "C" int bgj_cuda_search_bucket_pool_batch_np_flat_raw(const int8_t *pool_
                                           uint32_t *result_count,
                                           int *overflow);
 
+// GPU LSH m-block collect: for every pool vector, reconstruct the integer
+// coefficients against b_dual, expand to the float representation with b_ext,
+// Babai-reduce head +/- center against b_head, and append passing vectors'
+// fvec rows to the per-center host buffers. Reproduces the arithmetic of
+// lsh_mblock_provider_t::batch_pop's collect loop (same FMA order).
+extern "C" int bgj_cuda_lsh_collect_raw(const int8_t *pool_vecs,
+                                         uint64_t pool_epoch,
+                                         uint32_t pool_size,
+                                         const int32_t *vsum,
+                                         uint32_t num_vec,
+                                         uint32_t vec_length,
+                                         uint32_t csd,
+                                         const uint8_t *b_dual,
+                                         int32_t dhalf,
+                                         int32_t dshift,
+                                         const float *b_ext,
+                                         uint32_t fd,
+                                         uint32_t fd8,
+                                         const float *b_head,
+                                         const float *idiag,
+                                         uint32_t dh_dim,
+                                         uint32_t dh_stride,
+                                         uint32_t id_off,
+                                         const float *centers,
+                                         uint32_t num_c,
+                                         float radius2,
+                                         uint32_t adjust_sample,
+                                         double adjust_expect,
+                                         float *radius2_out,
+                                         uint32_t max_per_center,
+                                         float *const *fvec_out,
+                                         uint32_t *mbound_out);
+
 extern "C" int bgj_cuda_sub_bucketing_raw(const int8_t *pool_vecs,
                                            uint64_t pool_epoch,
                                            uint32_t pool_size,

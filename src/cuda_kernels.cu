@@ -119,6 +119,15 @@ struct bgj_cuda_raw_scratch_t {
     bgj_cuda_np_tile_task_t *host_np_tile_tasks;
     uint32_t *subb_stage;
     uint32_t *host_subb_stage;
+    int32_t *lshc_vsum;
+    uint8_t *lshc_params;
+    int32_t *lshc_coeff;
+    float *lshc_fvec;
+    uint32_t *lshc_bits;
+    float *lshc_out;
+    uint32_t *lshc_counts;
+    uint32_t *host_lshc_counts;
+    float *host_lshc_bounce;
     uint32_t *single_stage;
     uint32_t *host_single_stage;
     uint8_t *single_response;
@@ -163,6 +172,15 @@ struct bgj_cuda_raw_scratch_t {
     size_t host_np_tile_task_capacity;
     size_t subb_stage_capacity;
     size_t host_subb_stage_capacity;
+    size_t lshc_vsum_capacity;
+    size_t lshc_param_capacity;
+    size_t lshc_coeff_capacity;
+    size_t lshc_fvec_capacity;
+    size_t lshc_bit_capacity;
+    size_t lshc_out_capacity;
+    size_t lshc_count_capacity;
+    size_t host_lshc_count_capacity;
+    size_t host_lshc_bounce_capacity;
     size_t single_stage_capacity;
     size_t host_single_stage_capacity;
     size_t single_response_capacity;
@@ -201,6 +219,15 @@ struct bgj_cuda_raw_scratch_t {
           host_np_tile_tasks(NULL),
           subb_stage(NULL),
           host_subb_stage(NULL),
+          lshc_vsum(NULL),
+          lshc_params(NULL),
+          lshc_coeff(NULL),
+          lshc_fvec(NULL),
+          lshc_bits(NULL),
+          lshc_out(NULL),
+          lshc_counts(NULL),
+          host_lshc_counts(NULL),
+          host_lshc_bounce(NULL),
           single_stage(NULL),
           host_single_stage(NULL),
           single_response(NULL),
@@ -244,6 +271,15 @@ struct bgj_cuda_raw_scratch_t {
           host_np_tile_task_capacity(0),
           subb_stage_capacity(0),
           host_subb_stage_capacity(0),
+          lshc_vsum_capacity(0),
+          lshc_param_capacity(0),
+          lshc_coeff_capacity(0),
+          lshc_fvec_capacity(0),
+          lshc_bit_capacity(0),
+          lshc_out_capacity(0),
+          lshc_count_capacity(0),
+          host_lshc_count_capacity(0),
+          host_lshc_bounce_capacity(0),
           single_stage_capacity(0),
           host_single_stage_capacity(0),
           single_response_capacity(0),
@@ -287,6 +323,15 @@ struct bgj_cuda_raw_scratch_t {
         if (host_np_tile_tasks) cudaFreeHost(host_np_tile_tasks);
         cudaFree(subb_stage);
         if (host_subb_stage) cudaFreeHost(host_subb_stage);
+        cudaFree(lshc_vsum);
+        cudaFree(lshc_params);
+        cudaFree(lshc_coeff);
+        cudaFree(lshc_fvec);
+        cudaFree(lshc_bits);
+        cudaFree(lshc_out);
+        cudaFree(lshc_counts);
+        if (host_lshc_counts) cudaFreeHost(host_lshc_counts);
+        if (host_lshc_bounce) cudaFreeHost(host_lshc_bounce);
         cudaFree(single_stage);
         if (host_single_stage) cudaFreeHost(host_single_stage);
         cudaFree(single_response);
@@ -327,6 +372,15 @@ struct bgj_cuda_raw_scratch_t {
         host_np_tile_tasks = NULL;
         subb_stage = NULL;
         host_subb_stage = NULL;
+        lshc_vsum = NULL;
+        lshc_params = NULL;
+        lshc_coeff = NULL;
+        lshc_fvec = NULL;
+        lshc_bits = NULL;
+        lshc_out = NULL;
+        lshc_counts = NULL;
+        host_lshc_counts = NULL;
+        host_lshc_bounce = NULL;
         single_stage = NULL;
         host_single_stage = NULL;
         single_response = NULL;
@@ -371,6 +425,15 @@ struct bgj_cuda_raw_scratch_t {
         host_np_tile_task_capacity = 0;
         subb_stage_capacity = 0;
         host_subb_stage_capacity = 0;
+        lshc_vsum_capacity = 0;
+        lshc_param_capacity = 0;
+        lshc_coeff_capacity = 0;
+        lshc_fvec_capacity = 0;
+        lshc_bit_capacity = 0;
+        lshc_out_capacity = 0;
+        lshc_count_capacity = 0;
+        host_lshc_count_capacity = 0;
+        host_lshc_bounce_capacity = 0;
         single_stage_capacity = 0;
         host_single_stage_capacity = 0;
         single_response_capacity = 0;
@@ -11685,6 +11748,371 @@ extern "C" int bgj_cuda_sub_bucketing_raw(const int8_t *pool_vecs,
             CUDA_TRY(cudaMemcpyAsync(sols, d_sols,
                                      (size_t)copys * sizeof(bgj_cuda_subb_entry_t),
                                      cudaMemcpyDeviceToHost, stream));
+        }
+        CUDA_TRY(cudaStreamSynchronize(stream));
+    }
+
+    set_plain_error("no CUDA error");
+    return 1;
+
+fail:
+    return 0;
+}
+
+// LSH collect stage 1: integer coefficients of one chunk of pool vectors
+// against the dual basis, matching Pool_epi8_t::_compute_coeff exactly.
+__global__ void bgj_cuda_lshc_coeff_kernel(const int8_t *pool_vecs,
+                                           const int32_t *vsum,
+                                           uint32_t base_v,
+                                           uint32_t chunk_n,
+                                           uint32_t vec_length,
+                                           uint32_t csd,
+                                           const uint8_t *b_dual,
+                                           int32_t dhalf,
+                                           int32_t dshift,
+                                           int32_t *coeffs)
+{
+    const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t v = idx / csd;
+    const uint32_t i = idx - v * csd;
+    if (v >= chunk_n) return;
+    const int8_t *vp = pool_vecs + (uint64_t)(base_v + v) * vec_length;
+    const uint8_t *dp_row = b_dual + (uint64_t)i * vec_length;
+    int acc = 0;
+    for (uint32_t k = 0; k < vec_length; k += 4) {
+        const int av = *(const int *)(vp + k);
+        const unsigned int bu = *(const unsigned int *)(dp_row + k);
+        asm("dp4a.s32.u32 %0, %1, %2, %0;" : "+r"(acc) : "r"(av), "r"(bu));
+    }
+    coeffs[(uint64_t)v * csd + i] = (acc + dhalf - vsum[base_v + v]) >> dshift;
+}
+
+// LSH collect stage 2: expand coefficients to the float representation.
+// One block per vector, one thread per output dimension; the i-ascending
+// accumulation matches the CPU red_avx2 chain FMA-for-FMA.
+__global__ void bgj_cuda_lshc_expand_kernel(const int32_t *coeffs,
+                                            uint32_t chunk_n,
+                                            uint32_t csd,
+                                            const float *b_ext,
+                                            uint32_t fd8,
+                                            float *fvec)
+{
+    const uint32_t v = blockIdx.x;
+    const uint32_t j = threadIdx.x;
+    if (v >= chunk_n || j >= fd8) return;
+    extern __shared__ int32_t lshc_coeff_smem[];
+    for (uint32_t i = threadIdx.x; i < csd; i += blockDim.x) {
+        lshc_coeff_smem[i] = coeffs[(uint64_t)v * csd + i];
+    }
+    __syncthreads();
+    float acc = 0.0f;
+    for (uint32_t i = 0; i < csd; i++) {
+        acc = fmaf((float)lshc_coeff_smem[i], b_ext[(uint64_t)i * fd8 + j], acc);
+    }
+    fvec[(uint64_t)v * fd8 + j] = acc;
+}
+
+#define BGJ_CUDA_LSHC_MAX_DH 32u
+
+// LSH collect stage 3: Babai-reduce head +/- center and test the norm bound,
+// matching lsh_mblock_provider_t::__size_red_npcheck (round-to-nearest-even,
+// full-row updates, strict bound comparison, pass if either sign passes).
+// The head dimension is a template constant so the working vectors stay in
+// registers; the reduced basis and idiag are staged in shared memory.
+template <uint32_t DH>
+__global__ void bgj_cuda_lshc_npcheck_kernel(const float *fvec,
+                                             uint32_t chunk_n,
+                                             uint32_t fd8,
+                                             uint32_t id_off,
+                                             const float *b_head,
+                                             const float *idiag,
+                                             uint32_t dh_stride,
+                                             const float *centers,
+                                             uint32_t num_c,
+                                             float radius2,
+                                             float radius2_pre,
+                                             uint32_t base_v,
+                                             uint32_t pre_split,
+                                             uint32_t *bits,
+                                             uint32_t bit_words,
+                                             uint32_t *sample_count)
+{
+    __shared__ float s_bhead[DH][DH];
+    __shared__ float s_idiag[DH];
+    for (uint32_t t = threadIdx.x; t < DH * DH; t += blockDim.x) {
+        s_bhead[t / DH][t % DH] = b_head[(uint64_t)(t / DH) * dh_stride + (t % DH)];
+    }
+    if (threadIdx.x < DH) s_idiag[threadIdx.x] = idiag[threadIdx.x];
+    __syncthreads();
+
+    const uint64_t pair = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t v = (uint32_t)(pair / num_c);
+    const uint32_t c = (uint32_t)(pair - (uint64_t)v * num_c);
+    if (v >= chunk_n) return;
+
+    float wp[DH];
+    float wn[DH];
+    const float *head = fvec + (uint64_t)v * fd8 + id_off;
+    const float *cent = centers + (uint64_t)c * DH;
+    #pragma unroll
+    for (uint32_t j = 0; j < DH; j++) {
+        const float h = head[j];
+        const float cc = cent[j];
+        wp[j] = h + cc;
+        wn[j] = h - cc;
+    }
+    #pragma unroll
+    for (int k = (int)DH - 1; k >= 0; k--) {
+        const float qp = rintf(wp[k] * s_idiag[k]);
+        const float qn = rintf(wn[k] * s_idiag[k]);
+        #pragma unroll
+        for (uint32_t j = 0; j < DH; j++) {
+            wp[j] = fmaf(-qp, s_bhead[k][j], wp[j]);
+            wn[j] = fmaf(-qn, s_bhead[k][j], wn[j]);
+        }
+    }
+    float np = 0.0f;
+    float nn = 0.0f;
+    #pragma unroll
+    for (uint32_t j = 0; j < DH; j++) {
+        np = fmaf(wp[j], wp[j], np);
+        nn = fmaf(wn[j], wn[j], nn);
+    }
+    const float r2 = (base_v + v < pre_split) ? radius2_pre : radius2;
+    const int pass = (r2 > np) || (r2 > nn);
+    if (!pass) return;
+    if (sample_count) {
+        atomicAdd(sample_count, 1u);
+    } else {
+        atomicOr(bits + (uint64_t)v * bit_words + (c >> 5), 1u << (c & 31u));
+    }
+}
+
+// LSH collect stage 4: append passing fvec rows to per-center output slabs.
+__global__ void bgj_cuda_lshc_compact_kernel(const float *fvec,
+                                             uint32_t chunk_n,
+                                             uint32_t fd8,
+                                             const uint32_t *bits,
+                                             uint32_t bit_words,
+                                             uint32_t num_c,
+                                             float *out,
+                                             uint32_t max_per_center,
+                                             uint32_t *counts)
+{
+    const uint64_t pair = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t v = (uint32_t)(pair / num_c);
+    const uint32_t c = (uint32_t)(pair - (uint64_t)v * num_c);
+    if (v >= chunk_n) return;
+    if (!(bits[(uint64_t)v * bit_words + (c >> 5)] & (1u << (c & 31u)))) return;
+    const uint32_t pos = atomicAdd(counts + c, 1u);
+    if (pos >= max_per_center) return;
+    const float4 *src = (const float4 *)(fvec + (uint64_t)v * fd8);
+    float4 *dst = (float4 *)(out + ((uint64_t)c * max_per_center + pos) * fd8);
+    for (uint32_t j = 0; j < fd8 / 4u; j++) dst[j] = src[j];
+}
+
+extern "C" int bgj_cuda_lsh_collect_raw(const int8_t *pool_vecs,
+                                         uint64_t pool_epoch,
+                                         uint32_t pool_size,
+                                         const int32_t *vsum,
+                                         uint32_t num_vec,
+                                         uint32_t vec_length,
+                                         uint32_t csd,
+                                         const uint8_t *b_dual,
+                                         int32_t dhalf,
+                                         int32_t dshift,
+                                         const float *b_ext,
+                                         uint32_t fd,
+                                         uint32_t fd8,
+                                         const float *b_head,
+                                         const float *idiag,
+                                         uint32_t dh_dim,
+                                         uint32_t dh_stride,
+                                         uint32_t id_off,
+                                         const float *centers,
+                                         uint32_t num_c,
+                                         float radius2,
+                                         uint32_t adjust_sample,
+                                         double adjust_expect,
+                                         float *radius2_out,
+                                         uint32_t max_per_center,
+                                         float *const *fvec_out,
+                                         uint32_t *mbound_out)
+{
+    if (!bgj_cuda_select_thread_device()) return 0;
+    if (!pool_vecs || !vsum || !b_dual || !b_ext || !b_head || !idiag ||
+        !centers || !radius2_out || !fvec_out || !mbound_out) {
+        set_plain_error("invalid LSH collect pointer");
+        return 0;
+    }
+    if (num_vec == 0 || csd == 0 || fd8 == 0 || fd8 % 4u != 0u ||
+        num_c == 0 || max_per_center == 0 ||
+        dh_dim == 0 || dh_dim > BGJ_CUDA_LSHC_MAX_DH || dh_dim % 8u != 0u ||
+        id_off + dh_dim > fd8 ||
+        vec_length % 4u != 0u) {
+        set_plain_error("unsupported LSH collect shape");
+        return 0;
+    }
+
+    bgj_cuda_raw_scratch_t *scratch = &bgj_cuda_raw_scratch;
+    int8_t *pool_vecs_device = NULL;
+    if (!bgj_cuda_prepare_stream(scratch)) return 0;
+    *radius2_out = radius2;
+    const float radius2_initial = radius2;
+    uint32_t pre_split = 0;
+
+    {
+        cudaStream_t stream = scratch->stream;
+        const size_t pool_vec_bytes = (size_t)pool_size * (size_t)vec_length * sizeof(int8_t);
+        if (!bgj_cuda_prepare_shared_pool_cache(pool_vecs,
+                                                pool_epoch,
+                                                pool_size,
+                                                vec_length,
+                                                pool_vec_bytes,
+                                                stream,
+                                                &pool_vecs_device)) {
+            goto fail;
+        }
+
+        const uint32_t chunk = num_vec < (1u << 18) ? num_vec : (1u << 18);
+        const uint32_t bit_words = (num_c + 31u) / 32u;
+        const size_t param_bytes_dual = (size_t)csd * vec_length;
+        const size_t param_off_bext = (param_bytes_dual + 255u) & ~(size_t)255u;
+        const size_t param_off_bhead = param_off_bext + (size_t)csd * fd8 * sizeof(float);
+        const size_t param_off_idiag = param_off_bhead + (size_t)dh_dim * dh_stride * sizeof(float);
+        const size_t param_off_centers = param_off_idiag + (size_t)dh_dim * sizeof(float);
+        const size_t param_bytes = param_off_centers + (size_t)num_c * dh_dim * sizeof(float);
+
+        CUDA_ENSURE(scratch->lshc_params, scratch->lshc_param_capacity, param_bytes);
+        CUDA_ENSURE(scratch->lshc_vsum, scratch->lshc_vsum_capacity,
+                    (size_t)num_vec * sizeof(int32_t));
+        CUDA_ENSURE(scratch->lshc_coeff, scratch->lshc_coeff_capacity,
+                    (size_t)chunk * csd * sizeof(int32_t));
+        CUDA_ENSURE(scratch->lshc_fvec, scratch->lshc_fvec_capacity,
+                    (size_t)chunk * fd8 * sizeof(float));
+        CUDA_ENSURE(scratch->lshc_bits, scratch->lshc_bit_capacity,
+                    (size_t)chunk * bit_words * sizeof(uint32_t));
+        CUDA_ENSURE(scratch->lshc_out, scratch->lshc_out_capacity,
+                    (size_t)num_c * max_per_center * fd8 * sizeof(float));
+        CUDA_ENSURE(scratch->lshc_counts, scratch->lshc_count_capacity,
+                    ((size_t)num_c + 1u) * sizeof(uint32_t));
+        if (!ensure_cuda_host_capacity((void **)&scratch->host_lshc_counts,
+                                       &scratch->host_lshc_count_capacity,
+                                       ((size_t)num_c + 1u) * sizeof(uint32_t))) {
+            goto fail;
+        }
+
+        CUDA_TRY(cudaMemcpyAsync(scratch->lshc_params, b_dual, param_bytes_dual,
+                                 cudaMemcpyHostToDevice, stream));
+        CUDA_TRY(cudaMemcpyAsync(scratch->lshc_params + param_off_bext, b_ext,
+                                 (size_t)csd * fd8 * sizeof(float),
+                                 cudaMemcpyHostToDevice, stream));
+        CUDA_TRY(cudaMemcpyAsync(scratch->lshc_params + param_off_bhead, b_head,
+                                 (size_t)dh_dim * dh_stride * sizeof(float),
+                                 cudaMemcpyHostToDevice, stream));
+        CUDA_TRY(cudaMemcpyAsync(scratch->lshc_params + param_off_idiag, idiag,
+                                 (size_t)dh_dim * sizeof(float),
+                                 cudaMemcpyHostToDevice, stream));
+        CUDA_TRY(cudaMemcpyAsync(scratch->lshc_params + param_off_centers, centers,
+                                 (size_t)num_c * dh_dim * sizeof(float),
+                                 cudaMemcpyHostToDevice, stream));
+        CUDA_TRY(cudaMemcpyAsync(scratch->lshc_vsum, vsum,
+                                 (size_t)num_vec * sizeof(int32_t),
+                                 cudaMemcpyHostToDevice, stream));
+        CUDA_TRY(cudaMemsetAsync(scratch->lshc_counts, 0,
+                                 ((size_t)num_c + 1u) * sizeof(uint32_t), stream));
+
+        const uint8_t *d_dual = (const uint8_t *)scratch->lshc_params;
+        const float *d_bext = (const float *)(scratch->lshc_params + param_off_bext);
+        const float *d_bhead = (const float *)(scratch->lshc_params + param_off_bhead);
+        const float *d_idiag = (const float *)(scratch->lshc_params + param_off_idiag);
+        const float *d_centers = (const float *)(scratch->lshc_params + param_off_centers);
+        uint32_t *d_sample = scratch->lshc_counts + num_c;
+
+        const uint32_t coeff_threads = 256;
+        const uint32_t pair_threads = 256;
+        const uint32_t expand_smem = csd * sizeof(int32_t);
+
+        // Radius calibration on a leading sample, then the full pass.
+        if (adjust_sample) {
+            const uint32_t sample = adjust_sample < num_vec ? adjust_sample : num_vec;
+            const uint32_t sample_chunk = sample < chunk ? sample : chunk;
+            const uint64_t coeff_total = (uint64_t)sample_chunk * csd;
+            bgj_cuda_lshc_coeff_kernel<<<(uint32_t)((coeff_total + coeff_threads - 1) / coeff_threads),
+                                         coeff_threads, 0, stream>>>(
+                pool_vecs_device, scratch->lshc_vsum, 0, sample_chunk, vec_length, csd,
+                d_dual, dhalf, dshift, scratch->lshc_coeff);
+            CUDA_TRY(cudaGetLastError());
+            bgj_cuda_lshc_expand_kernel<<<sample_chunk, fd8, expand_smem, stream>>>(
+                scratch->lshc_coeff, sample_chunk, csd, d_bext, fd8, scratch->lshc_fvec);
+            CUDA_TRY(cudaGetLastError());
+            const uint64_t pair_total = (uint64_t)sample_chunk * num_c;
+            const uint32_t np_grid = (uint32_t)((pair_total + pair_threads - 1) / pair_threads);
+            switch (dh_dim) {
+            case 8u: bgj_cuda_lshc_npcheck_kernel<8u><<<np_grid, pair_threads, 0, stream>>>(scratch->lshc_fvec, sample_chunk, fd8, id_off, d_bhead, d_idiag, dh_stride, d_centers, num_c, radius2, radius2, 0u, 0u, NULL, bit_words, d_sample); break;
+            case 16u: bgj_cuda_lshc_npcheck_kernel<16u><<<np_grid, pair_threads, 0, stream>>>(scratch->lshc_fvec, sample_chunk, fd8, id_off, d_bhead, d_idiag, dh_stride, d_centers, num_c, radius2, radius2, 0u, 0u, NULL, bit_words, d_sample); break;
+            case 24u: bgj_cuda_lshc_npcheck_kernel<24u><<<np_grid, pair_threads, 0, stream>>>(scratch->lshc_fvec, sample_chunk, fd8, id_off, d_bhead, d_idiag, dh_stride, d_centers, num_c, radius2, radius2, 0u, 0u, NULL, bit_words, d_sample); break;
+            default: bgj_cuda_lshc_npcheck_kernel<32u><<<np_grid, pair_threads, 0, stream>>>(scratch->lshc_fvec, sample_chunk, fd8, id_off, d_bhead, d_idiag, dh_stride, d_centers, num_c, radius2, radius2, 0u, 0u, NULL, bit_words, d_sample); break;
+            }
+            CUDA_TRY(cudaGetLastError());
+            CUDA_TRY(cudaMemcpyAsync(scratch->host_lshc_counts, d_sample, sizeof(uint32_t),
+                                     cudaMemcpyDeviceToHost, stream));
+            CUDA_TRY(cudaStreamSynchronize(stream));
+            const uint32_t num_pass = *scratch->host_lshc_counts;
+            const double exp_pass = adjust_expect * (double)sample_chunk;
+            if (num_pass > 0 && exp_pass > 0.0) {
+                radius2 = (float)((double)radius2 *
+                                  pow(exp_pass / (double)num_pass, 2.0 / (double)dh_dim));
+                // Vectors before the calibration point keep the initial
+                // radius, mirroring the CPU loop's temporal behavior.
+                pre_split = sample_chunk;
+            }
+            *radius2_out = radius2;
+        }
+
+        for (uint32_t base = 0; base < num_vec; base += chunk) {
+            const uint32_t n = (num_vec - base) < chunk ? (num_vec - base) : chunk;
+            const uint64_t coeff_total = (uint64_t)n * csd;
+            bgj_cuda_lshc_coeff_kernel<<<(uint32_t)((coeff_total + coeff_threads - 1) / coeff_threads),
+                                         coeff_threads, 0, stream>>>(
+                pool_vecs_device, scratch->lshc_vsum, base, n, vec_length, csd,
+                d_dual, dhalf, dshift, scratch->lshc_coeff);
+            CUDA_TRY(cudaGetLastError());
+            bgj_cuda_lshc_expand_kernel<<<n, fd8, expand_smem, stream>>>(
+                scratch->lshc_coeff, n, csd, d_bext, fd8, scratch->lshc_fvec);
+            CUDA_TRY(cudaGetLastError());
+            CUDA_TRY(cudaMemsetAsync(scratch->lshc_bits, 0,
+                                     (size_t)n * bit_words * sizeof(uint32_t), stream));
+            const uint64_t pair_total = (uint64_t)n * num_c;
+            const uint32_t np_grid = (uint32_t)((pair_total + pair_threads - 1) / pair_threads);
+            switch (dh_dim) {
+            case 8u: bgj_cuda_lshc_npcheck_kernel<8u><<<np_grid, pair_threads, 0, stream>>>(scratch->lshc_fvec, n, fd8, id_off, d_bhead, d_idiag, dh_stride, d_centers, num_c, radius2, radius2_initial, base, pre_split, scratch->lshc_bits, bit_words, NULL); break;
+            case 16u: bgj_cuda_lshc_npcheck_kernel<16u><<<np_grid, pair_threads, 0, stream>>>(scratch->lshc_fvec, n, fd8, id_off, d_bhead, d_idiag, dh_stride, d_centers, num_c, radius2, radius2_initial, base, pre_split, scratch->lshc_bits, bit_words, NULL); break;
+            case 24u: bgj_cuda_lshc_npcheck_kernel<24u><<<np_grid, pair_threads, 0, stream>>>(scratch->lshc_fvec, n, fd8, id_off, d_bhead, d_idiag, dh_stride, d_centers, num_c, radius2, radius2_initial, base, pre_split, scratch->lshc_bits, bit_words, NULL); break;
+            default: bgj_cuda_lshc_npcheck_kernel<32u><<<np_grid, pair_threads, 0, stream>>>(scratch->lshc_fvec, n, fd8, id_off, d_bhead, d_idiag, dh_stride, d_centers, num_c, radius2, radius2_initial, base, pre_split, scratch->lshc_bits, bit_words, NULL); break;
+            }
+            CUDA_TRY(cudaGetLastError());
+            bgj_cuda_lshc_compact_kernel<<<(uint32_t)((pair_total + pair_threads - 1) / pair_threads),
+                                           pair_threads, 0, stream>>>(
+                scratch->lshc_fvec, n, fd8, scratch->lshc_bits, bit_words, num_c,
+                scratch->lshc_out, max_per_center, scratch->lshc_counts);
+            CUDA_TRY(cudaGetLastError());
+        }
+
+        CUDA_TRY(cudaMemcpyAsync(scratch->host_lshc_counts, scratch->lshc_counts,
+                                 (size_t)num_c * sizeof(uint32_t),
+                                 cudaMemcpyDeviceToHost, stream));
+        CUDA_TRY(cudaStreamSynchronize(stream));
+        for (uint32_t c = 0; c < num_c; c++) {
+            const uint32_t cnt = scratch->host_lshc_counts[c];
+            mbound_out[c] = cnt < max_per_center ? cnt : max_per_center;
+            if (mbound_out[c]) {
+                CUDA_TRY(cudaMemcpyAsync(fvec_out[c],
+                                         scratch->lshc_out +
+                                         (uint64_t)c * max_per_center * fd8,
+                                         (size_t)mbound_out[c] * fd8 * sizeof(float),
+                                         cudaMemcpyDeviceToHost, stream));
+            }
         }
         CUDA_TRY(cudaStreamSynchronize(stream));
     }

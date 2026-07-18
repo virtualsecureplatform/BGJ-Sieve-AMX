@@ -117,11 +117,14 @@ rescue pass. Set it to `1` to restore the old single-shot behavior.
 because the cheap pass can perturb the full rescue trajectory.
 `BGJ_120T95_FINAL_LSH_STOP_LENGTH=<length>` overrides the rescue early-stop
 threshold.
-With the Tensor Core search paths the CUDA solver is CPU-bound on machines
-with many cores: on a 2x A100 host with 32 physical cores, `--threads 32`
-brings the dim-120 seed-897 solver from 464s to 286s versus the historical
-`--threads 16` convention, with an identical solution. Pick the physical core
-count; oversubscribing SMT threads regresses.
+With the Tensor Core search paths the CUDA solver's compute is CPU-bound at
+the historical `--threads 16`: at `--threads 32` (the physical core count on
+a 2x A100 host) the pump and LSH phase profiles run 15-25% faster
+phase-for-phase with identical solutions. End-to-end dim-120 wall times are
+dominated by how many rescue attempts a trajectory happens to need (repeated
+seed-42 runs ranged 286-625s in both thread configurations), so judge thread
+settings by phase profiles rather than single wall clocks. Oversubscribing
+SMT threads regresses.
 
 Plain `--cuda` uses one CUDA execution device unless `BGJ_CUDA_DEVICES` or
 `BGJ_CUDA_NUM_DEVICES` is set. The SVP-120 quality-rescue default is validated
@@ -232,6 +235,19 @@ force CPU bucketing. On A100, CUDA bucketing
 defaults to the append-based INT8 Tensor Core kernel for full 16x16
 center/vector tiles because it is the fastest current path on SVP100 timing
 runs. Set `BGJ_CUDA_BUCKET_TENSOR=0` to force scalar `dp4a` append kernels.
+The LSH insertion m-block collect (coefficient reconstruction, float
+expansion, and the +/-center Babai membership test over the whole pool) can
+run on the GPU with `BGJ_CUDA_LSH_COLLECT=1`. It reproduces the CPU
+arithmetic FMA-for-FMA (oracle test in `tests/bgj_cuda_lsh_collect_test.cpp`,
+which also takes a `bench` argument) and runs a 4M-vector, 40-center collect
+in ~315 ms on one A100 versus roughly a second for the 32-thread CPU loop.
+Bucket membership can differ from the CPU path only through the radius
+calibration, which the CPU applies with a benign data race; the GPU version
+calibrates on the same leading sample and keeps the pre-sample vectors on the
+initial radius to match. Off by default: dim-120 validation runs find the
+same solutions, but the end-to-end gain is within solver trajectory variance,
+so enable it explicitly on LSH-heavy workloads.
+
 An experimental Tensor Core sub-bucketing offload for the BGJ2/BGJ3
 `_sub_bucketing` step exists behind `BGJ_CUDA_SUBBUCKET=1` (default off) with
 `BGJ_CUDA_SUBBUCKET_MIN_VECS` (default `32768`) gating small main buckets to
