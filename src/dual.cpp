@@ -18,7 +18,8 @@ int Lattice_QP::dual_QP(NTL::Mat<NTL::quad_float>& Ld){
         mul(tmp.hi[i], tmp.lo[i], Bi[i], m8);
     }
     for (long i = n-1; i > 0; i--){
-        for (long j = i-1; j >= 0; j--){
+        #pragma omp parallel for schedule(static) if(i > 16)
+        for (long j = 0; j < i; j++){
             NTL::quad_float x(miu.hi[i][j], miu.lo[i][j]);
             red(tmp.hi[j], tmp.lo[j], tmp.hi[i], tmp.lo[i], x, m8);
         }
@@ -48,7 +49,8 @@ int Lattice_QP::dual_QP(NTL::Mat<double>& Ld){
         mul(tmp.hi[i], tmp.lo[i], Bi[i], m8);
     }
     for (long i = n-1; i > 0; i--){
-        for (long j = i-1; j >= 0; j--){
+        #pragma omp parallel for schedule(static) if(i > 16)
+        for (long j = 0; j < i; j++){
             NTL::quad_float x(miu.hi[i][j], miu.lo[i][j]);
             red(tmp.hi[j], tmp.lo[j], tmp.hi[i], tmp.lo[i], x, m8);
         }
@@ -78,7 +80,8 @@ Lattice_QP *Lattice_QP::dual_QP(){
         mul(tmp.hi[i], tmp.lo[i], Bi[i], m8);
     }
     for (long i = n-1; i > 0; i--){
-        for (long j = i-1; j >= 0; j--){
+        #pragma omp parallel for schedule(static) if(i > 16)
+        for (long j = 0; j < i; j++){
             NTL::quad_float x(miu.hi[i][j], miu.lo[i][j]);
             red(tmp.hi[j], tmp.lo[j], tmp.hi[i], tmp.lo[i], x, m8);
         }

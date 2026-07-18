@@ -70,6 +70,23 @@ static int bgj_tail_lll_use_fplll()
     return 0;
 }
 
+static int bgj_tail_lll_profile_enabled()
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("BGJ_TAIL_LLL_PROFILE");
+        cached = (env != NULL && env[0] != '\0') ? (env[0] != '0') : 0;
+    }
+    return cached;
+}
+
+static double bgj_tail_lll_now()
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec + 1e-6 * tv.tv_usec;
+}
+
 static int bgj_tail_deep_lll_use_custom()
 {
     const char *backend = getenv("BGJ_TAIL_DEEP_LLL_BACKEND");
@@ -1422,6 +1439,9 @@ int Pool_epi8_t<nb>::tail_LLL(double delta, long n) {
             }
         } while (0);
 
+        const int tail_profile = bgj_tail_lll_profile_enabled();
+        double tp_t0 = tail_profile ? bgj_tail_lll_now() : 0.0;
+        double tp_reconstruct = 0.0, tp_lll = 0.0, tp_dual = 0.0, tp_trans = 0.0, tp_gso = 0.0;
         if (!L_tmp->reconstruct(L_src)) {
             if (reason) *reason = "reconstruct failed";
             delete L_src;
@@ -1430,6 +1450,7 @@ int Pool_epi8_t<nb>::tail_LLL(double delta, long n) {
         }
         delete L_src;
         L_src = NULL;
+        if (tail_profile) { tp_reconstruct = bgj_tail_lll_now() - tp_t0; tp_t0 = bgj_tail_lll_now(); }
         int fplll_tail_status = -1;
         if (!force_custom_tail && tail_use_fplll) {
             fplll_tail_status = bgj_fplll_lll_qp(*L_tmp, delta, CSD-n, CSD, 0);
@@ -1440,6 +1461,7 @@ int Pool_epi8_t<nb>::tail_LLL(double delta, long n) {
         if (force_custom_tail || fplll_tail_status != 0 || tail_use_custom_deep) {
             L_tmp->LLL_DEEP_QP(delta-0.03, CSD-n, CSD);
         }
+        if (tail_profile) { tp_lll = bgj_tail_lll_now() - tp_t0; tp_t0 = bgj_tail_lll_now(); }
         if (!lattice_entries_are_sane(L_tmp, reason)) {
             delete L_tmp;
             return 0;
@@ -1513,6 +1535,7 @@ int Pool_epi8_t<nb>::tail_LLL(double delta, long n) {
             }
         }
 
+        if (tail_profile) { tp_dual = bgj_tail_lll_now() - tp_t0; tp_t0 = bgj_tail_lll_now(); }
         // process basis
         NTL::quad_float q(1.0/_ratio);
         for (long i = 0; i < CSD; i++){
@@ -1529,7 +1552,14 @@ int Pool_epi8_t<nb>::tail_LLL(double delta, long n) {
             delete L_tmp_dual;
             return 0;
         }
+        if (tail_profile) { tp_trans = bgj_tail_lll_now() - tp_t0; tp_t0 = bgj_tail_lll_now(); }
         basis->compute_gso_QP();
+        if (tail_profile) {
+            tp_gso = bgj_tail_lll_now() - tp_t0;
+            fprintf(stderr,
+                    "tail_lll_profile: csd=%ld n=%ld reconstruct=%.6f lll=%.6f dual=%.6f trans=%.6f gso=%.6f\n",
+                    CSD, index_r, tp_reconstruct, tp_lll, tp_dual, tp_trans, tp_gso);
+        }
 
         delete L_tmp;
         delete L_tmp_dual;
@@ -1559,6 +1589,8 @@ int Pool_epi8_t<nb>::tail_LLL(double delta, long n) {
         }
     }
 
+    const int tail_profile_outer = bgj_tail_lll_profile_enabled();
+    double tpo_t0 = tail_profile_outer ? bgj_tail_lll_now() : 0.0;
     float **b_normal = (float **) NEW_MAT(CSD, vec_length, sizeof(float));
     do {
         for (long j = 0; j < CSD; j++) {
@@ -1569,7 +1601,11 @@ int Pool_epi8_t<nb>::tail_LLL(double delta, long n) {
         }
     } while (0);
 
+    double tpo_bnormal = tail_profile_outer ? bgj_tail_lll_now() - tpo_t0 : 0.0;
+    if (tail_profile_outer) tpo_t0 = bgj_tail_lll_now();
     basis->size_reduce();
+    double tpo_sizered = tail_profile_outer ? bgj_tail_lll_now() - tpo_t0 : 0.0;
+    if (tail_profile_outer) tpo_t0 = bgj_tail_lll_now();
     _update_b_local(_ratio);
     uid->reset_hash_function(CSD);
     bgj_reserve_uid_table(uid, _pool_size);
@@ -1588,6 +1624,8 @@ int Pool_epi8_t<nb>::tail_LLL(double delta, long n) {
         }
     } while (0);
 
+    double tpo_blocal = tail_profile_outer ? bgj_tail_lll_now() - tpo_t0 : 0.0;
+    if (tail_profile_outer) tpo_t0 = bgj_tail_lll_now();
     INIT_COLLISION_LIST;
 
     // update all uid and remove vectors we cannot recover
@@ -1680,6 +1718,8 @@ int Pool_epi8_t<nb>::tail_LLL(double delta, long n) {
         }
     }
 
+    double tpo_pool = tail_profile_outer ? bgj_tail_lll_now() - tpo_t0 : 0.0;
+    if (tail_profile_outer) tpo_t0 = bgj_tail_lll_now();
     const uint32_t trace_collision_count = quality_trace ? num_collision : 0;
     PROCESS_COLLISION_LIST;
     if (quality_trace) {
@@ -1703,6 +1743,12 @@ int Pool_epi8_t<nb>::tail_LLL(double delta, long n) {
     }
 
     _reconstruct_all_cvec();
+    if (tail_profile_outer) {
+        fprintf(stderr,
+                "tail_lll_outer: csd=%ld num_vec=%ld bnormal=%.6f sizered=%.6f blocal=%.6f pool=%.6f cvec=%.6f\n",
+                CSD, num_vec, tpo_bnormal, tpo_sizered, tpo_blocal, tpo_pool,
+                bgj_tail_lll_now() - tpo_t0);
+    }
     FREE_VEC(_b_dual_old);
     FREE_MAT(b_normal);
 

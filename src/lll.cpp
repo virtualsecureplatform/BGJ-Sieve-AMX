@@ -14,6 +14,7 @@ void Lattice_QP::compute_gso_QP(){
 	B.lo[0] = x.lo;
 	for (long i = 0; i < n-1; i++){
 		x = 1.0/x;
+		#pragma omp parallel for schedule(static) if(n - i > 16)
 		for (long j = i+1; j < n; j++){
 			NTL::quad_float y = dot(b_star.hi[j], b_star.lo[j], b_star.hi[i], b_star.lo[i], m8) * x;
 			miu.hi[j][i] = y.hi;
@@ -39,6 +40,7 @@ void Lattice_QP::compute_gso_QP(long index_l){
 		x.hi = B.hi[i];
 		x.lo = B.lo[i];
 		x = 1.0/x;
+		#pragma omp parallel for schedule(static) if(n - index_l > 16)
 		for (long j = index_l; j < n; j++){
 			NTL::quad_float y = dot(b_star.hi[j], b_star.lo[j], b_star.hi[i], b_star.lo[i], m8) * x;
 			miu.hi[j][i] = y.hi;
@@ -51,6 +53,7 @@ void Lattice_QP::compute_gso_QP(long index_l){
 	B.lo[index_l] = x.lo;
 	for (long i = index_l; i < n-1; i++){
 		x = 1.0/x;
+		#pragma omp parallel for schedule(static) if(n - i > 16)
 		for (long j = i+1; j < n; j++){
 			NTL::quad_float y = dot(b_star.hi[j], b_star.lo[j], b_star.hi[i], b_star.lo[i], m8) * x;
 			miu.hi[j][i] = y.hi;
@@ -83,23 +86,30 @@ int Lattice_QP::trans_to(long ind_l, long ind_r, Lattice_QP *L){
     double **b_loc_hi = L->get_b().hi;
     double **b_loc_lo = L->get_b().lo;
     NTL::quad_float *B_loc = (NTL::quad_float *) malloc(dim * sizeof(NTL::quad_float));
+    NTL::quad_float *B_loc_inv = (NTL::quad_float *) malloc(dim * sizeof(NTL::quad_float));
     for (long j = 0; j < dim; j++) {
         B_loc[j] = NTL::sqrt(NTL::quad_float(B.hi[j+ind_l], B.lo[j+ind_l]));
+        B_loc_inv[j] = NTL::quad_float(1.0) / B_loc[j];
     }
-    for (long j = dim - 1; j >= 0; j--) {
-        if (fperr) break;
-        NTL::quad_float x = NTL::quad_float(1.0) / B_loc[j];
-        for (long i = 0; i < dim; i++) {
-            NTL::quad_float y = NTL::quad_float(b_loc_hi[i][j], b_loc_lo[i][j]) * x;
+    // Rows are independent: each row's descending-j elimination only reads
+    // and writes its own b_loc entries, so the loop nest is flipped to run
+    // row-parallel with per-element arithmetic identical to the serial form.
+    int fpwarn_flag = 0;
+    int fperr_flag = 0;
+    #pragma omp parallel for schedule(static) if(dim > 16)
+    for (long i = 0; i < dim; i++) {
+        for (long j = dim - 1; j >= 0; j--) {
+            NTL::quad_float y = NTL::quad_float(b_loc_hi[i][j], b_loc_lo[i][j]) * B_loc_inv[j];
             if (fabs(y.hi - round(y.hi)) > 0.05) {
-                fpwarn = true;
+                #pragma omp atomic write
+                fpwarn_flag = 1;
                 if (fabs(y.hi - round(y.hi)) > 0.2) {
-                    fperr = true;
+                    #pragma omp atomic write
+                    fperr_flag = 1;
                     break;
                 }
             }
             A[i][j] = round(y.hi);
-            //to optimize
             for (long k = 0; k < dim; k++){
                 NTL::quad_float z = NTL::quad_float(b_loc_hi[i][k], b_loc_lo[i][k]);
                 z -= A[i][j] * NTL::quad_float(miu.hi[j+ind_l][k+ind_l], miu.lo[j+ind_l][k+ind_l]) * B_loc[k];
@@ -108,7 +118,10 @@ int Lattice_QP::trans_to(long ind_l, long ind_r, Lattice_QP *L){
             }
         }
     }
+    fpwarn = fpwarn_flag != 0;
+    fperr = fperr_flag != 0;
     free(B_loc);
+    free(B_loc_inv);
     if (fpwarn || fperr) {
         char output1[256];
         char output2[256];
