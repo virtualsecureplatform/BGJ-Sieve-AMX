@@ -314,6 +314,12 @@ static void solver_profile_best_line(const char *stage)
     } while (0)
 
 int __progressive_LLL(Lattice_QP *L) {
+    // fplll reaches delta 0.99 directly and much faster than the progressive
+    // NTL quad_float ladder; keep the ladder as the fallback.
+    if (bgj_fplll_is_available() &&
+        bgj_fplll_lll_qp(*L, 0.99, 0, L->NumRows(), 0) == 0) {
+        return 1;
+    }
     L->LLL_QP(0.5);
     L->LLL_QP(0.75);
     L->LLL_QP(0.9);
