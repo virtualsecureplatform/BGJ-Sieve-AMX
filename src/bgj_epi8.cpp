@@ -2803,7 +2803,7 @@ int Pool_epi8_t<nb>::bgj3_Sieve(long log_level, long lps_auto_adj){
             const uint64_t cuda_bgj3_search2_staged_min_dots =
                 bgj_epi8_env_u64("BGJ_CUDA_BGJ3_SEARCH2_STAGED_MIN_DOTS", 1024ULL * 1024ULL);
             const uint64_t cuda_bgj3_search2_np_fused_min_dots =
-                bgj_epi8_env_u64("BGJ_CUDA_BGJ3_SEARCH2_NP_FUSED_MIN_DOTS", 1024ULL * 1024ULL);
+                bgj_epi8_env_u64("BGJ_CUDA_BGJ3_SEARCH2_NP_FUSED_MIN_DOTS", 128ULL * 1024ULL);
             const int cuda_bgj3_search = bgj_epi8_env_flag("BGJ_CUDA_BGJ3_SEARCH", 1);
             const int cuda_bgj3_search0 = cuda_bgj3_search ? bgj_epi8_env_flag("BGJ_CUDA_BGJ3_SEARCH0", 1) : 0;
             const int cuda_bgj3_search1 = cuda_bgj3_search ? bgj_epi8_env_flag("BGJ_CUDA_BGJ3_SEARCH1", 1) : 0;

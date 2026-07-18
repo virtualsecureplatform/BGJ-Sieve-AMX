@@ -161,7 +161,7 @@ same-sign pp/nn searches as well and is on by default; bucket order is still
 preserved, and buckets fall back to the ordinary CPU path on CUDA failure,
 result overflow, or result consume failure.
 `BGJ_CUDA_BGJ3_SEARCH2_NP_FUSED_MIN_DOTS` controls the fused batch gate and
-defaults to `1048576`.
+defaults to `131072`; batches below the gate use the CPU search path.
 `BGJ_CUDA_BGJ3_SEARCH2_NP_FUSED_MAX_RESULTS` caps the per-bucket result slab
 used by the fused path. By default this path uses at most `262144` results per
 bucket, while ordinary CUDA search still honors `BGJ_CUDA_MAX_RESULTS`.
