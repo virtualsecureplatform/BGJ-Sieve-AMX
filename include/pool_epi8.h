@@ -1072,6 +1072,12 @@ struct Pool_epi8_t {
         int _pool_bucketing(bucket_epi8_t<record_dp> **dst3, bucket_epi8_t<0> **dst2, double alpha3, double alpha2);
         template <uint32_t batchsize, bool faraway_center, bool for_bgj2, bool init_sieve, bool profiling>
         int _sub_bucketing(bucket_epi8_t<0> *main_bucket, bucket_epi8_t<0> **dst3, bucket_epi8_t<0> **dst2, double alpha3, double alpha2, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<nb> *prof = NULL);
+        #if defined(HAVE_CUDA)
+        // GPU variant of _sub_bucketing: identical center selection and
+        // acceptance rules, entries computed on device. Returns 0 when the
+        // caller should fall back to the CPU implementation.
+        int _sub_bucketing_cuda(bucket_epi8_t<0> *main_bucket, bucket_epi8_t<0> **dst3, bucket_epi8_t<0> **dst2, long batchsize, int faraway_center, double alpha3, double alpha2, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<nb> *prof = NULL);
+        #endif
         template <bool record_dp, bool profiling>
         int _search_cred(bucket_epi8_t<record_dp> *bkt, sol_list_epi8_t *sol, int32_t goal_norm, bgj_profile_data_t<nb> *prof = NULL);
         template <uint32_t l2_block, uint32_t l1_block, bool record_dp, bool profiling>

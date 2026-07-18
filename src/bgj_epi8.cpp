@@ -214,6 +214,16 @@ static uint32_t bgj3_epi8_cuda_batch_size()
     return value;
 }
 
+// Experimental: synchronous GPU sub-bucketing loses to the CPU path today
+// because CPU bucketing overlaps GPU search in the sieve pipeline, so the
+// offload is opt-in until it gets an async submit/consume design.
+static int bgj_epi8_cuda_subbucket_requested()
+{
+    static int cached = -1;
+    if (cached < 0) cached = bgj_epi8_env_flag("BGJ_CUDA_SUBBUCKET", 0);
+    return cached;
+}
+
 static int bgj3_epi8_cuda_search2_staged_requested()
 {
     const char *env = getenv("BGJ_CUDA_BGJ3_SEARCH2_STAGED");
@@ -1710,12 +1720,23 @@ int Pool_epi8_t<nb>::bgj2_Sieve(long log_level, long lps_auto_adj){
                 const long begin_ind = (thread * BGJ2_EPI8_BUCKET0_BATCHSIZE) / num_threads;
                 const long end_ind = ((thread + 1) * BGJ2_EPI8_BUCKET0_BATCHSIZE) / num_threads;
                 for (long ind = begin_ind; ind < end_ind; ind++) {
+                    int subb_cuda_done = 0;
+                    #if defined(HAVE_CUDA)
+                    if (bgj_cuda_search_requested() && bgj_epi8_cuda_subbucket_requested()) {
+                        subb_cuda_done = _sub_bucketing_cuda(
+                            bucket0[ind], &bucket1[ind * BGJ2_EPI8_BUCKET1_BATCHSIZE], NULL,
+                            BGJ2_EPI8_BUCKET1_BATCHSIZE, BGJ2_EPI8_USE_FARAWAY_CENTER,
+                            alpha_b1, 0.0, sol_list[thread], goal_norm, &local_profile) > 0;
+                    }
+                    #endif
+                    if (!subb_cuda_done) {
                     if (max_norm > 65535) {
                         _sub_bucketing<BGJ2_EPI8_BUCKET1_BATCHSIZE, BGJ2_EPI8_USE_FARAWAY_CENTER, 1, 1, 1>(
                             bucket0[ind], &bucket1[ind * BGJ2_EPI8_BUCKET1_BATCHSIZE], NULL, alpha_b1, 0.0, sol_list[thread], goal_norm, &local_profile);
                     } else {
                         _sub_bucketing<BGJ2_EPI8_BUCKET1_BATCHSIZE, BGJ2_EPI8_USE_FARAWAY_CENTER, 1, 0, 1>(
                             bucket0[ind], &bucket1[ind * BGJ2_EPI8_BUCKET1_BATCHSIZE], NULL, alpha_b1, 0.0, sol_list[thread], goal_norm, &local_profile);
+                    }
                     }
                 }
             }
@@ -3284,12 +3305,23 @@ int Pool_epi8_t<nb>::bgj3_Sieve(long log_level, long lps_auto_adj){
                     long ndp = 0;
                     TIMER_START;
                     for (long ind = begin_ind; ind < end_ind; ind++) {
+                        int subb1_cuda_done = 0;
+                        #if defined(HAVE_CUDA)
+                        if (bgj_cuda_search_requested() && bgj_epi8_cuda_subbucket_requested()) {
+                            subb1_cuda_done = _sub_bucketing_cuda(
+                                bucket0[ind], &rbucket1[ind * BGJ3_EPI8_BUCKET1_BATCHSIZE], &bucket1[ind * BGJ3_EPI8_BUCKET1_BATCHSIZE],
+                                BGJ3_EPI8_BUCKET1_BATCHSIZE, BGJ3_EPI8_USE_FARAWAY_CENTER,
+                                alpha_r1, alpha_b1, sol_list[thread], goal_norm, &local_profile) > 0;
+                        }
+                        #endif
+                        if (!subb1_cuda_done) {
                         if (max_norm > 65535) {
                             _sub_bucketing<BGJ3_EPI8_BUCKET1_BATCHSIZE, BGJ3_EPI8_USE_FARAWAY_CENTER, 0, 1, 1>(
                                 bucket0[ind], &rbucket1[ind * BGJ3_EPI8_BUCKET1_BATCHSIZE], &bucket1[ind * BGJ3_EPI8_BUCKET1_BATCHSIZE], alpha_r1, alpha_b1, sol_list[thread], goal_norm, &local_profile);
                         } else {
                             _sub_bucketing<BGJ3_EPI8_BUCKET1_BATCHSIZE, BGJ3_EPI8_USE_FARAWAY_CENTER, 0, 0, 1>(
                                 bucket0[ind], &rbucket1[ind * BGJ3_EPI8_BUCKET1_BATCHSIZE], &bucket1[ind * BGJ3_EPI8_BUCKET1_BATCHSIZE], alpha_r1, alpha_b1, sol_list[thread], goal_norm, &local_profile);
+                        }
                         }
                         ndp += BGJ3_EPI8_BUCKET1_BATCHSIZE * (bucket0[ind]->num_pvec + bucket0[ind]->num_nvec);
                         if (local_profile.log_level <= 3) delete bucket0[ind];
@@ -3462,12 +3494,23 @@ int Pool_epi8_t<nb>::bgj3_Sieve(long log_level, long lps_auto_adj){
                         delete bkt2;
 
                         TIMER_START;
+                        int subb2_cuda_done = 0;
+                        #if defined(HAVE_CUDA)
+                        if (bgj_cuda_search_requested() && bgj_epi8_cuda_subbucket_requested()) {
+                            subb2_cuda_done = _sub_bucketing_cuda(
+                                bkt, &bucket2[thread * BGJ3_EPI8_BUCKET2_BATCHSIZE], NULL,
+                                BGJ3_EPI8_BUCKET2_BATCHSIZE, BGJ3_EPI8_USE_FARAWAY_CENTER,
+                                alpha_b2, 0.0, sol_list[thread], goal_norm, &local_profile) > 0;
+                        }
+                        #endif
+                        if (!subb2_cuda_done) {
                         if (max_norm > 65535) {
                             _sub_bucketing<BGJ3_EPI8_BUCKET2_BATCHSIZE, BGJ3_EPI8_USE_FARAWAY_CENTER, 1, 1, 1>(
                             bkt, &bucket2[thread * BGJ3_EPI8_BUCKET2_BATCHSIZE], NULL, alpha_b2, 0.0, sol_list[thread], goal_norm, &local_profile);
                         } else {
                             _sub_bucketing<BGJ3_EPI8_BUCKET2_BATCHSIZE, BGJ3_EPI8_USE_FARAWAY_CENTER, 1, 0, 1>(
                             bkt, &bucket2[thread * BGJ3_EPI8_BUCKET2_BATCHSIZE], NULL, alpha_b2, 0.0, sol_list[thread], goal_norm, &local_profile);
+                        }
                         }
                         TIMER_END;
                         __bucket2_time += CURRENT_TIME;

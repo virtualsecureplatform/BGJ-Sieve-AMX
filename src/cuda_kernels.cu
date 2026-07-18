@@ -117,6 +117,11 @@ struct bgj_cuda_raw_scratch_t {
     bgj_cuda_np_batch_task_t *np_batch_tasks;
     bgj_cuda_np_tile_task_t *np_tile_tasks;
     bgj_cuda_np_tile_task_t *host_np_tile_tasks;
+    uint32_t *subb_stage;
+    uint32_t *host_subb_stage;
+    bgj_cuda_subb_entry_t *subb_entries;
+    uint32_t *subb_counts;
+    uint32_t *host_subb_counts;
     bgj_cuda_result_t *results;
     uint32_t *result_count;
     uint32_t *det_counts;
@@ -150,6 +155,11 @@ struct bgj_cuda_raw_scratch_t {
     size_t np_batch_task_capacity;
     size_t np_tile_task_capacity;
     size_t host_np_tile_task_capacity;
+    size_t subb_stage_capacity;
+    size_t host_subb_stage_capacity;
+    size_t subb_entry_capacity;
+    size_t subb_count_capacity;
+    size_t host_subb_count_capacity;
     size_t result_capacity;
     size_t result_count_capacity;
     size_t det_count_capacity;
@@ -179,6 +189,11 @@ struct bgj_cuda_raw_scratch_t {
           np_batch_tasks(NULL),
           np_tile_tasks(NULL),
           host_np_tile_tasks(NULL),
+          subb_stage(NULL),
+          host_subb_stage(NULL),
+          subb_entries(NULL),
+          subb_counts(NULL),
+          host_subb_counts(NULL),
           results(NULL),
           result_count(NULL),
           det_counts(NULL),
@@ -211,6 +226,11 @@ struct bgj_cuda_raw_scratch_t {
           np_batch_task_capacity(0),
           np_tile_task_capacity(0),
           host_np_tile_task_capacity(0),
+          subb_stage_capacity(0),
+          host_subb_stage_capacity(0),
+          subb_entry_capacity(0),
+          subb_count_capacity(0),
+          host_subb_count_capacity(0),
           result_capacity(0),
           result_count_capacity(0),
           det_count_capacity(0),
@@ -245,6 +265,11 @@ struct bgj_cuda_raw_scratch_t {
         cudaFree(np_batch_tasks);
         cudaFree(np_tile_tasks);
         if (host_np_tile_tasks) cudaFreeHost(host_np_tile_tasks);
+        cudaFree(subb_stage);
+        if (host_subb_stage) cudaFreeHost(host_subb_stage);
+        cudaFree(subb_entries);
+        cudaFree(subb_counts);
+        if (host_subb_counts) cudaFreeHost(host_subb_counts);
         cudaFree(results);
         cudaFree(result_count);
         cudaFree(det_counts);
@@ -276,6 +301,11 @@ struct bgj_cuda_raw_scratch_t {
         np_batch_tasks = NULL;
         np_tile_tasks = NULL;
         host_np_tile_tasks = NULL;
+        subb_stage = NULL;
+        host_subb_stage = NULL;
+        subb_entries = NULL;
+        subb_counts = NULL;
+        host_subb_counts = NULL;
         results = NULL;
         result_count = NULL;
         det_counts = NULL;
@@ -309,6 +339,11 @@ struct bgj_cuda_raw_scratch_t {
         np_batch_task_capacity = 0;
         np_tile_task_capacity = 0;
         host_np_tile_task_capacity = 0;
+        subb_stage_capacity = 0;
+        host_subb_stage_capacity = 0;
+        subb_entry_capacity = 0;
+        subb_count_capacity = 0;
+        host_subb_count_capacity = 0;
         result_capacity = 0;
         result_count_capacity = 0;
         det_count_capacity = 0;
@@ -1864,6 +1899,184 @@ void bgj_cuda_search_np_batch_tensor_kernel(const int8_t *pool_vecs,
 }
 
 #define BGJ_CUDA_SINGLE_TENSOR_PAD_NORM (1 << 28)
+#define BGJ_CUDA_SUBB_MAX_CENTERS 96u
+
+// Warp-aggregated append: one atomicAdd per warp per stream instead of one
+// per accepted pair. Every lane of the warp must reach this call (predicated
+// by `accept`); the sub-bucketing acceptance rate is a few percent, so
+// plain per-lane atomics on the shared counters would serialize the kernel.
+__device__ __forceinline__ void bgj_cuda_subb_push_warp(bgj_cuda_subb_entry_t *entries,
+                                                        uint32_t *count,
+                                                        int *overflow,
+                                                        uint32_t capacity,
+                                                        uint32_t lane_id,
+                                                        int accept,
+                                                        uint32_t index,
+                                                        uint32_t meta)
+{
+    const uint32_t mask = __ballot_sync(0xffffffffu, accept);
+    if (!mask) return;
+    uint32_t base = 0;
+    const uint32_t leader = __ffs(mask) - 1u;
+    if (lane_id == leader) base = atomicAdd(count, (uint32_t)__popc(mask));
+    base = __shfl_sync(0xffffffffu, base, leader);
+    if (!accept) return;
+    const uint32_t out = base + (uint32_t)__popc(mask & ((1u << lane_id) - 1u));
+    if (out < capacity) {
+        entries[out].index = index;
+        entries[out].meta = meta;
+    } else {
+        *overflow = 1;
+    }
+}
+
+// Sub-bucketing on tensor cores: one CTA covers 64 rows of one side of the
+// main bucket against every center. Acceptance follows the AVX path in
+// Pool_epi8_t::_sub_bucketing exactly: bound_x(v) = (norm_v * alpha_x2) >> 16,
+// positive rows pass when dp > bound, negative rows when dp < -bound. With
+// alpha2x2 == 0 (bgj2-style single-output mode) the alpha3 bound gates
+// everything; otherwise alpha2 gates entries2 and alpha3 additionally selects
+// entries3 plus the 2-reduction solution checks against center_b2.
+__global__ __launch_bounds__(BGJ_CUDA_NP_TENSOR_THREADS, 4)
+void bgj_cuda_sub_bucketing_kernel(const int8_t *pool_vecs,
+                                   const uint32_t *p_ids,
+                                   const int32_t *p_norm,
+                                   uint32_t num_p,
+                                   const uint32_t *n_ids,
+                                   const int32_t *n_norm,
+                                   uint32_t num_n,
+                                   const uint32_t *center_ids,
+                                   const int32_t *center_b2,
+                                   uint32_t num_centers,
+                                   uint32_t p_tiles,
+                                   uint32_t vec_length,
+                                   uint32_t alpha3x2,
+                                   uint32_t alpha2x2,
+                                   bgj_cuda_subb_entry_t *entries3,
+                                   uint32_t cap3,
+                                   bgj_cuda_subb_entry_t *entries2,
+                                   uint32_t cap2,
+                                   bgj_cuda_subb_entry_t *sols,
+                                   uint32_t sol_cap,
+                                   uint32_t *counts,
+                                   int *overflow)
+{
+    const int is_p = blockIdx.x < p_tiles;
+    const uint32_t base_row = (is_p ? blockIdx.x : blockIdx.x - p_tiles) * BGJ_CUDA_NP_TENSOR_TILE;
+    const uint32_t num_rows = is_p ? num_p : num_n;
+    const uint32_t *row_ids = is_p ? p_ids : n_ids;
+    const int32_t *row_norm = is_p ? p_norm : n_norm;
+    const uint32_t ct16 = (num_centers + 15u) / 16u * 16u;
+    const uint32_t smem_stride = vec_length + 16u;
+    const int single_alpha = alpha2x2 == 0;
+
+    extern __shared__ int8_t np_tensor_smem[];
+    int8_t *v_tile = np_tensor_smem;
+    int8_t *c_tile = v_tile + (size_t)BGJ_CUDA_NP_TENSOR_TILE * smem_stride;
+    int32_t *v_norm_s = (int32_t *)(c_tile + (size_t)ct16 * smem_stride);
+    int32_t *v_b3_s = v_norm_s + BGJ_CUDA_NP_TENSOR_TILE;
+    int32_t *v_b2_s = v_b3_s + BGJ_CUDA_NP_TENSOR_TILE;
+
+    if (threadIdx.x < BGJ_CUDA_NP_TENSOR_TILE) {
+        const uint32_t slot = base_row + threadIdx.x;
+        const int32_t norm = slot < num_rows ? row_norm[slot] :
+                             BGJ_CUDA_SINGLE_TENSOR_PAD_NORM;
+        v_norm_s[threadIdx.x] = norm;
+        v_b3_s[threadIdx.x] = (int32_t)(((int64_t)norm * (int64_t)alpha3x2) >> 16);
+        v_b2_s[threadIdx.x] = single_alpha ? 0 :
+                              (int32_t)(((int64_t)norm * (int64_t)alpha2x2) >> 16);
+    }
+
+    {
+        const uint32_t vec_int4 = vec_length / 16u;
+        const uint32_t half_int4 = vec_int4 / 2u;
+        const uint32_t lo_int4 = vec_int4 - half_int4;
+        const uint32_t r = threadIdx.x >> 1;
+        const uint32_t half = threadIdx.x & 1u;
+        const uint32_t col0 = half ? lo_int4 : 0u;
+        const uint32_t ncols = half ? half_int4 : lo_int4;
+        const uint32_t slot = base_row + r;
+        int4 *dst = (int4 *)(v_tile + (size_t)r * smem_stride) + col0;
+        if (slot < num_rows) {
+            const int4 *src = (const int4 *)(pool_vecs +
+                                             (uint64_t)row_ids[slot] * vec_length) + col0;
+            for (uint32_t c = 0; c < ncols; c++) dst[c] = src[c];
+        } else {
+            const int4 zero = make_int4(0, 0, 0, 0);
+            for (uint32_t c = 0; c < ncols; c++) dst[c] = zero;
+        }
+        for (uint32_t idx = threadIdx.x; idx < ct16 * vec_int4;
+             idx += BGJ_CUDA_NP_TENSOR_THREADS) {
+            const uint32_t row = idx / vec_int4;
+            const uint32_t col = idx - row * vec_int4;
+            int4 *cdst = (int4 *)(c_tile + (size_t)row * smem_stride) + col;
+            if (row < num_centers) {
+                *cdst = ((const int4 *)(pool_vecs +
+                                        (uint64_t)center_ids[row] * vec_length))[col];
+            } else {
+                *cdst = make_int4(0, 0, 0, 0);
+            }
+        }
+    }
+    __syncthreads();
+
+    const uint32_t warp_id = threadIdx.x / BGJ_CUDA_WARP_SIZE;
+    const uint32_t lane_id = threadIdx.x % BGJ_CUDA_WARP_SIZE;
+    const uint32_t k_blocks = vec_length / 16u;
+    const uint32_t ct_tiles = ct16 / 16u;
+    const int8_t *v_rows = v_tile + (size_t)warp_id * 16u * smem_stride;
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, signed char, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, signed char, wmma::col_major> b_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, int> c_frag[BGJ_CUDA_SUBB_MAX_CENTERS / 16u];
+
+    for (uint32_t ct = 0; ct < ct_tiles; ct++) {
+        wmma::fill_fragment(c_frag[ct], 0);
+    }
+    for (uint32_t kb = 0; kb < k_blocks; kb++) {
+        wmma::load_matrix_sync(a_frag,
+                               (const signed char *)(v_rows + kb * 16u),
+                               smem_stride);
+        for (uint32_t ct = 0; ct < ct_tiles; ct++) {
+            wmma::load_matrix_sync(b_frag,
+                                   (const signed char *)(c_tile + (size_t)ct * 16u * smem_stride + kb * 16u),
+                                   smem_stride);
+            wmma::mma_sync(c_frag[ct], a_frag, b_frag, c_frag[ct]);
+        }
+    }
+
+    const uint32_t side_bit = is_p ? (1u << 16) : 0u;
+    for (uint32_t ct = 0; ct < ct_tiles; ct++) {
+        #pragma unroll
+        for (uint32_t element = 0; element < c_frag[ct].num_elements; element++) {
+            uint32_t row;
+            uint32_t col;
+            bgj_cuda_tensor_accumulator_coord(lane_id, element, &row, &col);
+            const uint32_t cind = ct * 16u + col;
+            const uint32_t r_local = warp_id * 16u + row;
+            const uint32_t slot = base_row + r_local;
+            const int valid = cind < num_centers && slot < num_rows;
+            const int32_t dp = c_frag[ct].x[element];
+            const int32_t gate = single_alpha ? v_b3_s[r_local] : v_b2_s[r_local];
+            const int pass_gate = valid && (is_p ? (dp > gate) : (dp < -gate));
+            const int pass3 = pass_gate &&
+                              (single_alpha ? 1 :
+                               (is_p ? (dp > v_b3_s[r_local]) : (dp < -v_b3_s[r_local])));
+            const int32_t reduced = is_p ? v_norm_s[r_local] - dp : v_norm_s[r_local] + dp;
+            const int pass_sol = pass3 && valid &&
+                                 reduced < center_b2[valid ? cind : 0];
+            const uint32_t meta = cind | side_bit;
+            if (!single_alpha) {
+                bgj_cuda_subb_push_warp(entries2, counts + 1, overflow, cap2,
+                                        lane_id, pass_gate, slot, meta);
+            }
+            bgj_cuda_subb_push_warp(entries3, counts + 0, overflow, cap3,
+                                    lane_id, pass3, slot, meta);
+            bgj_cuda_subb_push_warp(sols, counts + 2, overflow, sol_cap,
+                                    lane_id, pass_sol, slot, meta);
+        }
+    }
+}
 
 __device__ __forceinline__ uint64_t bgj_cuda_tri_tile_offset(uint32_t a, uint32_t tiles)
 {
@@ -10944,6 +11157,232 @@ extern "C" int bgj_cuda_search_bucket_pool_raw_single(const int8_t *pool_vecs,
                                            result_capacity,
                                            result_count,
                                            overflow);
+}
+
+extern "C" int bgj_cuda_sub_bucketing_raw(const int8_t *pool_vecs,
+                                           uint64_t pool_epoch,
+                                           uint32_t pool_size,
+                                           const uint32_t *p_ids,
+                                           const int32_t *p_norm,
+                                           uint32_t num_p,
+                                           const uint32_t *n_ids,
+                                           const int32_t *n_norm,
+                                           uint32_t num_n,
+                                           const uint32_t *center_ids,
+                                           const int32_t *center_b2,
+                                           uint32_t num_centers,
+                                           uint32_t vec_length,
+                                           uint32_t alpha3x2_u16,
+                                           uint32_t alpha2x2_u16,
+                                           bgj_cuda_subb_entry_t *entries3,
+                                           uint32_t cap3,
+                                           uint32_t *count3,
+                                           bgj_cuda_subb_entry_t *entries2,
+                                           uint32_t cap2,
+                                           uint32_t *count2,
+                                           bgj_cuda_subb_entry_t *sols,
+                                           uint32_t sol_cap,
+                                           uint32_t *sol_count,
+                                           int *overflow)
+{
+    if (!bgj_cuda_select_thread_device()) return 0;
+    if (!pool_vecs || !center_ids || !center_b2 || !count3 || !sol_count || !overflow) {
+        set_plain_error("invalid sub-bucketing pointer");
+        return 0;
+    }
+    if (num_p && (!p_ids || !p_norm)) {
+        set_plain_error("invalid sub-bucketing p pointer");
+        return 0;
+    }
+    if (num_n && (!n_ids || !n_norm)) {
+        set_plain_error("invalid sub-bucketing n pointer");
+        return 0;
+    }
+    if (num_centers == 0 || num_centers > BGJ_CUDA_SUBB_MAX_CENTERS) {
+        set_plain_error("unsupported sub-bucketing center count");
+        return 0;
+    }
+    if (vec_length < 16u || vec_length % 16u != 0u ||
+        vec_length > BGJ_CUDA_NP_TENSOR_MAX_VEC_LENGTH) {
+        set_plain_error("unsupported sub-bucketing vec length");
+        return 0;
+    }
+    const int dual_output = alpha2x2_u16 != 0;
+    if (dual_output && (!entries2 || !count2 || cap2 == 0)) {
+        set_plain_error("invalid sub-bucketing entries2 output");
+        return 0;
+    }
+    if (!entries3 || cap3 == 0 || !sols || sol_cap == 0) {
+        set_plain_error("invalid sub-bucketing output");
+        return 0;
+    }
+
+    *count3 = 0;
+    if (count2) *count2 = 0;
+    *sol_count = 0;
+    *overflow = 0;
+    if (num_p == 0 && num_n == 0) {
+        set_plain_error("no CUDA error");
+        return 1;
+    }
+
+    bgj_cuda_raw_scratch_t *scratch = &bgj_cuda_raw_scratch;
+    int8_t *pool_vecs_device = NULL;
+    if (!bgj_cuda_prepare_stream(scratch)) return 0;
+
+    {
+        cudaStream_t stream = scratch->stream;
+        const size_t pool_vec_bytes = (size_t)pool_size * (size_t)vec_length * sizeof(int8_t);
+        if (!bgj_cuda_prepare_shared_pool_cache(pool_vecs,
+                                                pool_epoch,
+                                                pool_size,
+                                                vec_length,
+                                                pool_vec_bytes,
+                                                stream,
+                                                &pool_vecs_device)) {
+            goto fail;
+        }
+
+        // One pinned staging block carries every input array in a single
+        // host-to-device copy: [p_ids|p_norm|n_ids|n_norm|center_ids|center_b2].
+        const size_t stage_words = 2u * ((size_t)num_p + (size_t)num_n) +
+                                   2u * (size_t)num_centers;
+        CUDA_ENSURE(scratch->subb_stage, scratch->subb_stage_capacity,
+                    stage_words * sizeof(uint32_t));
+        if (!ensure_cuda_host_capacity((void **)&scratch->host_subb_stage,
+                                       &scratch->host_subb_stage_capacity,
+                                       stage_words * sizeof(uint32_t))) {
+            goto fail;
+        }
+        {
+            uint32_t *stage = scratch->host_subb_stage;
+            size_t off = 0;
+            if (num_p) {
+                memcpy(stage + off, p_ids, (size_t)num_p * sizeof(uint32_t));
+                off += num_p;
+                memcpy(stage + off, p_norm, (size_t)num_p * sizeof(int32_t));
+                off += num_p;
+            }
+            if (num_n) {
+                memcpy(stage + off, n_ids, (size_t)num_n * sizeof(uint32_t));
+                off += num_n;
+                memcpy(stage + off, n_norm, (size_t)num_n * sizeof(int32_t));
+                off += num_n;
+            }
+            memcpy(stage + off, center_ids, (size_t)num_centers * sizeof(uint32_t));
+            off += num_centers;
+            memcpy(stage + off, center_b2, (size_t)num_centers * sizeof(int32_t));
+            CUDA_TRY(cudaMemcpyAsync(scratch->subb_stage, stage,
+                                     stage_words * sizeof(uint32_t),
+                                     cudaMemcpyHostToDevice, stream));
+        }
+        uint32_t *d_p_ids = scratch->subb_stage;
+        int32_t *d_p_norm = (int32_t *)(scratch->subb_stage + num_p);
+        uint32_t *d_n_ids = scratch->subb_stage + 2u * (size_t)num_p;
+        int32_t *d_n_norm = (int32_t *)(scratch->subb_stage + 2u * (size_t)num_p + num_n);
+        uint32_t *d_center_ids = scratch->subb_stage + 2u * ((size_t)num_p + num_n);
+        int32_t *d_center_b2 = (int32_t *)(d_center_ids + num_centers);
+
+        const size_t total_entry_cap = (size_t)cap3 + (dual_output ? (size_t)cap2 : 0) +
+                                       (size_t)sol_cap;
+        CUDA_ENSURE(scratch->subb_entries, scratch->subb_entry_capacity,
+                    total_entry_cap * sizeof(bgj_cuda_subb_entry_t));
+        CUDA_ENSURE(scratch->subb_counts, scratch->subb_count_capacity, 3u * sizeof(uint32_t));
+        CUDA_ENSURE(scratch->overflow, scratch->overflow_capacity, sizeof(int));
+        if (!ensure_cuda_host_capacity((void **)&scratch->host_subb_counts,
+                                       &scratch->host_subb_count_capacity,
+                                       3u * sizeof(uint32_t)) ||
+            !ensure_cuda_host_capacity((void **)&scratch->host_overflow,
+                                       &scratch->host_overflow_capacity,
+                                       sizeof(int))) {
+            goto fail;
+        }
+        CUDA_TRY(cudaMemsetAsync(scratch->subb_counts, 0, 3u * sizeof(uint32_t), stream));
+        CUDA_TRY(cudaMemsetAsync(scratch->overflow, 0, sizeof(int), stream));
+
+        bgj_cuda_subb_entry_t *d_entries3 = scratch->subb_entries;
+        bgj_cuda_subb_entry_t *d_entries2 = dual_output ? scratch->subb_entries + cap3 : NULL;
+        bgj_cuda_subb_entry_t *d_sols = scratch->subb_entries + cap3 +
+                                        (dual_output ? cap2 : 0);
+        {
+            const uint32_t p_tiles = num_p ?
+                (num_p + BGJ_CUDA_NP_TENSOR_TILE - 1u) / BGJ_CUDA_NP_TENSOR_TILE : 0u;
+            const uint32_t n_tiles = num_n ?
+                (num_n + BGJ_CUDA_NP_TENSOR_TILE - 1u) / BGJ_CUDA_NP_TENSOR_TILE : 0u;
+            const uint32_t ct16 = (num_centers + 15u) / 16u * 16u;
+            const uint32_t smem_bytes =
+                (BGJ_CUDA_NP_TENSOR_TILE + ct16) * (vec_length + 16u) +
+                3u * BGJ_CUDA_NP_TENSOR_TILE * (uint32_t)sizeof(int32_t);
+            bgj_cuda_sub_bucketing_kernel<<<p_tiles + n_tiles,
+                                            BGJ_CUDA_NP_TENSOR_THREADS,
+                                            smem_bytes,
+                                            stream>>>(pool_vecs_device,
+                                                      d_p_ids,
+                                                      d_p_norm,
+                                                      num_p,
+                                                      d_n_ids,
+                                                      d_n_norm,
+                                                      num_n,
+                                                      d_center_ids,
+                                                      d_center_b2,
+                                                      num_centers,
+                                                      p_tiles,
+                                                      vec_length,
+                                                      alpha3x2_u16,
+                                                      alpha2x2_u16,
+                                                      d_entries3,
+                                                      cap3,
+                                                      d_entries2,
+                                                      dual_output ? cap2 : 0u,
+                                                      d_sols,
+                                                      sol_cap,
+                                                      scratch->subb_counts,
+                                                      scratch->overflow);
+            CUDA_TRY(cudaGetLastError());
+        }
+
+        CUDA_TRY(cudaMemcpyAsync(scratch->host_subb_counts, scratch->subb_counts,
+                                 3u * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+        CUDA_TRY(cudaMemcpyAsync(scratch->host_overflow, scratch->overflow, sizeof(int),
+                                 cudaMemcpyDeviceToHost, stream));
+        CUDA_TRY(cudaStreamSynchronize(stream));
+
+        const uint32_t raw3 = scratch->host_subb_counts[0];
+        const uint32_t raw2 = scratch->host_subb_counts[1];
+        const uint32_t raws = scratch->host_subb_counts[2];
+        *overflow = *scratch->host_overflow ||
+                    raw3 > cap3 ||
+                    (dual_output && raw2 > cap2) ||
+                    raws > sol_cap;
+        const uint32_t copy3 = raw3 > cap3 ? cap3 : raw3;
+        const uint32_t copy2 = dual_output ? (raw2 > cap2 ? cap2 : raw2) : 0u;
+        const uint32_t copys = raws > sol_cap ? sol_cap : raws;
+        *count3 = copy3;
+        if (count2) *count2 = copy2;
+        *sol_count = copys;
+        if (copy3) {
+            CUDA_TRY(cudaMemcpyAsync(entries3, d_entries3,
+                                     (size_t)copy3 * sizeof(bgj_cuda_subb_entry_t),
+                                     cudaMemcpyDeviceToHost, stream));
+        }
+        if (copy2) {
+            CUDA_TRY(cudaMemcpyAsync(entries2, d_entries2,
+                                     (size_t)copy2 * sizeof(bgj_cuda_subb_entry_t),
+                                     cudaMemcpyDeviceToHost, stream));
+        }
+        if (copys) {
+            CUDA_TRY(cudaMemcpyAsync(sols, d_sols,
+                                     (size_t)copys * sizeof(bgj_cuda_subb_entry_t),
+                                     cudaMemcpyDeviceToHost, stream));
+        }
+        CUDA_TRY(cudaStreamSynchronize(stream));
+    }
+
+    set_plain_error("no CUDA error");
+    return 1;
+
+fail:
+    return 0;
 }
 
 extern "C" int bgj_cuda_search_bucket_pool_batch_np_flat_raw(const int8_t *pool_vecs,

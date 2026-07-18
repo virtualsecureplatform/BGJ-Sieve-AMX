@@ -216,6 +216,15 @@ force CPU bucketing. On A100, CUDA bucketing
 defaults to the append-based INT8 Tensor Core kernel for full 16x16
 center/vector tiles because it is the fastest current path on SVP100 timing
 runs. Set `BGJ_CUDA_BUCKET_TENSOR=0` to force scalar `dp4a` append kernels.
+An experimental Tensor Core sub-bucketing offload for the BGJ2/BGJ3
+`_sub_bucketing` step exists behind `BGJ_CUDA_SUBBUCKET=1` (default off) with
+`BGJ_CUDA_SUBBUCKET_MIN_VECS` (default `32768`) gating small main buckets to
+the CPU. It reproduces the CPU acceptance rules and 2-reduction solution
+candidates exactly (oracle test in `tests/bgj_cuda_subb_test.cpp`, which also
+takes a `bench` argument), but the current synchronous round trip loses
+wall-clock to the CPU path, whose bucketing overlaps GPU search in the sieve
+pipeline; it is groundwork for an async or fused bucketing+search design.
+
 The deterministic two-pass `dp4a` path remains available with
 `BGJ_CUDA_BUCKET_DETERMINISTIC=1`; it emits each bucket as positive ids in
 ascending order followed by negative ids in ascending order, but is slower in

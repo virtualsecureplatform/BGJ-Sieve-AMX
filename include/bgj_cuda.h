@@ -56,6 +56,17 @@ struct alignas(16) bgj_cuda_bucket_entry_t {
     uint32_t reserved;
 };
 
+// Sub-bucketing output entry: index is the position in the main bucket's
+// p-list or n-list; meta packs the center slot in bits 0..15 and the side
+// (1 = positive list) in bit 16.
+struct bgj_cuda_subb_entry_t {
+    uint32_t index;
+    uint32_t meta;
+};
+
+#define BGJ_CUDA_SUBB_META_CIND(meta) ((meta) & 0xffffu)
+#define BGJ_CUDA_SUBB_META_P(meta) (((meta) >> 16) & 1u)
+
 int bgj_cuda_device_count();
 int bgj_cuda_execution_device_count();
 const char *bgj_cuda_last_error();
@@ -147,6 +158,32 @@ extern "C" int bgj_cuda_search_bucket_pool_batch_np_flat_raw(const int8_t *pool_
                                           const uint32_t *result_capacity,
                                           uint32_t *result_count,
                                           int *overflow);
+
+extern "C" int bgj_cuda_sub_bucketing_raw(const int8_t *pool_vecs,
+                                           uint64_t pool_epoch,
+                                           uint32_t pool_size,
+                                           const uint32_t *p_ids,
+                                           const int32_t *p_norm,
+                                           uint32_t num_p,
+                                           const uint32_t *n_ids,
+                                           const int32_t *n_norm,
+                                           uint32_t num_n,
+                                           const uint32_t *center_ids,
+                                           const int32_t *center_b2,
+                                           uint32_t num_centers,
+                                           uint32_t vec_length,
+                                           uint32_t alpha3x2_u16,
+                                           uint32_t alpha2x2_u16,
+                                           bgj_cuda_subb_entry_t *entries3,
+                                           uint32_t cap3,
+                                           uint32_t *count3,
+                                           bgj_cuda_subb_entry_t *entries2,
+                                           uint32_t cap2,
+                                           uint32_t *count2,
+                                           bgj_cuda_subb_entry_t *sols,
+                                           uint32_t sol_cap,
+                                           uint32_t *sol_count,
+                                           int *overflow);
 
 extern "C" int bgj_cuda_materialize_sol_list_raw(const int8_t *pool_vecs,
                                                   uint64_t pool_epoch,
