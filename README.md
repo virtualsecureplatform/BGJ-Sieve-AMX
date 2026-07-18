@@ -117,6 +117,12 @@ rescue pass. Set it to `1` to restore the old single-shot behavior.
 because the cheap pass can perturb the full rescue trajectory.
 `BGJ_120T95_FINAL_LSH_STOP_LENGTH=<length>` overrides the rescue early-stop
 threshold.
+With the Tensor Core search paths the CUDA solver is CPU-bound on machines
+with many cores: on a 2x A100 host with 32 physical cores, `--threads 32`
+brings the dim-120 seed-897 solver from 464s to 286s versus the historical
+`--threads 16` convention, with an identical solution. Pick the physical core
+count; oversubscribing SMT threads regresses.
+
 Plain `--cuda` uses one CUDA execution device unless `BGJ_CUDA_DEVICES` or
 `BGJ_CUDA_NUM_DEVICES` is set. The SVP-120 quality-rescue default is validated
 on that single-device trajectory. CUDA BGJ2 first-level search uses the staged
