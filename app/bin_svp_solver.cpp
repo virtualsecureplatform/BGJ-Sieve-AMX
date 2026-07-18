@@ -545,6 +545,8 @@ int _svp_solver_red(Lattice_QP* L, long algo) {
             const long final_fast_first_msd = solver_env_long("BGJ_120T95_FINAL_LSH_FAST_FIRST_MSD", 92);
             const long final_fast_first_ext_d = solver_env_long("BGJ_120T95_FINAL_LSH_FAST_FIRST_EXT_D", 0);
             const long final_attempts_default = (final_lsh_mode == 2) ? 2 : 1;
+            const long final_msd_step = solver_env_long("BGJ_120T95_FINAL_LSH_MSD_STEP", 0);
+            const long final_msd_max = solver_env_long("BGJ_120T95_FINAL_LSH_MSD_MAX", 104);
             long final_attempts = solver_env_long("BGJ_120T95_FINAL_LSH_ATTEMPTS",
                                                   final_attempts_default);
             if (final_attempts < 1) final_attempts = 1;
@@ -557,7 +559,10 @@ int _svp_solver_red(Lattice_QP* L, long algo) {
                 double final_lsh_length = 0.0;
                 char final_lsh_label[128];
                 const int use_fast_first = final_fast_first && final_attempt == 0 && final_attempts > 1;
-                const long attempt_msd = use_fast_first ? final_fast_first_msd : final_msd;
+                long attempt_esc = final_attempt - ((final_fast_first && final_attempts > 1) ? 1 : 0);
+                if (attempt_esc < 0) attempt_esc = 0;
+                long attempt_msd = use_fast_first ? final_fast_first_msd : final_msd + attempt_esc * final_msd_step;
+                if (!use_fast_first && attempt_msd > final_msd_max) attempt_msd = final_msd_max;
                 const long attempt_ext_d = use_fast_first ? final_fast_first_ext_d : final_ext_d;
                 const long attempt_lift_start = final_lift_start_is_set ?
                     final_lift_start : attempt_msd - final_lift_margin;

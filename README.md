@@ -126,6 +126,20 @@ seed-42 runs ranged 286-625s in both thread configurations), so judge thread
 settings by phase profiles rather than single wall clocks. Oversubscribing
 SMT threads regresses.
 
+The rescue-count variance comes from the internal success gate, not the
+sieving: the default target is `0.97 * gh`, which on many lattices sits below
+the second-shortest vector class, so the solver keeps re-running ~130s rescue
+pumps until it finds the true minimum even though a challenge-passing vector
+is usually already in the basis. If you only need a vector under the SVP
+challenge bound (`~1.05 * gh`), set `BGJ_120T95_FINAL_LSH_TARGET_FACTOR=1.04`:
+measured on L_120_897/t32, wall time tightens from 217-676s (mean ~450s) to
+185-297s with 0-1 rescue tries and every run passing the bound (norms
+2840-2884 instead of the true minimum 2654). Keep the default 0.97 when you
+want the shortest vector the schedule can reach. Escalating the rescue msd on
+retries (`BGJ_120T95_FINAL_LSH_MSD_STEP`, default 0) was measured and lost to
+the tuned fixed-`msd=102` retry (escalated 103/104 attempts succeeded 1/7 vs
+~2/3 at 102) - it stays available for experiments only.
+
 Plain `--cuda` uses one CUDA execution device unless `BGJ_CUDA_DEVICES` or
 `BGJ_CUDA_NUM_DEVICES` is set. The SVP-120 quality-rescue default is validated
 on that single-device trajectory. CUDA BGJ2 first-level search uses the staged
