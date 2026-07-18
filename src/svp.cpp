@@ -54,6 +54,30 @@ static int svp_bgj3_sieve(Pool_epi8_t<nb> &p, long log_level, long lps_auto_adj)
     return p.bgj3_Sieve(log_level, lps_auto_adj);
 }
 
+static long svp_bgj3_desc_min_csd() {
+    static long v = -1;
+    if (v < 0) { const char *e = getenv("BGJ_BGJ3_DESC_MIN_CSD"); v = (e && e[0]) ? atol(e) : (svp_cuda_bgj1_enabled() ? 93 : 103); }
+    return v;
+}
+
+static long svp_bgj2_desc_min_csd() {
+    static long v = -1;
+    if (v < 0) { const char *e = getenv("BGJ_BGJ2_DESC_MIN_CSD"); v = (e && e[0]) ? atol(e) : 91; }
+    return v;
+}
+
+static long svp_bgj2_min_csd() {
+    static long v = -1;
+    if (v < 0) { const char *e = getenv("BGJ_BGJ2_MIN_CSD"); v = (e && e[0]) ? atol(e) : (svp_cuda_bgj1_enabled() ? 92 : 81); }
+    return v;
+}
+
+static long svp_bgj3_min_csd() {
+    static long v = -1;
+    if (v < 0) { const char *e = getenv("BGJ_BGJ3_MIN_CSD"); v = (e && e[0]) ? atol(e) : 93; }
+    return v;
+}
+
 static int svp_pump_profile_enabled()
 {
     const char *env = std::getenv("BGJ_PUMP_PROFILE");
@@ -559,10 +583,10 @@ void __pump_red_epi8(Lattice_QP *L, long num_threads, double eta, long msd, long
                     SVP_PROFILE_DO(profile_extend, p.extend_left());                                             \
                     long target_num_vec = (long) (pow(4./3., p.CSD * 0.5) * pool_size_ratio);                   \
                     if (target_num_vec > p.num_vec + p.num_empty) p.num_empty = target_num_vec - p.num_vec;     \
-                    if (p.CSD > 92) {                                                                           \
+                    if (p.CSD >= svp_bgj3_min_csd()) {                                                                           \
                         SVP_PROFILE_ASSIGN(profile_sieve_bgj3, ret, svp_bgj3_sieve(p, log_level-3, 1));         \
                         profile_bgj3_count++;                                                                   \
-                    } else if (p.CSD > 80) {                                                                    \
+                    } else if (p.CSD >= svp_bgj2_min_csd()) {                                                                    \
                         SVP_PROFILE_ASSIGN(profile_sieve_bgj2, ret, svp_bgj2_sieve(p, log_level-3, 1));         \
                         profile_bgj2_count++;                                                                   \
                     } else {                                                                                    \
@@ -603,10 +627,10 @@ void __pump_red_epi8(Lattice_QP *L, long num_threads, double eta, long msd, long
                         if ((long)(pow(4./3., p.CSD * 0.5) * pool_size_ratio) < p.num_vec) {                    \
                             SVP_PROFILE_DO(profile_shrink, p.shrink((long)(pow(4./3., p.CSD * 0.5) * pool_size_ratio))); \
                         }                                                                                       \
-                        if (p.CSD > 102) {                                                                      \
+                        if (p.CSD >= svp_bgj3_desc_min_csd()) {                                                                      \
                             SVP_PROFILE_ASSIGN(profile_sieve_bgj3, ret, svp_bgj3_sieve(p, log_level-3, 1));     \
                             profile_bgj3_count++;                                                               \
-                        } else if (p.CSD > 90) {                                                                \
+                        } else if (p.CSD >= svp_bgj2_desc_min_csd()) {                                                                \
                             SVP_PROFILE_ASSIGN(profile_sieve_bgj2, ret, svp_bgj2_sieve(p, log_level-3, 1));     \
                             profile_bgj2_count++;                                                               \
                         } else {                                                                                \
@@ -783,10 +807,10 @@ void __lsh_pump_red_epi8(Lattice_QP *L, long num_threads, double eta, double qra
                     SVP_PROFILE_DO(profile_extend, p.extend_left());                                             \
                     long target_num_vec = (long) (pow(4./3., p.CSD * 0.5) * pool_size_ratio);                   \
                     if (target_num_vec > p.num_vec + p.num_empty) p.num_empty = target_num_vec - p.num_vec;     \
-                    if (p.CSD > 92) {                                                                           \
+                    if (p.CSD >= svp_bgj3_min_csd()) {                                                                           \
                         SVP_PROFILE_ASSIGN(profile_sieve_bgj3, ret, svp_bgj3_sieve(p, log_level-3, 1));         \
                         profile_bgj3_count++;                                                                   \
-                    } else if (p.CSD > 80) {                                                                    \
+                    } else if (p.CSD >= svp_bgj2_min_csd()) {                                                                    \
                         SVP_PROFILE_ASSIGN(profile_sieve_bgj2, ret, svp_bgj2_sieve(p, log_level-3, 1));         \
                         profile_bgj2_count++;                                                                   \
                     } else {                                                                                    \
@@ -882,10 +906,10 @@ void __lsh_pump_red_epi8(Lattice_QP *L, long num_threads, double eta, double qra
                         const long long __trace_sieve_pool_before = stage_trace_pool ? svp_pool_best_norm(p) : -1; \
                         const double __trace_sieve_lsh_before = stage_trace ? svp_lsh_best_length(L->NumCols()) : 0.0; \
                         const double __trace_sieve_t0 = stage_trace ? svp_profile_now() : 0.0;                 \
-                        if (p.CSD > 102) {                                                                       \
+                        if (p.CSD >= svp_bgj3_desc_min_csd()) {                                                                       \
                             SVP_PROFILE_ASSIGN(profile_sieve_bgj3, ret, svp_bgj3_sieve(p, log_level-3, 1));     \
                             profile_bgj3_count++;                                                               \
-                        } else if (p.CSD > 90) {                                                                \
+                        } else if (p.CSD >= svp_bgj2_desc_min_csd()) {                                                                \
                             SVP_PROFILE_ASSIGN(profile_sieve_bgj2, ret, svp_bgj2_sieve(p, log_level-3, 1));     \
                             profile_bgj2_count++;                                                               \
                         } else {                                                                                \
@@ -1037,11 +1061,11 @@ double __last_lsh_pump_epi8(Lattice_QP *L, long num_threads, double qratio, doub
 	                                                                                                            \
                 const char *__trace_sieve_name = "bgj1";                                                   \
                 const double __trace_sieve_t0 = stage_trace ? svp_profile_now() : 0.0;                     \
-                if (p.CSD > 92) {                                                                           \
+                if (p.CSD >= svp_bgj3_min_csd()) {                                                                           \
                     __trace_sieve_name = "bgj3";                                                           \
                     SVP_PROFILE_ASSIGN(profile_sieve_bgj3, ret, svp_bgj3_sieve(p, log_level-3, 1));         \
                     profile_bgj3_count++;                                                                   \
-                } else if (p.CSD > 80) {                                                                    \
+                } else if (p.CSD >= svp_bgj2_min_csd()) {                                                                    \
                     __trace_sieve_name = "bgj2";                                                           \
                     SVP_PROFILE_ASSIGN(profile_sieve_bgj2, ret, svp_bgj2_sieve(p, log_level-3, 1));         \
                     profile_bgj2_count++;                                                                   \
@@ -1567,9 +1591,9 @@ void __hkz_red_epi8(Lattice_QP *L, long num_threads, long log_level) {
             p.extend_left();                                                                            \
             long target_num_vec = (long) (pow(4./3., p.CSD * 0.5) * 3.2);                               \
             if (target_num_vec > p.num_vec + p.num_empty) p.num_empty = target_num_vec - p.num_vec;     \
-            if (p.CSD > 92) {                                                                           \
+            if (p.CSD >= svp_bgj3_min_csd()) {                                                                           \
                 svp_bgj3_sieve(p, log_level-3, 1);                                                       \
-            } else if (p.CSD > 80) {                                                                    \
+            } else if (p.CSD >= svp_bgj2_min_csd()) {                                                                    \
                 svp_bgj2_sieve(p, log_level-3, 1);                                                       \
             } else {                                                                                    \
                 svp_bgj1_sieve(p, log_level-3, 1); \
@@ -1581,9 +1605,9 @@ void __hkz_red_epi8(Lattice_QP *L, long num_threads, long log_level) {
             p.tail_LLL(0.99, 16);                                                                       \
             p.shrink(max(1009, (long)(pow(4./3., p.CSD * 0.5) * pool_size_ratio)));                     \
             ind++;                                                                                      \
-            if (p.CSD > 92) {                                                                           \
+            if (p.CSD >= svp_bgj3_min_csd()) {                                                                           \
                 svp_bgj3_sieve(p, log_level-3, 1);                                                       \
-            } else if (p.CSD > 80) {                                                                    \
+            } else if (p.CSD >= svp_bgj2_min_csd()) {                                                                    \
                 svp_bgj2_sieve(p, log_level-3, 1);                                                       \
             } else {                                                                                    \
                 svp_bgj1_sieve(p, log_level-3, 1); \

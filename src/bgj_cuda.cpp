@@ -3585,6 +3585,18 @@ int Pool_epi8_t<nb>::_search_bgj1_cuda_batch(bucket_epi8_t<record_dp> **buckets,
 
 static long bgj_cuda_host_threads(long requested, long sieving_dim);
 
+static long bgj_cuda_bgj2_min_csd() {
+    static long v = -1;
+    if (v < 0) { const char *e = getenv("BGJ_BGJ2_MIN_CSD"); v = (e && e[0]) ? atol(e) : 92; }
+    return v;
+}
+
+static long bgj_cuda_bgj3_min_csd() {
+    static long v = -1;
+    if (v < 0) { const char *e = getenv("BGJ_BGJ3_MIN_CSD"); v = (e && e[0]) ? atol(e) : 93; }
+    return v;
+}
+
 template <uint32_t nb>
 int Pool_epi8_t<nb>::_sub_bucketing_cuda(bucket_epi8_t<0> *main_bucket,
                                          bucket_epi8_t<0> **dst3,
@@ -3926,9 +3938,9 @@ int Pool_epi8_t<nb>::left_progressive_bgjfsieve_cuda(long ind_l, long ind_r, lon
         extend_left();
         long target_num_vec = (long)(pow(4. / 3., CSD * 0.5) * 3.2);
         if (target_num_vec > num_vec + num_empty) num_empty = target_num_vec - num_vec;
-        if (CSD >= 92) {
+        if (CSD >= bgj_cuda_bgj3_min_csd()) {
             bgj3_Sieve_cuda(log_level, 1);
-        } else if (CSD > 80) {
+        } else if (CSD >= bgj_cuda_bgj2_min_csd()) {
             bgj2_Sieve_cuda(log_level, 1);
         } else {
             bgj1_Sieve_cuda(log_level, 1);

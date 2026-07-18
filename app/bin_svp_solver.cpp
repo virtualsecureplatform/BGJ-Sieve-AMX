@@ -332,7 +332,7 @@ int __deep40_tour(Lattice_QP *L) {
 }
 int __local_pump(Lattice_QP *L, long msd, long d4f, long ind_l, long ind_r) {
     Lattice_QP *L_loc = L->b_loc_QP(ind_l, ind_r);
-    __pump_red_epi8(L_loc, num_threads, 1.1, msd, d4f, 24, 0, 24, 0, 0, 45);
+    __pump_red_epi8(L_loc, num_threads, 1.1, msd, d4f, 24, 0, 24, solver_env_long("BGJ_LSH_PUMP_LOG", 0), 0, 45);
     L->trans_to(ind_l, ind_r, L_loc);
     L->compute_gso_QP();
     L->size_reduce();
@@ -341,7 +341,7 @@ int __local_pump(Lattice_QP *L, long msd, long d4f, long ind_l, long ind_r) {
 }
 int __local_lsh_pump(Lattice_QP *L, long msd, long d4f, long ind_l, long ind_r) {
     Lattice_QP *L_loc = L->b_loc_QP(ind_l, ind_r);
-    __lsh_pump_red_epi8(L_loc, num_threads, 1.1, 0.2, msd, d4f, 24, 0, 24, 0, 0, 45);
+    __lsh_pump_red_epi8(L_loc, num_threads, 1.1, 0.2, msd, d4f, 24, 0, 24, solver_env_long("BGJ_LSH_PUMP_LOG", 0), 0, 45);
     L->trans_to(ind_l, ind_r, L_loc);
     L->compute_gso_QP();
     L->size_reduce();
@@ -640,19 +640,19 @@ int _svp_solver_red(Lattice_QP* L, long algo) {
         __pump_red_epi8(L, num_threads, 1.1, 80, 50, 30, 0, 30, 0, 0, 45);
         __pump_red_epi8(L, num_threads, 1.1, 80, 50, 30, 0, 30, 0, 0, 45);
         __local_lsh_pump(L, 75, 30, 25, 130);
-        __lsh_pump_red_epi8(L, num_threads, 1.1, 0.2, 83, 47, 24, 0, 24, 0, 0, 45);
+        __lsh_pump_red_epi8(L, num_threads, 1.1, 0.2, 83, 47, 24, 0, 24, solver_env_long("BGJ_LSH_PUMP_LOG", 0), 0, 45);
         __local_pump(L, 80, 30, 20, 130);
-        __lsh_pump_red_epi8(L, num_threads, 1.1, 0.2, 86, 44, 24, 0, 24, 0, 0, 45);
+        __lsh_pump_red_epi8(L, num_threads, 1.1, 0.2, 86, 44, 24, 0, 24, solver_env_long("BGJ_LSH_PUMP_LOG", 0), 0, 45);
         __local_pump(L, 83, 27, 20, 130);
-        __lsh_pump_red_epi8(L, num_threads, 1.1, 0.2, 89, 41, 24, 0, 24, 0, 0, 45);
+        __lsh_pump_red_epi8(L, num_threads, 1.1, 0.2, 89, 41, 24, 0, 24, solver_env_long("BGJ_LSH_PUMP_LOG", 0), 0, 45);
         __local_lsh_pump(L, 87, 33, 10, 130);
-        __lsh_pump_red_epi8(L, num_threads, 1.1, 0.2, 92, 38, 24, 0, 24, 0, 0, 45);
+        __lsh_pump_red_epi8(L, num_threads, 1.1, 0.2, 92, 38, 24, 0, 24, solver_env_long("BGJ_LSH_PUMP_LOG", 0), 0, 45);
         __local_lsh_pump(L, 89, 31, 10, 130);
-        __lsh_pump_red_epi8(L, num_threads, 1.1, 0.2, 95, 35, 24, 0, 24, 0, 0, 45);
+        __lsh_pump_red_epi8(L, num_threads, 1.1, 0.2, 95, 35, 24, 0, 24, solver_env_long("BGJ_LSH_PUMP_LOG", 0), 0, 45);
         __local_lsh_pump(L, 92, 28, 10, 130);
-        __lsh_pump_red_epi8(L, num_threads, 1.1, 0.2, 98, 32, 24, 0, 24, 0, 0, 45);
+        __lsh_pump_red_epi8(L, num_threads, 1.1, 0.2, 98, 32, 24, 0, 24, solver_env_long("BGJ_LSH_PUMP_LOG", 0), 0, 45);
         __local_lsh_pump(L, 95, 27, 8, 130);
-        __lsh_pump_red_epi8(L, num_threads, 1.1, 0.2, 101, 29, 24, 0, 24, 0, 0, 45);
+        __lsh_pump_red_epi8(L, num_threads, 1.1, 0.2, 101, 29, 24, 0, 24, solver_env_long("BGJ_LSH_PUMP_LOG", 0), 0, 45);
         __local_lsh_pump(L, 95, 27, 8, 130);
 
         // the final sieve do not insert to the basis, it only print the short vectors
