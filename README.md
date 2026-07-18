@@ -179,7 +179,17 @@ kernel with full 3-reduction (recorded center dot) support, replacing the
 fragment-pack round trip, the per-shape tensor kernels, and the scalar tail
 kernels; set `BGJ_CUDA_SINGLE_TENSOR=0` to restore the legacy kernel chain.
 Deterministic-results mode, ranged bucket splits, and tensor bucket splits
-always use the legacy kernels. The batched path has an oracle test:
+always use the legacy kernels. Both paths default to a low-latency transfer
+scheme: single-bucket search stages every metadata array in one pinned
+host-to-device copy, gathers vectors straight from the device pool cache, and
+returns `[count|overflow|results]` in one windowed pinned copy consumed after
+a single stream sync (`BGJ_CUDA_SINGLE_FAST=0` restores the legacy transfer
+flow, `BGJ_CUDA_SINGLE_WINDOW`, default `8192`, sets the result window).
+Batched search likewise stages its metadata in one pinned copy and returns
+counts, overflows, and a per-bucket result window with a single sync
+(`BGJ_CUDA_BATCH_FAST=0` to disable, `BGJ_CUDA_BATCH_WINDOW`, default `64`,
+sets the per-bucket window; over-window buckets fetch their tail with one
+extra copy round). The batched path has an oracle test:
 
 ```bash
 $ clang++ -O2 -g -std=c++17 -DHAVE_CUDA tests/bgj_cuda_np_flat_test.cpp src/libllib.a \
