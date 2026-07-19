@@ -660,6 +660,36 @@ int _svp_solver_red(Lattice_QP* L, long algo) {
         __lsh_pump_red_epi8(L, num_threads, 1.1, 0.2, 101, 29, 24, 0, 24, solver_env_long("BGJ_LSH_PUMP_LOG", 0), 0, 45);
         __local_lsh_pump(L, 95, 27, 8, 130);
 
+        if (solver_env_long("BGJ_130T98_FINAL_LSH", 1)) {
+            const long fmsd = solver_env_long("BGJ_130T98_FINAL_LSH_MSD", 110);
+            const long fattempts = solver_env_long("BGJ_130T98_FINAL_LSH_ATTEMPTS", 2);
+            const double fq = solver_env_double("BGJ_130T98_FINAL_LSH_QRATIO", 0.4);
+            const double feq = solver_env_double("BGJ_130T98_FINAL_LSH_EXT_QRATIO", fq);
+            const double ftarget = solver_env_double("BGJ_130T98_FINAL_LSH_STOP_LENGTH", 0.0);
+            // deep final pumps lift best from the legacy sieve ladder (measured:
+            // msd-110 best-lift 2812 legacy vs 2920-2964 with the fast ladder)
+            solver_scoped_env_override_t flad_b2("BGJ_BGJ2_MIN_CSD",
+                solver_env_is_set("BGJ_BGJ2_MIN_CSD") ? getenv("BGJ_BGJ2_MIN_CSD") : "81");
+            solver_scoped_env_override_t flad_b3("BGJ_BGJ3_MIN_CSD",
+                solver_env_is_set("BGJ_BGJ3_MIN_CSD") ? getenv("BGJ_BGJ3_MIN_CSD") : "93");
+            solver_scoped_env_override_t flad_d2("BGJ_BGJ2_DESC_MIN_CSD",
+                solver_env_is_set("BGJ_BGJ2_DESC_MIN_CSD") ? getenv("BGJ_BGJ2_DESC_MIN_CSD") : "91");
+            solver_scoped_env_override_t flad_d3("BGJ_BGJ3_DESC_MIN_CSD",
+                solver_env_is_set("BGJ_BGJ3_DESC_MIN_CSD") ? getenv("BGJ_BGJ3_DESC_MIN_CSD") : "103");
+            for (long fa = 0; fa < fattempts; ++fa) {
+                char flbl[96];
+                snprintf(flbl, sizeof(flbl), "130t98 final_lsh_%ld_q%.2f_try_%ld", fmsd, fq, fa + 1);
+                double fgot = 0.0;
+                SOLVER_PROFILE_DO(flbl,
+                                  fgot = __last_lsh_pump_epi8(L, num_threads, fq, feq, fmsd, 0, 3, (fa > 0) ? 1 : 0, 40, ftarget));
+                if (fgot > 0.0) {
+                    printf("final_lsh_best: algo=130t98 attempt=%ld length=%.9g\n", fa + 1, fgot);
+                    fflush(stdout);
+                }
+                if (ftarget > 0.0 && fgot > 0.0 && fgot <= ftarget) break;
+            }
+        }
+
         // the final sieve do not insert to the basis, it only print the short vectors
         // now we run this part manually
         // __last_lsh_pump_epi8(L, num_threads, 0.4, 0.4, 112, 0, 3, 0, 40);

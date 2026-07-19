@@ -55,26 +55,26 @@ static int svp_bgj3_sieve(Pool_epi8_t<nb> &p, long log_level, long lps_auto_adj)
 }
 
 static long svp_bgj3_desc_min_csd() {
-    static long v = -1;
-    if (v < 0) { const char *e = getenv("BGJ_BGJ3_DESC_MIN_CSD"); v = (e && e[0]) ? atol(e) : (svp_cuda_bgj1_enabled() ? 93 : 103); }
+    long v;
+    const char *e = getenv("BGJ_BGJ3_DESC_MIN_CSD"); v = (e && e[0]) ? atol(e) : (svp_cuda_bgj1_enabled() ? 93 : 103);
     return v;
 }
 
 static long svp_bgj2_desc_min_csd() {
-    static long v = -1;
-    if (v < 0) { const char *e = getenv("BGJ_BGJ2_DESC_MIN_CSD"); v = (e && e[0]) ? atol(e) : 91; }
+    long v;
+    const char *e = getenv("BGJ_BGJ2_DESC_MIN_CSD"); v = (e && e[0]) ? atol(e) : 91;
     return v;
 }
 
 static long svp_bgj2_min_csd() {
-    static long v = -1;
-    if (v < 0) { const char *e = getenv("BGJ_BGJ2_MIN_CSD"); v = (e && e[0]) ? atol(e) : (svp_cuda_bgj1_enabled() ? 92 : 81); }
+    long v;
+    const char *e = getenv("BGJ_BGJ2_MIN_CSD"); v = (e && e[0]) ? atol(e) : (svp_cuda_bgj1_enabled() ? 92 : 81);
     return v;
 }
 
 static long svp_bgj3_min_csd() {
-    static long v = -1;
-    if (v < 0) { const char *e = getenv("BGJ_BGJ3_MIN_CSD"); v = (e && e[0]) ? atol(e) : 93; }
+    long v;
+    const char *e = getenv("BGJ_BGJ3_MIN_CSD"); v = (e && e[0]) ? atol(e) : 93;
     return v;
 }
 

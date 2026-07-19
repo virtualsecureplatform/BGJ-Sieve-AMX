@@ -3586,14 +3586,14 @@ int Pool_epi8_t<nb>::_search_bgj1_cuda_batch(bucket_epi8_t<record_dp> **buckets,
 static long bgj_cuda_host_threads(long requested, long sieving_dim);
 
 static long bgj_cuda_bgj2_min_csd() {
-    static long v = -1;
-    if (v < 0) { const char *e = getenv("BGJ_BGJ2_MIN_CSD"); v = (e && e[0]) ? atol(e) : 92; }
+    long v;
+    const char *e = getenv("BGJ_BGJ2_MIN_CSD"); v = (e && e[0]) ? atol(e) : 92;
     return v;
 }
 
 static long bgj_cuda_bgj3_min_csd() {
-    static long v = -1;
-    if (v < 0) { const char *e = getenv("BGJ_BGJ3_MIN_CSD"); v = (e && e[0]) ? atol(e) : 93; }
+    long v;
+    const char *e = getenv("BGJ_BGJ3_MIN_CSD"); v = (e && e[0]) ? atol(e) : 93;
     return v;
 }
 

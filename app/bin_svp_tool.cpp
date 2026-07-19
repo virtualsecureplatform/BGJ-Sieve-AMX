@@ -6,6 +6,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 #include <cstdlib>
+#include <vector>
 
 #include "../include/svp.h"
 #include "../include/utils.h"
@@ -364,6 +365,20 @@ int main(int argc, char** argv) {
     TIMER_END;
 
     printf("time: %fs\n", CURRENT_TIME);
+
+    {
+        std::vector<double> lsh_best_vec((size_t)L.NumCols());
+        double lsh_best_len = 0.0;
+        long lsh_best_dim = 0;
+        if (bgj_lsh_best_solution_get(&lsh_best_len, lsh_best_vec.data(),
+                                      L.NumCols(), &lsh_best_dim) &&
+            lsh_best_dim == L.NumCols() && lsh_best_len > 0.0) {
+            printf("best sol: %s, source = lsh_best, length = %.5f, vec = ",
+                   argv[1], lsh_best_len);
+            PRINT_VEC(lsh_best_vec.data(), lsh_best_dim);
+            fflush(stdout);
+        }
+    }
 
     char output_file[256];
     sprintf(output_file, "%s%s", argv[1], sr ? "" : "r");
